@@ -1,0 +1,19 @@
+(bind-func fill_f64_array
+  (lambda (arr:double* size:i64)
+    (let ((i 0))
+      (dotimes (i size)
+        (aset! arr i 42.0)))))
+
+(bind-func test_fill
+  (lambda ()
+     ;; Allocate an array of 50 doubles
+    (let ((len 50)
+          (my_array:|50,double|* (alloc)))
+
+      ;; Cast the array pointer type to a flat double* for the function call
+      (fill_f64_array (cast my_array double*) len)
+
+      ;; Verify by reading the last index
+      (aref my_array 49))))
+
+(test_fill)

@@ -1,0 +1,14 @@
+I want to create a low level odin like language that is hosted in
+clojure. The code is written as clojure data structures just like
+clojure code. Extempore is similar language that is hosted in
+scheme. For reference, Odin and extempore source code can be found in
+the references folder. There is also odin-clojure folder that contains
+clojure code that calls odin code using panama.
+
+Add code to src/clodin/compiler.clj so that defproc will be a macro
+that generates llvm ir and compiles a native procedure using llvm. It
+also creates a clojure function with the same name that calls the
+native procedure using panama. Native procedures should be able to can
+call each other without interfering with jvm.
+
+Untyped constant integers should be threated as 64 bit integers.
