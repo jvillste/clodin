@@ -2,3 +2,6 @@
 /.clj-kondo/
 /.lsp/
 /references/
+/.clodin/
+/.pi/
+/.cpcache/

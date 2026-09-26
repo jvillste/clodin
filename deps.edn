@@ -1,0 +1,4 @@
+{:paths ["src"]
+ :aliases
+ {:dev
+  {:jvm-opts ["--enable-native-access=ALL-UNNAMED"]}}}
