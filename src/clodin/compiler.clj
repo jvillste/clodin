@@ -53,8 +53,8 @@
 
 (def procedure-registry (atom {}))
 (def procedure-handles (atom {}))
-(def library-counter (atom 0))
-(def library-arena (atom nil))
+(defonce library-counter (atom 0))
+(defonce library-arena (atom nil))
 
 (def build-directory
   (delay (let [path (java.nio.file.Paths/get
