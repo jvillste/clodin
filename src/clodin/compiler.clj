@@ -416,10 +416,10 @@
 ;;; ---------------------------------------------------------------------------
 
 (defproc substract-one [number :i64]
-  (- number 2))
+  (- number 1))
 
 (defproc add-some [number :i64]
-  (substract-one (+ number 42)))
+  (+ number 42))
 
 (defproc add-both [a :i64 b :i64]
   (+ a b))
@@ -437,7 +437,7 @@
   (is (= 9 (substract-one 10))))
 
 (deftest test-add-some
-  (is (= 42 (add-some 1))))
+  (is (= 43 (add-some 1))))
 
 (deftest test-add-both
   (is (= 7 (add-both 3 4)))
