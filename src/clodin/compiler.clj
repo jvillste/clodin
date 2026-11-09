@@ -12,11 +12,15 @@
   involved at the boundary, when clojure code calls a native procedure
   (or the other way around, which is not supported here).
 
-  Untyped constant integers are treated as 64 bit integers."
+  Untyped constant integers are treated as 64 bit integers.
+
+  Pointers use the :ptr type. Memory is accessed with
+  (load type pointer), (store type pointer value), (pointer-add pointer
+  offset) and (to-pointer integer-address)."
   (:require [clojure.string :as string]
             [clojure.test :refer [deftest is run-tests testing]])
-  (:import (java.lang.foreign Arena FunctionDescriptor Linker SymbolLookup
-                              ValueLayout)))
+  (:import (java.lang.foreign Arena FunctionDescriptor Linker MemorySegment
+                              SymbolLookup ValueLayout)))
 
 (declare compile-expression)
 
@@ -31,6 +35,7 @@
     :i32 "i32"
     :f64 "double"
     :f32 "float"
+    :ptr "ptr"
     (throw (ex-info (str "Unsupported clodin type: " type) {:type type}))))
 
 (deftest test-llvm-type
@@ -39,6 +44,7 @@
   (is (= "i32" (llvm-type :i32)))
   (is (= "double" (llvm-type :f64)))
   (is (= "float" (llvm-type :f32)))
+  (is (= "ptr" (llvm-type :ptr)))
   (is (thrown? clojure.lang.ExceptionInfo (llvm-type :i8))))
 
 ;;; ---------------------------------------------------------------------------
@@ -115,7 +121,16 @@
     :i32 ValueLayout/JAVA_INT
     :f64 ValueLayout/JAVA_DOUBLE
     :f32 ValueLayout/JAVA_FLOAT
+    :ptr ValueLayout/ADDRESS
     (throw (ex-info (str "Unsupported clodin type: " type) {:type type}))))
+
+(deftest test-value-layout
+  (is (= ValueLayout/JAVA_LONG (value-layout :i64)))
+  (is (= ValueLayout/JAVA_INT (value-layout :i32)))
+  (is (= ValueLayout/JAVA_DOUBLE (value-layout :f64)))
+  (is (= ValueLayout/JAVA_FLOAT (value-layout :f32)))
+  (is (= ValueLayout/ADDRESS (value-layout :ptr)))
+  (is (thrown? clojure.lang.ExceptionInfo (value-layout :i8))))
 
 (defn- function-descriptor
   [return-type param-types]
@@ -181,7 +196,7 @@
     nil))
 
 (defn coerce-argument
-  "Converts a clojure value into the java primitive that the panama
+  "Converts a clojure value into the java value that the panama
   downcall descriptor expects for the given clodin type."
   [type value]
   (case type
@@ -189,6 +204,13 @@
     :i32 (int value)
     :f64 (double value)
     :f32 (float value)
+    :ptr (cond
+           (instance? MemorySegment value) value
+           (nil? value) (MemorySegment/ofAddress 0)
+           (integer? value) (MemorySegment/ofAddress (long value))
+           :else (throw (ex-info (str "Expected a MemorySegment or integer address for :ptr, got "
+                                      (some-> value class .getName))
+                                 {:type type :value value})))
     (throw (ex-info (str "Unsupported clodin type: " type) {:type type}))))
 
 (defn invoke-procedure
@@ -334,6 +356,98 @@
                                    value))]
       [state result :f64])))
 
+(defn- compile-load
+  "Compiles (load type pointer) into an llvm load instruction."
+  [state environment expression]
+  (when-not (= 3 (count expression))
+    (throw (ex-info "load expects (load type pointer)" {:expression expression})))
+  (let [[element-type pointer-form] (rest expression)]
+    (llvm-type element-type)
+    (let [[state pointer-value pointer-type]
+          (compile-expression state environment pointer-form)]
+      (when-not (= :ptr pointer-type)
+        (throw (ex-info (str "load expects a :ptr pointer, got " pointer-type)
+                        {:type pointer-type})))
+      (let [[state result] (fresh-temporary state)
+            state (emit-line state
+                             (format "%s = load %s, ptr %s"
+                                     result
+                                     (llvm-type element-type)
+                                     pointer-value))]
+        [state result element-type]))))
+
+(defn- compile-store
+  "Compiles (store type pointer value) into an llvm store instruction.
+  A store does not produce a value."
+  [state environment expression]
+  (when-not (= 4 (count expression))
+    (throw (ex-info "store expects (store type pointer value)"
+                    {:expression expression})))
+  (let [[element-type pointer-form value-form] (rest expression)]
+    (llvm-type element-type)
+    (let [[state pointer-value pointer-type]
+          (compile-expression state environment pointer-form)
+          [state stored-value stored-type]
+          (compile-expression state environment value-form)]
+      (when-not (= :ptr pointer-type)
+        (throw (ex-info (str "store expects a :ptr pointer, got " pointer-type)
+                        {:type pointer-type})))
+      (when-not (= element-type stored-type)
+        (throw (ex-info (str "store expects a " element-type " value, got " stored-type)
+                        {:element-type element-type :value-type stored-type})))
+      (let [state (emit-line state
+                             (format "store %s %s, ptr %s"
+                                     (llvm-type element-type)
+                                     stored-value
+                                     pointer-value))]
+        [state nil nil]))))
+
+(defn- compile-pointer-add
+  "Compiles (pointer-add pointer offset) into an llvm getelementptr.
+  The offset is measured in bytes."
+  [state environment expression]
+  (when-not (= 3 (count expression))
+    (throw (ex-info "pointer-add expects (pointer-add pointer offset)"
+                    {:expression expression})))
+  (let [[pointer-form offset-form] (rest expression)
+        [state pointer-value pointer-type]
+        (compile-expression state environment pointer-form)
+        [state offset-value offset-type]
+        (compile-expression state environment offset-form)]
+    (when-not (= :ptr pointer-type)
+      (throw (ex-info (str "pointer-add expects a :ptr pointer, got " pointer-type)
+                      {:type pointer-type})))
+    (when-not (#{:i64 :i32} offset-type)
+      (throw (ex-info (str "pointer-add expects an integer offset, got " offset-type)
+                      {:type offset-type})))
+    (let [[state result] (fresh-temporary state)
+          state (emit-line state
+                           (format "%s = getelementptr inbounds i8, ptr %s, %s %s"
+                                   result
+                                   pointer-value
+                                   (llvm-type offset-type)
+                                   offset-value))]
+      [state result :ptr])))
+
+(defn- compile-to-pointer
+  "Compiles (to-pointer address), converting an integer address to :ptr."
+  [state environment expression]
+  (when-not (= 2 (count expression))
+    (throw (ex-info "to-pointer expects (to-pointer address)"
+                    {:expression expression})))
+  (let [[state value type]
+        (compile-expression state environment (second expression))]
+    (when-not (#{:i64 :i32} type)
+      (throw (ex-info (str "to-pointer expects an integer address, got " type)
+                      {:type type})))
+    (let [[state result] (fresh-temporary state)
+          state (emit-line state
+                           (format "%s = inttoptr %s %s to ptr"
+                                   result
+                                   (llvm-type type)
+                                   value))]
+      [state result :ptr])))
+
 (defn- compile-expression
   [state environment expression]
   (cond
@@ -348,6 +462,14 @@
     (compile-arithmetic state environment (first expression) (rest expression))
     (and (seq? expression) (= 'to-float (first expression)))
     (compile-to-float state environment expression)
+    (and (seq? expression) (= 'load (first expression)))
+    (compile-load state environment expression)
+    (and (seq? expression) (= 'store (first expression)))
+    (compile-store state environment expression)
+    (and (seq? expression) (= 'pointer-add (first expression)))
+    (compile-pointer-add state environment expression)
+    (and (seq? expression) (= 'to-pointer (first expression)))
+    (compile-to-pointer state environment expression)
     (seq? expression)
     (compile-procedure-call state environment (first expression) (rest expression))
     :else (throw (ex-info (str "Unsupported clodin expression: " expression)
@@ -394,7 +516,10 @@
 
   An explicit return type can be given by putting a type keyword
   before the body forms; without it the return type is inferred from
-  the last body expression."
+  the last body expression.
+
+  Pointers are declared as :ptr. Memory can be read and written with
+  (load :i64 pointer) and (store :i64 pointer value)."
   [name params & body]
   {:pre [(symbol? name) (vector? params) (even? (count params))]}
   (let [param-pairs (partition 2 params)
@@ -407,6 +532,10 @@
                       (zipmap param-names param-types)
                       body-forms)
         return-type (or explicit-return-type return-type)]
+    (when (and return-type (nil? result-value))
+      (throw (ex-info (str "Procedure " name " declares return type " return-type
+                           " but its body does not produce a value")
+                      {:procedure name :return-type return-type})))
     (compile-procedure! (str name) param-names param-types return-type result-value lines)
     `(defn ~name [~@param-names]
        (invoke-procedure ~(str name) [~@param-names]))))
@@ -433,6 +562,24 @@
 (defproc mix-both [a :i64 b :f64]
   (+ b (halve (to-float (add-both a 1)))))
 
+(defproc store-i64-at [pointer :ptr value :i64]
+  (store :i64 pointer value))
+
+(defproc load-i64-at [pointer :ptr]
+  (load :i64 pointer))
+
+(defproc store-i64-through-address [address :i64 value :i64]
+  (store :i64 (to-pointer address) value))
+
+(defproc store-second-i64 [pointer :ptr value :i64]
+  (store :i64 (pointer-add pointer 8) value))
+
+(defproc increment-i64-at [pointer :ptr]
+  (store-i64-at pointer (+ (load :i64 pointer) 1)))
+
+(defproc pointer-to-second-i64 [pointer :ptr]
+  (pointer-add pointer 8))
+
 (deftest test-substract-one
   (is (= 9 (substract-one 10))))
 
@@ -453,6 +600,33 @@
 (deftest test-mix-both
   (testing "native procedures call each other and float calls flow through"
     (is (< (abs (- 6.0 (mix-both 3 4.0))) 0.000001))))
+
+(deftest test-pointer-memory
+  (let [arena (Arena/ofShared)
+        buffer (.allocate arena 16)]
+    (try
+      (store-i64-at buffer 42)
+      (is (= 42 (load-i64-at buffer)))
+      (is (= 42 (.getAtIndex buffer ValueLayout/JAVA_LONG 0)))
+      (store-second-i64 buffer 99)
+      (is (= 99 (.getAtIndex buffer ValueLayout/JAVA_LONG 1)))
+      (store-i64-through-address (.address buffer) 7)
+      (is (= 7 (load-i64-at buffer)))
+      (increment-i64-at buffer)
+      (is (= 8 (load-i64-at buffer)))
+      (store-i64-at (pointer-to-second-i64 buffer) 123)
+      (is (= 123 (load-i64-at (pointer-to-second-i64 buffer))))
+      (finally
+        (.close arena)))))
+
+(deftest test-coerce-pointer-argument
+  (let [arena (Arena/ofShared)
+        buffer (.allocate arena 8)]
+    (try
+      (is (identical? buffer (coerce-argument :ptr buffer)))
+      (is (instance? MemorySegment (coerce-argument :ptr (.address buffer))))
+      (finally
+        (.close arena)))))
 
 (defn -main
   [& _]
