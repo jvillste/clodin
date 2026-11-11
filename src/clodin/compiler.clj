@@ -16,13 +16,17 @@
 
   Pointers use the :ptr type. Memory is accessed with
   (load type pointer), (store type pointer value), (pointer-add pointer
-  offset) and (to-pointer integer-address)."
+  offset) and (to-pointer integer-address).
+
+  Local variables are introduced with (let [name type value ...] body...)
+  and mutated with (set name value). Loops are written with
+  (while condition body...)."
   (:require [clojure.string :as string]
             [clojure.test :refer [deftest is run-tests testing]])
   (:import (java.lang.foreign Arena FunctionDescriptor Linker MemorySegment
                               SymbolLookup ValueLayout)))
 
-(declare compile-expression)
+(declare compile-expression compile-body)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Types
@@ -89,7 +93,11 @@
                                (str (llvm-type param-type) " %" param-name))
                              param-types
                              param-names))
-        body (apply str (map (fn [line] (str "  " line "\n")) lines))
+        body (apply str (map (fn [line]
+                               (if (string/ends-with? line ":")
+                                 (str line "\n")
+                                 (str "  " line "\n")))
+                             lines))
         return-line (if return-type
                       (str "  ret " (llvm-type return-type) " " result-value "\n")
                       "  ret void\n")]
@@ -108,7 +116,21 @@
               "  ret i64 %1\n"
               "}\n")
          (render-procedure "twice" ["number"] [:i64] :i64 "%1"
-                           ["%1 = mul i64 %number, 2"]))))
+                           ["%1 = mul i64 %number, 2"])))
+  (testing "labels are rendered without indentation"
+    (is (= (str "define void @\"loop\"() {\n"
+                "entry:\n"
+                "  br label %while.cond\n"
+                "while.cond:\n"
+                "  br label %while.end\n"
+                "while.end:\n"
+                "  ret void\n"
+                "}\n")
+           (render-procedure "loop" [] [] nil nil
+                             ["br label %while.cond"
+                              "while.cond:"
+                              "br label %while.end"
+                              "while.end:"])))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Panama integration
@@ -232,18 +254,66 @@
 ;;; ---------------------------------------------------------------------------
 ;;; Expression compilation
 ;;;
-;;; An emitter state is {:lines [...] :temporary-index n}. Expression
-;;; compilation returns [state value-representation type].
+;;; An emitter state is
+;;; {:lines [...] :temporary-index n :label-index n :block-terminated? bool}.
+;;; Expression compilation returns [state value-representation type].
+;;; A form that produces no value, such as store, set or while, returns
+;;; nil as both the value and the type.
+;;;
+;;; The environment maps a local name to {:type ... :slot "%name"}.
+;;; Locals live in stack slots allocated with alloca, so a set inside a
+;;; loop is visible in the next iteration without building phi nodes.
 ;;; ---------------------------------------------------------------------------
 
 (defn- emit-line
   [state line]
   (update state :lines conj line))
 
+(defn- emit-label
+  "Emits a basic block label. Labels are not indented."
+  [state label]
+  (update state :lines conj (str label ":")))
+
+(defn- terminate-block
+  "Marks the current basic block as terminated, so that no further
+  instructions are emitted into it."
+  [state]
+  (assoc state :block-terminated? true))
+
 (defn- fresh-temporary
   [state]
   (let [index (inc (:temporary-index state))]
     [(assoc state :temporary-index index) (str "%" index)]))
+
+(defn- fresh-label
+  [state prefix]
+  (let [index (inc (:label-index state))]
+    [(assoc state :label-index index) (str prefix "." index)]))
+
+(defn- fresh-local-slot
+  "Returns a stack slot name that is unique per binding. A fresh slot per
+  binding lets a later let binding shadow an earlier one of the same
+  name without overwriting its storage."
+  [state name]
+  (let [index (inc (:slot-index state))]
+    [(assoc state :slot-index index) (str "%" name ".slot." index)]))
+
+(defn- compile-local-reference
+  "Compiles a reference to a local. Parameters are already llvm values,
+  while let bindings live in stack slots and are loaded."
+  [state environment name]
+  (let [local (get environment name)]
+    (when-not local
+      (throw (ex-info (str "Unknown symbol: " name) {:symbol name})))
+    (if (:parameter? local)
+      [state (:slot local) (:type local)]
+      (let [[state result] (fresh-temporary state)
+            state (emit-line state
+                             (format "%s = load %s, ptr %s"
+                                     result
+                                     (llvm-type (:type local))
+                                     (:slot local)))]
+        [state result (:type local)]))))
 
 (defn- compile-operands
   [state environment operand-forms]
@@ -374,7 +444,9 @@
                                      result
                                      (llvm-type element-type)
                                      pointer-value))]
-        [state result element-type]))))
+        [(assoc state :result-value result :return-type element-type)
+         result
+         element-type]))))
 
 (defn- compile-store
   "Compiles (store type pointer value) into an llvm store instruction.
@@ -446,20 +518,178 @@
                                    result
                                    (llvm-type type)
                                    value))]
-      [state result :ptr])))
+      [(assoc state :result-value result :return-type :ptr) result :ptr])))
+
+(defn binding-names
+  "Returns the names bound by a let form, or nil for other forms."
+  [form]
+  (when (and (seq? form)
+             (= 'let (first form))
+             (vector? (second form)))
+    (set (take-nth 3 (second form)))))
+
+(deftest test-binding-names
+  (is (= #{'x} (binding-names '(let [x :i64 1] x))))
+  (is (= #{'x 'y} (binding-names '(let [x :i64 1 y :i64 2] x))))
+  (is (nil? (binding-names '(+ 1 2)))))
+
+(defn- compile-let
+  "Compiles (let [name type value ...] body...). Every binding gets its
+  own stack slot, so a later binding may shadow an earlier one and the
+  initial value of a binding is evaluated in the environment of the
+  bindings before it."
+  [state environment expression]
+  (let [bindings (second expression)
+        body-forms (drop 2 expression)]
+    (when-not (vector? bindings)
+      (throw (ex-info "let expects a vector of bindings" {:expression expression})))
+    (when-not (zero? (mod (count bindings) 3))
+      (throw (ex-info "let bindings must come in name, type, value triples"
+                      {:bindings bindings})))
+    (when (empty? body-forms)
+      (throw (ex-info "let expects at least one body form" {:expression expression})))
+    (let [binding-pairs (partition 3 bindings)
+          [state environment]
+          (reduce (fn [[state environment] [name type value-form]]
+                    (when-not (symbol? name)
+                      (throw (ex-info (str "let binding name must be a symbol, got " name)
+                                      {:name name})))
+                    (llvm-type type)
+                    (let [[state value value-type]
+                          (compile-expression state environment value-form)]
+                      (when-not (= type value-type)
+                        (throw (ex-info (str "let binding " name " is declared as " type
+                                             " but its value is " value-type)
+                                        {:name name :type type :value-type value-type})))
+                      (let [[state slot] (fresh-local-slot state name)
+                            state (emit-line state
+                                             (format "%s = alloca %s"
+                                                     slot
+                                                     (llvm-type type)))
+                            state (emit-line state
+                                             (format "store %s %s, ptr %s"
+                                                     (llvm-type type)
+                                                     value
+                                                     slot))]
+                        [state (assoc environment name {:type type :slot slot})])))
+                  [state environment]
+                  binding-pairs)]
+      (let [inner (compile-body state environment body-forms)]
+        [inner (:result-value inner) (:return-type inner)]))))
+
+(defn- compile-set
+  "Compiles (set name value), storing the value into the stack slot of
+  the local. A set does not produce a value."
+  [state environment expression]
+  (when-not (= 3 (count expression))
+    (throw (ex-info "set expects (set name value)" {:expression expression})))
+  (let [[name value-form] (rest expression)
+        local (get environment name)]
+    (when-not (symbol? name)
+      (throw (ex-info (str "set expects a local name, got " name) {:name name})))
+    (when-not local
+      (throw (ex-info (str "Cannot set unknown local: " name) {:symbol name})))
+    (let [[state value value-type] (compile-expression state environment value-form)]
+      (when-not (= (:type local) value-type)
+        (throw (ex-info (str "Cannot set " name " of type " (:type local)
+                             " to a value of type " value-type)
+                        {:name name :type (:type local) :value-type value-type})))
+      (let [state (emit-line state
+                             (format "store %s %s, ptr %s"
+                                     (llvm-type value-type)
+                                     value
+                                     (:slot local)))]
+        [state nil nil]))))
+
+(defn- comparison-instruction
+  [type operator]
+  (if (#{:f64 :f32} type)
+    (case operator
+      < "fcmp olt"
+      <= "fcmp ole"
+      > "fcmp ogt"
+      >= "fcmp oge"
+      = "fcmp oeq"
+      not= "fcmp une")
+    (case operator
+      < "icmp slt"
+      <= "icmp sle"
+      > "icmp sgt"
+      >= "icmp sge"
+      = "icmp eq"
+      not= "icmp ne")))
+
+(deftest test-comparison-instruction
+  (is (= "icmp slt" (comparison-instruction :i64 '<)))
+  (is (= "icmp ne" (comparison-instruction :i32 'not=)))
+  (is (= "fcmp oge" (comparison-instruction :f64 '>=)))
+  (is (= "fcmp une" (comparison-instruction :f32 'not=))))
+
+(defn- compile-comparison
+  "Compiles a binary comparison into an llvm icmp or fcmp instruction.
+  The result is an i1."
+  [state environment operator operand-forms]
+  (when-not (= 2 (count operand-forms))
+    (throw (ex-info (str "Comparison " operator " needs exactly 2 operands")
+                    {:operator operator})))
+  (let [[state values types] (compile-operands state environment operand-forms)
+        distinct-types (distinct types)]
+    (when-not (= 1 (count distinct-types))
+      (throw (ex-info (str "Mixed operand types " distinct-types
+                           " for comparison " operator)
+                      {:operator operator :types types})))
+    (let [type (first distinct-types)
+          [state result] (fresh-temporary state)
+          state (emit-line state
+                           (format "%s = %s %s %s, %s"
+                                   result
+                                   (comparison-instruction type operator)
+                                   (llvm-type type)
+                                   (first values)
+                                   (second values)))]
+      [state result :i1])))
+
+(defn- compile-while
+  "Compiles (while condition body...) into a condition block, a body
+  block and an end block. The condition must be an i1."
+  [state environment expression]
+  (let [condition-form (second expression)
+        body-forms (drop 2 expression)]
+    (when-not condition-form
+      (throw (ex-info "while expects a condition" {:expression expression})))
+    (let [[state condition-label] (fresh-label state "while.cond")
+          [state body-label] (fresh-label state "while.body")
+          [state end-label] (fresh-label state "while.end")
+          state (emit-line state (str "br label %" condition-label))
+          state (emit-label state condition-label)
+          [state condition-value condition-type]
+          (compile-expression state environment condition-form)]
+      (when-not (= :i1 condition-type)
+        (throw (ex-info (str "while condition must be a comparison, got " condition-type)
+                        {:type condition-type})))
+      (let [state (emit-line state
+                             (format "br i1 %s, label %%%s, label %%%s"
+                                     condition-value
+                                     body-label
+                                     end-label))
+            state (terminate-block state)
+            state (emit-label state body-label)
+            state (compile-body state environment body-forms)
+            state (emit-line state (str "br label %" condition-label))
+            state (terminate-block state)
+            state (emit-label state end-label)]
+        [(assoc state :result-value nil :return-type nil) nil nil]))))
 
 (defn- compile-expression
   [state environment expression]
   (cond
     (integer? expression) [state (str expression) :i64]
     (float? expression) [state (str expression) :f64]
-    (symbol? expression) (let [type (get environment expression)]
-                           (when-not type
-                             (throw (ex-info (str "Unknown symbol: " expression)
-                                             {:symbol expression})))
-                           [state (str "%" expression) type])
+    (symbol? expression) (compile-local-reference state environment expression)
     (and (seq? expression) (#{'+ '- '* '/} (first expression)))
     (compile-arithmetic state environment (first expression) (rest expression))
+    (and (seq? expression) (#{'< '<= '> '>= '= 'not=} (first expression)))
+    (compile-comparison state environment (first expression) (rest expression))
     (and (seq? expression) (= 'to-float (first expression)))
     (compile-to-float state environment expression)
     (and (seq? expression) (= 'load (first expression)))
@@ -470,6 +700,12 @@
     (compile-pointer-add state environment expression)
     (and (seq? expression) (= 'to-pointer (first expression)))
     (compile-to-pointer state environment expression)
+    (and (seq? expression) (= 'let (first expression)))
+    (compile-let state environment expression)
+    (and (seq? expression) (= 'set (first expression)))
+    (compile-set state environment expression)
+    (and (seq? expression) (= 'while (first expression)))
+    (compile-while state environment expression)
     (seq? expression)
     (compile-procedure-call state environment (first expression) (rest expression))
     :else (throw (ex-info (str "Unsupported clodin expression: " expression)
@@ -478,11 +714,14 @@
 (defn- compile-body
   "Compiles the body expressions in order and returns the emitter
   state extended with the result value and return type of the last
-  expression."
+  expression. A body form that produces no value, such as set or
+  while, leaves the result value nil."
   [state environment body-forms]
   (reduce (fn [state body-form]
             (let [[state value type] (compile-expression state environment body-form)]
-              (assoc state :result-value value :return-type type)))
+              (assoc state
+                     :result-value value
+                     :return-type type)))
           (assoc state :result-value nil :return-type nil)
           body-forms))
 
@@ -503,6 +742,40 @@
             :ir ir})
     (recompile-library!)))
 
+(defn- defproc-form
+  "Compiles the procedure described by a defproc form and returns the
+  clojure defn form that calls the native procedure."
+  [name params body]
+  (when-not (symbol? name)
+    (throw (ex-info "Procedure name must be a symbol" {:name name})))
+  (when-not (vector? params)
+    (throw (ex-info "Procedure parameters must be a vector" {:params params})))
+  (when-not (even? (count params))
+    (throw (ex-info "Procedure parameters must come in name, type pairs"
+                    {:params params})))
+  (let [param-pairs (partition 2 params)
+        param-names (mapv first param-pairs)
+        param-types (mapv second param-pairs)
+        explicit-return-type (when (keyword? (first body)) (first body))
+        body-forms (if explicit-return-type (next body) body)
+        {:keys [result-value return-type lines]}
+        (compile-body {:lines [] :temporary-index 0 :label-index 0 :slot-index 0}
+                      (into {} (map (fn [param-name param-type]
+                                      [param-name {:type param-type
+                                                   :slot (str "%" param-name)
+                                                   :parameter? true}])
+                                    param-names
+                                    param-types))
+                      body-forms)
+        return-type (or explicit-return-type return-type)]
+    (when (and return-type (nil? result-value))
+      (throw (ex-info (str "Procedure " name " declares return type " return-type
+                           " but its body does not produce a value")
+                      {:procedure name :return-type return-type})))
+    (compile-procedure! (str name) param-names param-types return-type result-value lines)
+    `(defn ~name [~@param-names]
+       (invoke-procedure ~(str name) [~@param-names]))))
+
 (defmacro defproc
   "Defines a native clodin procedure.
 
@@ -519,26 +792,13 @@
   the last body expression.
 
   Pointers are declared as :ptr. Memory can be read and written with
-  (load :i64 pointer) and (store :i64 pointer value)."
+  (load :i64 pointer) and (store :i64 pointer value).
+
+  Locals are introduced with (let [name type value ...] body...) and
+  mutated with (set name value). Loops are written with
+  (while condition body...)."
   [name params & body]
-  {:pre [(symbol? name) (vector? params) (even? (count params))]}
-  (let [param-pairs (partition 2 params)
-        param-names (mapv first param-pairs)
-        param-types (mapv second param-pairs)
-        explicit-return-type (when (keyword? (first body)) (first body))
-        body-forms (if explicit-return-type (next body) body)
-        {:keys [result-value return-type lines]}
-        (compile-body {:lines [] :temporary-index 0}
-                      (zipmap param-names param-types)
-                      body-forms)
-        return-type (or explicit-return-type return-type)]
-    (when (and return-type (nil? result-value))
-      (throw (ex-info (str "Procedure " name " declares return type " return-type
-                           " but its body does not produce a value")
-                      {:procedure name :return-type return-type})))
-    (compile-procedure! (str name) param-names param-types return-type result-value lines)
-    `(defn ~name [~@param-names]
-       (invoke-procedure ~(str name) [~@param-names]))))
+  (defproc-form name params body))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Procedures and tests
@@ -579,6 +839,49 @@
 
 (defproc pointer-to-second-i64 [pointer :ptr]
   (pointer-add pointer 8))
+
+(defproc shadowed-let []
+  (let [x :i64 10
+        x :i64 (+ x 10)]
+    x))
+
+(defproc sum-to [limit :i64]
+  (let [sum :i64 0
+        index :i64 0]
+    (while (< index limit)
+      (set sum (+ sum index))
+      (set index (+ index 1)))
+    sum))
+
+(defproc count-down [start :i64]
+  (let [value :i64 start
+        steps :i64 0]
+    (while (> value 0)
+      (set value (- value 1))
+      (set steps (+ steps 1)))
+    steps))
+
+(defproc sum-floats-while [limit :f64]
+  (let [sum :f64 0.0
+        value :f64 0.0]
+    (while (< value limit)
+      (set sum (+ sum value))
+      (set value (+ value 1.0)))
+    sum))
+
+(defproc fill-i64 [pointer :ptr value :i64 count :i64]
+  (let [index :i64 0]
+    (while (< index count)
+      (store :i64 (pointer-add pointer (* index 8)) value)
+      (set index (+ index 1)))))
+
+(defproc sum-array-i64 [pointer :ptr count :i64]
+  (let [sum :i64 0
+        index :i64 0]
+    (while (< index count)
+      (set sum (+ sum (load :i64 (pointer-add pointer (* index 8)))))
+      (set index (+ index 1)))
+    sum))
 
 (deftest test-substract-one
   (is (= 9 (substract-one 10))))
@@ -625,6 +928,26 @@
     (try
       (is (identical? buffer (coerce-argument :ptr buffer)))
       (is (instance? MemorySegment (coerce-argument :ptr (.address buffer))))
+      (finally
+        (.close arena)))))
+
+(deftest test-shadowed-let
+  (testing "a later let binding shadows an earlier one"
+    (is (= 20 (shadowed-let)))))
+
+(deftest test-while
+  (is (= 10 (sum-to 5)))
+  (is (= 0 (sum-to 0)))
+  (is (= 5 (count-down 5)))
+  (is (= 6.0 (sum-floats-while 4.0))))
+
+(deftest test-while-with-memory
+  (let [arena (Arena/ofShared)
+        buffer (.allocate arena 32)]
+    (try
+      (fill-i64 buffer 3 4)
+      (is (= 12 (sum-array-i64 buffer 4)))
+      (is (= 3 (.getAtIndex buffer ValueLayout/JAVA_LONG 3)))
       (finally
         (.close arena)))))
 
