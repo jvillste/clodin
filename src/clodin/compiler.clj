@@ -2,10 +2,11 @@
   "A low level odin-like language hosted in clojure.
 
   Clodin source code is written as clojure data structures. The
-  defproc macro compiles a procedure into llvm ir, builds the whole
-  accumulated module into a native shared library with clang, loads
-  the library with project panama, and defines a clojure function of
-  the same name that downcalls into the native procedure.
+  defproc macro compiles a procedure into llvm ir and registers it
+  in the accumulated module. The module is compiled into a native
+  shared library with clang and loaded with project panama lazily,
+  when a clojure wrapper first calls a native procedure. The wrapper
+  has the same name as the procedure and downcalls into it.
 
   Native procedures call each other with direct llvm calls inside the
   shared library, so those calls never touch the jvm. The jvm is only
@@ -57,14 +58,18 @@
 
 ;;; procedure-registry maps a procedure name to
 ;;; {:param-types [...] :return-type ... :ir "..."}.
+;;; module-dirty is true when a procedure has been registered after
+;;; the last successful library compile.
 ;;; procedure-handles maps a procedure name to a panama downcall
 ;;; MethodHandle from the most recently compiled library.
 ;;; ---------------------------------------------------------------------------
 
 (def procedure-registry (atom {}))
 (def procedure-handles (atom {}))
+(def module-dirty (atom true))
 (defonce library-counter (atom 0))
 (defonce library-arena (atom nil))
+(defonce compile-lock (Object.))
 
 (def build-directory
   (delay (let [path (java.nio.file.Paths/get
@@ -217,6 +222,17 @@
     (load-library! (str library-path))
     nil))
 
+(defn compile-module!
+  "Compiles and loads the accumulated module if a procedure
+  registration marked it dirty. This batches all defproc forms that
+  were evaluated since the last compile into one clang invocation."
+  []
+  (locking compile-lock
+    (when @module-dirty
+      (recompile-library!)
+      (reset! module-dirty false))
+    nil))
+
 (defn coerce-argument
   "Converts a clojure value into the java value that the panama
   downcall descriptor expects for the given clodin type."
@@ -237,19 +253,22 @@
 
 (defn invoke-procedure
   "Calls a native procedure through its panama downcall handle,
-  coercing the clojure arguments to the declared types."
+  coercing the clojure arguments to the declared types. If procedures
+  have been registered since the last compile, the module is compiled
+  and loaded first."
   [name arguments]
-  (let [procedure (get @procedure-registry name)
-        handle (get @procedure-handles name)]
+  (let [procedure (get @procedure-registry name)]
     (when-not procedure
       (throw (ex-info (str "Unknown clodin procedure: " name) {:procedure name})))
-    (when-not handle
-      (throw (ex-info (str "No downcall handle for clodin procedure: " name)
-                      {:procedure name})))
-    (.invokeWithArguments
-     handle
-     (into-array Object
-                 (map coerce-argument (:param-types procedure) arguments)))))
+    (compile-module!)
+    (let [handle (get @procedure-handles name)]
+      (when-not handle
+        (throw (ex-info (str "No downcall handle for clodin procedure: " name)
+                        {:procedure name})))
+      (.invokeWithArguments
+       handle
+       (into-array Object
+                   (map coerce-argument (:param-types procedure) arguments))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Expression compilation
@@ -729,10 +748,10 @@
 ;;; Compilation entry points
 ;;; ---------------------------------------------------------------------------
 
-(defn compile-procedure!
-  "Registers the ir of a procedure in the module and recompiles and
-  reloads the whole library so that the new procedure and all updated
-  callers are available."
+(defn- register-procedure!
+  "Registers the ir and signature of a procedure and marks the module
+  dirty. The module is compiled later, once, when a native procedure
+  is first called."
   [name param-names param-types return-type result-value lines]
   (let [ir (render-procedure name param-names param-types return-type result-value lines)]
     (swap! procedure-registry
@@ -740,7 +759,16 @@
            {:param-types (vec param-types)
             :return-type return-type
             :ir ir})
-    (recompile-library!)))
+    (reset! module-dirty true)
+    nil))
+
+(defn compile-procedure!
+  "Registers a procedure and immediately compiles and loads the whole
+  module. defproc uses register-procedure! instead so that a batch of
+  procedures is compiled only once."
+  [name param-names param-types return-type result-value lines]
+  (register-procedure! name param-names param-types return-type result-value lines)
+  (compile-module!))
 
 (defn- defproc-form
   "Compiles the procedure described by a defproc form and returns the
@@ -772,7 +800,7 @@
       (throw (ex-info (str "Procedure " name " declares return type " return-type
                            " but its body does not produce a value")
                       {:procedure name :return-type return-type})))
-    (compile-procedure! (str name) param-names param-types return-type result-value lines)
+    (register-procedure! (str name) param-names param-types return-type result-value lines)
     `(defn ~name [~@param-names]
        (invoke-procedure ~(str name) [~@param-names]))))
 
@@ -782,10 +810,10 @@
   (defproc twice [number :i64] (* number 2))
 
   At macroexpansion time the body is type checked (untyped constant
-  integers are 64 bit integers), rendered as llvm ir, the whole
-  accumulated module is compiled into a shared library with clang and
-  loaded with panama. Expands to a clojure function of the same name
-  that downcalls into the native procedure.
+  integers are 64 bit integers) and rendered as llvm ir. The
+  procedure is registered in the accumulated module, but clang is not
+  invoked yet. The whole module is compiled and loaded lazily on the
+  first call to any native procedure wrapper.
 
   An explicit return type can be given by putting a type keyword
   before the body forms; without it the return type is inferred from
