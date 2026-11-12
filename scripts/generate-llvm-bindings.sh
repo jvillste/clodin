@@ -36,6 +36,9 @@
 # generates macOS bindings alongside the Linux ones and switches
 # target/current to them. Run it in the container to switch back.
 #
+# To switch between already-generated bindings without regenerating,
+# run scripts/use-llvm-bindings.sh.
+#
 # On macOS, Homebrew LLVM is the easiest source of both the headers and
 # libLLVM.dylib:
 #
