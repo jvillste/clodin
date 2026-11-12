@@ -15,10 +15,10 @@
   procedures that did not change. Stable thunks and indirect calls are
   deferred until there is a concrete use case for recompiling a single
   function.
-- [ ] Install jextract and generate the LLVM C API bindings.
-  `jdk.java.net` is currently blocked in the container, so either open
-  it or build jextract from source (which also needs Gradle and
-  `services.gradle.org`).
+- [x] Run `scripts/generate-llvm-bindings.sh` to install jextract and
+  generate the LLVM C API bindings. Tested on Linux/AArch64 with
+  LLVM 21.1: the generated bindings build a function through the C
+  API, JIT it with LLJIT, and call it through Panama.
 - [ ] On macOS, verify that jextract-generated bindings can load
   Homebrew's `libLLVM.dylib`, run ORC JIT code, and downcall into it
   with Panama.

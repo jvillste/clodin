@@ -1,4 +1,4 @@
-{:paths ["src"]
+{:paths ["src" "target/classes"]
  :aliases
  {:dev
   {:jvm-opts ["--enable-native-access=ALL-UNNAMED"]}}}
