@@ -18,10 +18,15 @@
 - [x] Run `scripts/generate-llvm-bindings.sh` to install jextract and
   generate the LLVM C API bindings. Tested on Linux/AArch64 with
   LLVM 21.1: the generated bindings build a function through the C
-  API, JIT it with LLJIT, and call it through Panama.
-- [ ] On macOS, verify that jextract-generated bindings can load
+  API, JIT it with LLJIT, and call it through Panama. Bindings are
+  generated per platform under `target/classes/<platform>`, and
+  `target/current` points at the active set.
+- [x] On macOS, verify that jextract-generated bindings can load
   Homebrew's `libLLVM.dylib`, run ORC JIT code, and downcall into it
-  with Panama.
+  with Panama. Verified on macOS/AArch64: the smoke test printed
+  `twice(21) = 42`. The earlier "cannot execute binary file" error
+  was caused by the Linux and macOS jextract installs sharing one
+  directory; jextract is now installed per platform.
 
 The clang and IR-text assumptions in the sections below are superseded
 by these decisions where they conflict.
