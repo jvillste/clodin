@@ -91,13 +91,17 @@
 ;;; ---------------------------------------------------------------------------
 
 (defn render-procedure
-  [name param-names param-types return-type result-value lines]
+  "Renders a procedure as llvm ir. Allocas are emitted at the start of
+  the entry block so that a let inside a loop does not grow the stack on
+  every iteration."
+  [name param-names param-types return-type result-value allocas lines]
   (let [parameter-list (string/join
                         ", "
                         (map (fn [param-type param-name]
                                (str (llvm-type param-type) " %" param-name))
                              param-types
                              param-names))
+        alloca-lines (apply str (map (fn [line] (str "  " line "\n")) allocas))
         body (apply str (map (fn [line]
                                (if (string/ends-with? line ":")
                                  (str line "\n")
@@ -110,6 +114,7 @@
          (if return-type (llvm-type return-type) "void")
          " @\"" name "\"(" parameter-list ") {\n"
          "entry:\n"
+         alloca-lines
          body
          return-line
          "}\n")))
@@ -120,7 +125,7 @@
               "  %1 = mul i64 %number, 2\n"
               "  ret i64 %1\n"
               "}\n")
-         (render-procedure "twice" ["number"] [:i64] :i64 "%1"
+         (render-procedure "twice" ["number"] [:i64] :i64 "%1" nil
                            ["%1 = mul i64 %number, 2"])))
   (testing "labels are rendered without indentation"
     (is (= (str "define void @\"loop\"() {\n"
@@ -131,11 +136,23 @@
                 "while.end:\n"
                 "  ret void\n"
                 "}\n")
-           (render-procedure "loop" [] [] nil nil
+           (render-procedure "loop" [] [] nil nil nil
                              ["br label %while.cond"
                               "while.cond:"
                               "br label %while.end"
-                              "while.end:"])))))
+                              "while.end:"]))))
+  (testing "allocas are hoisted to the entry block"
+    (is (= (str "define i64 @\"hoisted\"() {\n"
+                "entry:\n"
+                "  %value.slot.1 = alloca i64\n"
+                "  store i64 1, ptr %value.slot.1\n"
+                "  %1 = load i64, ptr %value.slot.1\n"
+                "  ret i64 %1\n"
+                "}\n")
+           (render-procedure "hoisted" [] [] :i64 "%1"
+                             ["%value.slot.1 = alloca i64"]
+                             ["store i64 1, ptr %value.slot.1"
+                              "%1 = load i64, ptr %value.slot.1"])))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Panama integration
@@ -274,7 +291,8 @@
 ;;; Expression compilation
 ;;;
 ;;; An emitter state is
-;;; {:lines [...] :temporary-index n :label-index n :block-terminated? bool}.
+;;; {:lines [...] :allocas [...] :temporary-index n :label-index n
+;;;  :slot-index n :block-terminated? bool}.
 ;;; Expression compilation returns [state value-representation type].
 ;;; A form that produces no value, such as store, set or while, returns
 ;;; nil as both the value and the type.
@@ -282,11 +300,19 @@
 ;;; The environment maps a local name to {:type ... :slot "%name"}.
 ;;; Locals live in stack slots allocated with alloca, so a set inside a
 ;;; loop is visible in the next iteration without building phi nodes.
+;;; Allocas are collected in :allocas and rendered once at the start of
+;;; the entry block, so a let inside a loop reuses its slot instead of
+;;; growing the stack on every iteration.
 ;;; ---------------------------------------------------------------------------
 
 (defn- emit-line
   [state line]
   (update state :lines conj line))
+
+(defn- add-alloca
+  "Records an alloca to be emitted at the start of the entry block."
+  [state line]
+  (update state :allocas conj line))
 
 (defn- emit-label
   "Emits a basic block label. Labels are not indented."
@@ -581,10 +607,10 @@
                                              " but its value is " value-type)
                                         {:name name :type type :value-type value-type})))
                       (let [[state slot] (fresh-local-slot state name)
-                            state (emit-line state
-                                             (format "%s = alloca %s"
-                                                     slot
-                                                     (llvm-type type)))
+                            state (add-alloca state
+                                              (format "%s = alloca %s"
+                                                      slot
+                                                      (llvm-type type)))
                             state (emit-line state
                                              (format "store %s %s, ptr %s"
                                                      (llvm-type type)
@@ -752,8 +778,9 @@
   "Registers the ir and signature of a procedure and marks the module
   dirty. The module is compiled later, once, when a native procedure
   is first called."
-  [name param-names param-types return-type result-value lines]
-  (let [ir (render-procedure name param-names param-types return-type result-value lines)]
+  [name param-names param-types return-type result-value allocas lines]
+  (let [ir (render-procedure name param-names param-types return-type result-value
+                             allocas lines)]
     (swap! procedure-registry
            assoc name
            {:param-types (vec param-types)
@@ -766,8 +793,9 @@
   "Registers a procedure and immediately compiles and loads the whole
   module. defproc uses register-procedure! instead so that a batch of
   procedures is compiled only once."
-  [name param-names param-types return-type result-value lines]
-  (register-procedure! name param-names param-types return-type result-value lines)
+  [name param-names param-types return-type result-value allocas lines]
+  (register-procedure! name param-names param-types return-type result-value
+                       allocas lines)
   (compile-module!))
 
 (defn- defproc-form
@@ -786,8 +814,9 @@
         param-types (mapv second param-pairs)
         explicit-return-type (when (keyword? (first body)) (first body))
         body-forms (if explicit-return-type (next body) body)
-        {:keys [result-value return-type lines]}
-        (compile-body {:lines [] :temporary-index 0 :label-index 0 :slot-index 0}
+        {:keys [result-value return-type allocas lines]}
+        (compile-body {:lines [] :allocas [] :temporary-index 0
+                       :label-index 0 :slot-index 0}
                       (into {} (map (fn [param-name param-type]
                                       [param-name {:type param-type
                                                    :slot (str "%" param-name)
@@ -800,7 +829,8 @@
       (throw (ex-info (str "Procedure " name " declares return type " return-type
                            " but its body does not produce a value")
                       {:procedure name :return-type return-type})))
-    (register-procedure! (str name) param-names param-types return-type result-value lines)
+    (register-procedure! (str name) param-names param-types return-type result-value
+                         allocas lines)
     `(defn ~name [~@param-names]
        (invoke-procedure ~(str name) [~@param-names]))))
 
@@ -911,6 +941,15 @@
       (set index (+ index 1)))
     sum))
 
+(defproc sum-squares [limit :i64]
+  (let [sum :i64 0
+        index :i64 0]
+    (while (< index limit)
+      (let [square :i64 (* index index)]
+        (set sum (+ sum square)))
+      (set index (+ index 1)))
+    sum))
+
 (deftest test-substract-one
   (is (= 9 (substract-one 10))))
 
@@ -978,6 +1017,11 @@
       (is (= 3 (.getAtIndex buffer ValueLayout/JAVA_LONG 3)))
       (finally
         (.close arena)))))
+
+(deftest test-let-inside-while
+  (testing "a let inside a while is hoisted and reused"
+    (is (= 14 (sum-squares 4)))
+    (is (= 0 (sum-squares 0)))))
 
 (defn -main
   [& _]

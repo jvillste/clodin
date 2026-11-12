@@ -2,16 +2,6 @@
 
 ## Caveats to fix
 
-- [ ] Hoist `let` allocas to the function entry block.
-
-  Currently `compile-let` emits `alloca` instructions at the point where
-  the `let` appears. A `let` inside a `while` body therefore allocates new
-  stack storage on every loop iteration, and none of it is released until
-  the procedure returns.
-
-  Fix by collecting allocas in the emitter state and emitting them directly
-  after the `entry:` label, before any loop or branch code.
-
 - [ ] Support or explicitly reject `set` on function parameters.
 
   Parameters are represented as raw LLVM values (`:parameter? true`), not as
