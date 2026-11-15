@@ -3,7 +3,11 @@
 ## Decisions
 
 - [x] Generate LLVM IR with the LLVM C API (`LLVMBuild*`,
-  `LLVMAddFunction`, ...), not by rendering IR text.
+  `LLVMAddFunction`, ...), not by rendering IR text. Implemented:
+  `clodin.llvm-api` wraps the bindings; `clodin.compiler` emits each
+  procedure through the C API into per-procedure bitcode stored in the
+  registry, then links all bitcode and JITs it with LLJIT in-process.
+  The full test suite passes on Linux/AArch64.
 - [x] Bind the LLVM C API with jextract-generated Panama bindings.
 - [x] Compile and load in-process with LLVM ORC/LLJIT. No `.ll` or `.so`
   files and no clang child process.
