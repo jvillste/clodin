@@ -181,14 +181,6 @@ to push the hot loop into native clodin code that mutates one contiguous
 
 ### Buffer ergonomics
 
-- [ ] Add typed array indexing over a `:ptr`.
-
-  A coordinate buffer is `n` nodes x 2 doubles (`16` bytes per node, x at
-  `+0` and y at `+8`). Manual `(pointer-add ptr (* index 16))` works but is
-  error-prone. Add something like `(buffer-get buf type index)` /
-  `(buffer-set buf type index value)` that scales the element size, or an
-  Odin-style `{:x :f64 :y :f64}` struct / `:array` type.
-
 - [ ] Represent the neighbour lists as CSR buffers.
 
   Flatten the `neighbours` vector-of-vectors once into an `offsets`
