@@ -20,6 +20,11 @@
   (load type pointer), (store type pointer value), (pointer-add pointer
   offset) and (to-pointer integer-address).
 
+  Uniform element buffers are read and written with (buffer-get pointer
+  type index) and (buffer-set pointer type index value), where index counts
+  elements: the offset is index times the element size (8 bytes for
+  :i64/:f64/:ptr, 4 bytes for :i32/:f32).
+
   Local variables are introduced with (let [name type value ...] body...)
   and mutated with (set name value). Loops are written with
   (while condition body...).
@@ -341,6 +346,82 @@
     (let [result (llvm/build-bytes-gep state pointer-value offset-value)]
       [state result :ptr])))
 
+(defn- element-size
+  "The size in bytes of one buffer element of the given type."
+  [type]
+  (case type
+    :i64 8
+    :i32 4
+    :f64 8
+    :f32 4
+    :ptr 8
+    (throw (ex-info (str "No buffer element size for type " type) {:type type}))))
+
+(defn- compile-buffer-get
+  "Compiles (buffer-get pointer type index) into a load from the pointer
+  scaled by the element size of type, so index counts elements, not bytes."
+  [state environment expression]
+  (when-not (= 4 (count expression))
+    (throw (ex-info "buffer-get expects (buffer-get pointer type index)"
+                    {:expression expression})))
+  (let [[pointer-form type index-form] (rest expression)
+        size (element-size type)
+        [state pointer-value pointer-type]
+        (compile-expression state environment pointer-form)]
+    (when-not (= :ptr pointer-type)
+      (throw (ex-info (str "buffer-get expects a :ptr pointer, got " pointer-type)
+                      {:type pointer-type})))
+    (let [[state index-value index-type]
+          (compile-expression state environment index-form)]
+      (when-not (#{:i64 :i32} index-type)
+        (throw (ex-info (str "buffer-get expects an integer index, got " index-type)
+                        {:type index-type})))
+      (let [builder (:builder state)
+            context (:context state)
+            arena (:arena state)
+            offset (llvm/build-int-mul builder index-value
+                                       (llvm/const-int-of-type context index-type size)
+                                       nil arena)
+            element-pointer (llvm/build-bytes-gep state pointer-value offset)
+            result (llvm/build-load builder (llvm/type-for context type)
+                                    element-pointer arena nil)]
+        [state result type]))))
+
+(defn- compile-buffer-set
+  "Compiles (buffer-set pointer type index value) into a store to the pointer
+  scaled by the element size of type, so index counts elements, not bytes.
+  A buffer-set does not produce a value."
+  [state environment expression]
+  (when-not (= 5 (count expression))
+    (throw (ex-info "buffer-set expects (buffer-set pointer type index value)"
+                    {:expression expression})))
+  (let [[pointer-form type index-form value-form] (rest expression)
+        size (element-size type)
+        [state pointer-value pointer-type]
+        (compile-expression state environment pointer-form)]
+    (when-not (= :ptr pointer-type)
+      (throw (ex-info (str "buffer-set expects a :ptr pointer, got " pointer-type)
+                      {:type pointer-type})))
+    (let [[state index-value index-type]
+          (compile-expression state environment index-form)]
+      (when-not (#{:i64 :i32} index-type)
+        (throw (ex-info (str "buffer-set expects an integer index, got " index-type)
+                        {:type index-type})))
+      (let [[state stored-value stored-type]
+            (compile-expression state environment value-form)]
+        (when-not (= type stored-type)
+          (throw (ex-info (str "buffer-set expects a " type " value, got " stored-type)
+                          {:element-type type :value-type stored-type})))
+        (let [builder (:builder state)
+              context (:context state)
+              arena (:arena state)
+              offset (llvm/build-int-mul builder index-value
+                                         (llvm/const-int-of-type context index-type size)
+                                         nil arena)
+              element-pointer (llvm/build-bytes-gep state pointer-value offset)]
+          (llvm/build-store builder stored-value element-pointer)
+          [state nil nil])))))
+
 (defn- compile-to-pointer
   "Compiles (to-pointer address), converting an integer address to :ptr."
   [state environment expression]
@@ -495,6 +576,8 @@
         (= operator 'load) (compile-load state environment expression)
         (= operator 'store) (compile-store state environment expression)
         (= operator 'pointer-add) (compile-pointer-add state environment expression)
+        (= operator 'buffer-get) (compile-buffer-get state environment expression)
+        (= operator 'buffer-set) (compile-buffer-set state environment expression)
         (= operator 'to-pointer) (compile-to-pointer state environment expression)
         (= operator 'let) (compile-let state environment expression)
         (= operator 'set) (compile-set state environment expression)
@@ -534,6 +617,8 @@
           (= operator 'load) (second expression)
           (= operator 'store) nil
           (= operator 'pointer-add) :ptr
+          (= operator 'buffer-get) (nth expression 2)
+          (= operator 'buffer-set) nil
           (= operator 'to-pointer) :ptr
           (= operator 'let)
           (let [[_ bindings & inner-body] expression
@@ -862,6 +947,63 @@
 
 (defproc max-int [a :i64 b :i64]
   (max a b))
+
+(defproc fill-buffer-f64 [pointer :ptr value :f64 count :i64]
+  (let [index :i64 0]
+    (while (< index count)
+      (buffer-set pointer :f64 index value)
+      (set index (+ index 1)))))
+
+(defproc sum-buffer-f64 [pointer :ptr count :i64]
+  (let [sum :f64 0.0
+        index :i64 0]
+    (while (< index count)
+      (set sum (+ sum (buffer-get pointer :f64 index)))
+      (set index (+ index 1)))
+    sum))
+
+(defproc buffer-i32-at [pointer :ptr index :i64]
+  (buffer-get pointer :i32 index))
+
+(defproc buffer-f64-at [pointer :ptr index :i64]
+  (buffer-get pointer :f64 index))
+
+(defproc buffer-i32-set-at [pointer :ptr index :i64 value :i32]
+  (buffer-set pointer :i32 index value))
+
+(deftest test-buffer-get-set
+  (let [arena (Arena/ofShared)
+        buffer (.allocate arena 40)]
+    (try
+      (testing "f64 elements are 8 bytes apart"
+        (fill-buffer-f64 buffer 2.5 4)
+        (is (= 10.0 (sum-buffer-f64 buffer 4)))
+        (is (= 2.5 (.getAtIndex buffer ValueLayout/JAVA_DOUBLE 3))))
+
+      (testing "i32 elements are 4 bytes apart"
+        (buffer-i32-set-at buffer 1 33)
+        (buffer-i32-set-at buffer 2 44)
+        (is (= 33 (buffer-i32-at buffer 1)))
+        (is (= 44 (buffer-i32-at buffer 2)))
+        (is (= 33 (.getAtIndex buffer ValueLayout/JAVA_INT 1)))
+        (is (= 44 (.getAtIndex buffer ValueLayout/JAVA_INT 2)))
+        (is (= 0 (.getAtIndex buffer ValueLayout/JAVA_INT 0))))
+
+      (testing "f64 and i32 views address the same bytes"
+        ;; f64 index 1 occupies bytes 8-15, which are exactly i32 indices 2
+        ;; and 3, so a write through the i32 view must be visible through the
+        ;; f64 view (little-endian: i32 2 is the low half, i32 3 the high).
+        (fill-buffer-f64 buffer 0.0 2)
+        (buffer-i32-set-at buffer 2 123456789)
+        (buffer-i32-set-at buffer 3 -987654321)
+        (is (= 123456789 (buffer-i32-at buffer 2)))
+        (is (= -987654321 (buffer-i32-at buffer 3)))
+        (is (= 123456789 (.getAtIndex buffer ValueLayout/JAVA_INT 2)))
+        (is (= -987654321 (.getAtIndex buffer ValueLayout/JAVA_INT 3)))
+        (is (= (.getAtIndex buffer ValueLayout/JAVA_LONG 1)
+               (Double/doubleToRawLongBits (buffer-f64-at buffer 1)))))
+      (finally
+        (.close arena)))))
 
 (deftest test-math-intrinsics
   (testing "sqrt"
