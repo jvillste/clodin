@@ -22,7 +22,12 @@
 
   Local variables are introduced with (let [name type value ...] body...)
   and mutated with (set name value). Loops are written with
-  (while condition body...)."
+  (while condition body...).
+
+  Math helpers: (sqrt x), (abs x), (min a b ...) and (max a b ...). sqrt
+  and abs take floats; abs also accepts integers. min and max accept floats
+  or integers, all operands sharing one type. They lower to the llvm.sqrt,
+  llvm.fabs, llvm.minnum/llvm.maxnum and llvm.smin/llvm.smax intrinsics."
   (:require [clodin.llvm-api :as llvm]
             [clojure.test :refer [deftest is run-tests testing]])
   (:import (java.lang.foreign Arena FunctionDescriptor Linker Linker$Option
@@ -206,6 +211,65 @@
         (if (:return-type procedure)
           [state result (:return-type procedure)]
           [state nil nil])))))
+
+(defn- compile-sqrt
+  "Compiles (sqrt x), the square root of a floating point value, lowered to
+  the llvm.sqrt intrinsic."
+  [state environment expression]
+  (when-not (= 2 (count expression))
+    (throw (ex-info "sqrt expects exactly one operand" {:expression expression})))
+  (let [[state value type] (compile-expression state environment (second expression))]
+    (when-not (float-type? type)
+      (throw (ex-info (str "sqrt expects a float operand, got " type) {:type type})))
+    (let [result (llvm/build-intrinsic-fcall state "llvm.sqrt" type [value])]
+      [state result type])))
+
+(defn- compile-abs
+  "Compiles (abs x), the absolute value. Floats lower to the llvm.fabs
+  intrinsic; integers are expanded with a sign test and select."
+  [state environment expression]
+  (when-not (= 2 (count expression))
+    (throw (ex-info "abs expects exactly one operand" {:expression expression})))
+  (let [[state value type] (compile-expression state environment (second expression))]
+    (cond
+      (float-type? type)
+      (let [result (llvm/build-intrinsic-fcall state "llvm.fabs" type [value])]
+        [state result type])
+
+      (#{:i64 :i32} type)
+      (let [builder (:builder state)
+            arena (:arena state)
+            zero (llvm/const-int-of-type (:context state) type 0)
+            negated (llvm/build-int-sub builder zero value nil arena)
+            negative? (llvm/build-icmp builder '< value zero arena)
+            result (llvm/build-select builder negative? negated value arena)]
+        [state result type])
+
+      :else
+      (throw (ex-info (str "abs expects a number, got " type) {:type type})))))
+
+(defn- compile-min-or-max
+  "Compiles (min a b ...) and (max a b ...), folding the operands left to
+  right. Floats lower to llvm.minnum/llvm.maxnum; integers to
+  llvm.smin/llvm.smax. All operands must have the same type."
+  [state environment operator operand-forms]
+  (when (< (count operand-forms) 2)
+    (throw (ex-info (str operator " needs at least 2 operands") {:operator operator})))
+  (let [[state values types] (compile-operands state environment operand-forms)
+        distinct-types (distinct types)]
+    (when-not (= 1 (count distinct-types))
+      (throw (ex-info (str "Mixed operand types " distinct-types
+                           " for operator " operator)
+                      {:operator operator :types types})))
+    (let [argument-type (first distinct-types)
+          prefix (if (float-type? argument-type)
+                   (if (= operator 'min) "llvm.minnum" "llvm.maxnum")
+                   (if (= operator 'min) "llvm.smin" "llvm.smax"))
+          result (reduce (fn [accumulate value]
+                           (llvm/build-intrinsic-fcall state prefix argument-type
+                                                       [accumulate value]))
+                         (first values) (rest values))]
+      [state result argument-type])))
 
 (defn- compile-to-float
   "Compiles (to-float x), a cast of an integer value to a 64 bit float."
@@ -425,6 +489,9 @@
         (#{'+ '- '* '/} operator) (compile-arithmetic state environment operator (rest expression))
         (#{'< '<= '> '>= '= 'not=} operator) (compile-comparison state environment operator (rest expression))
         (= operator 'to-float) (compile-to-float state environment expression)
+        (= operator 'sqrt) (compile-sqrt state environment expression)
+        (= operator 'abs) (compile-abs state environment expression)
+        (#{'min 'max} operator) (compile-min-or-max state environment operator (rest expression))
         (= operator 'load) (compile-load state environment expression)
         (= operator 'store) (compile-store state environment expression)
         (= operator 'pointer-add) (compile-pointer-add state environment expression)
@@ -462,6 +529,8 @@
           (#{'+ '- '* '/} operator) (expression-type environment (second expression))
           (#{'< '<= '> '>= '= 'not=} operator) :i1
           (= operator 'to-float) :f64
+          (#{'sqrt 'abs} operator) (expression-type environment (second expression))
+          (#{'min 'max} operator) (expression-type environment (second expression))
           (= operator 'load) (second expression)
           (= operator 'store) nil
           (= operator 'pointer-add) :ptr
@@ -772,6 +841,41 @@
         (set sum (+ sum square)))
       (set index (+ index 1)))
     sum))
+
+(defproc sqrt-of [x :f64]
+  (sqrt x))
+
+(defproc abs-float [x :f64]
+  (abs x))
+
+(defproc abs-int [x :i64]
+  (abs x))
+
+(defproc min-two [a :f64 b :f64]
+  (min a b))
+
+(defproc max-three [a :f64 b :f64 c :f64]
+  (max a b c))
+
+(defproc min-int [a :i64 b :i64]
+  (min a b))
+
+(defproc max-int [a :i64 b :i64]
+  (max a b))
+
+(deftest test-math-intrinsics
+  (testing "sqrt"
+    (is (= 3.0 (sqrt-of 9.0))))
+
+  (testing "abs"
+    (is (= 4.0 (abs-float -4.0)))
+    (is (= 7 (abs-int -7))))
+
+  (testing "min/max"
+    (is (= 2.0 (min-two 5.0 2.0)))
+    (is (= 9.0 (max-three 1.0 9.0 3.0)))
+    (is (= 3 (min-int 7 3)))
+    (is (= 8 (max-int 8 2)))))
 
 (deftest test-substract-one
   (is (= 9 (substract-one 10))))

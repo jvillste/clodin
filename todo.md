@@ -209,6 +209,100 @@ did not change.
   the module. A background compile could be started after registration
   and joined only when a procedure is actually called.
 
+
+## Spring layout on a single buffer
+
+The reference implementation lives in `src/examples/spring_layout.clj`
+(`examples.spring-layout`). The physics is pure Clojure today; the goal is
+to push the hot loop into native clodin code that mutates one contiguous
+`f64` coordinate buffer, and to draw it live with Java2D.
+
+### Intrinsics (done)
+
+- [x] Add `sqrt`, `abs`, `min`, `max` to the compiler.
+
+  `sqrt`/`abs` are unary, `min`/`max` are variadic folding; floats and
+  integers are supported (abs expands ints with a sign test + select).
+  They lower to `llvm.sqrt`, `llvm.fabs`, `llvm.minnum`/`llvm.maxnum`, and
+  `llvm.smin`/`llvm.smax`, added as `clodin.llvm-api/build-intrinsic-fcall`
+  and dispatched in `compile-expression` / `expression-type`. Tests:
+  `test-math-intrinsics`.
+
+### Buffer ergonomics
+
+- [ ] Add typed array indexing over a `:ptr`.
+
+  A coordinate buffer is `n` nodes x 2 doubles (`16` bytes per node, x at
+  `+0` and y at `+8`). Manual `(pointer-add ptr (* index 16))` works but is
+  error-prone. Add something like `(buffer-get buf type index)` /
+  `(buffer-set buf type index value)` that scales the element size, or an
+  Odin-style `{:x :f64 :y :f64}` struct / `:array` type.
+
+- [ ] Represent the neighbour lists as CSR buffers.
+
+  Flatten the `neighbours` vector-of-vectors once into an `offsets`
+  (`node-count + 1` i64s) and `indices` (`2 * edge-count` i64s) pair of
+  segments built in Clojure and passed to the native procs as `:ptr`s.
+
+### Native simulation
+
+- [ ] Port `step-layout` to a native void proc.
+
+  Signature operating entirely on caller-owned buffers:
+
+  ```clojure
+  (defproc step-layout-native
+    [positions :ptr                     ; n x 2 doubles
+     displacement-scratch :ptr         ; scratch, same shape
+     offsets :ptr  indices :ptr        ; CSR neighbours
+     node-count :i64
+     node-distance :f64  temperature :f64]
+    ...)    ; fill displacements, then cull positions in place
+  ```
+
+  Per-node displacement returns a pair, so the two displacement values are
+  written into the scratch buffer rather than returned (clodin procs return
+  one value).
+
+- [ ] Port `run-simulation` to a native void proc with the cooling loop.
+
+  `run-simulation-native` loops `iterations` inside native code (calling
+  `step-layout-native`), so the JVM is crossed once per run, not once per
+  step. Keep initial positions (`sin`/`cos` circle) computed in Clojure and
+  written into the buffer once.
+
+- [ ] Verify the native result against the pure implementation.
+
+  Run `run-simulation-native` and the existing pure
+  `examples.spring-layout/run-simulation` on the same dependency graph and
+  compare the final positions within the `minimum-distance` tolerance.
+
+### Live visualization
+
+- [ ] Add a Swing viewer that draws the graph with Java2D.
+
+  Plain Clojure renderer: `BufferedImage` + `Graphics2D` with antialiasing,
+  a world->pixels transform, edges as `Line2D`/`Polygon` with an arrowhead
+  at the dependent->dependency end, nodes as filled ovals, and labels via
+  `drawString`. Do **not** rasterize with clodin: arrows + text need path
+  stroking and a font/glyph rasterizer that Java2D provides for free.
+
+- [ ] Use a double buffer for the simulation/display handoff.
+
+  The simulation thread writes a back buffer; every `n` steps (about
+  5-15) it copies back->front; the EDT draws only the front buffer so every
+  frame is a complete, tearing-free snapshot. The swap can be folded into
+  `run-simulation-native` (n internal steps + memcpy per outer iteration)
+  so the JVM is crossed every `n` steps instead of every step. Use an
+  `Arena/ofShared` (not confined) since two threads touch the segment; load
+  and store of a single `f64` are atomic, so a shared segment is safe.
+
+- [ ] Run the simulation off the EDT.
+
+  Simulation on its own plain executor thread; the EDT just calls `repaint`
+  from a `javax.swing.Timer` at ~30-60 fps, decoupling physics rate from
+  paint rate.
+
 ## Next feature
 
 - [ ] Add the Odin-style buffer/array type with a length stored in the first

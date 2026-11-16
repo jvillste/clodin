@@ -143,6 +143,12 @@
   ^MemorySegment [^MemorySegment context long-value]
   (LLVM/LLVMConstInt (LLVM/LLVMInt64TypeInContext context) (long long-value) 0))
 
+(defn const-int-of-type
+  "A constant integer of the given clodin type."
+  ^MemorySegment [^MemorySegment context type long-value]
+  (LLVM/LLVMConstInt (type-for context type) (long long-value) 0))
+
+
 (defn const-real
   "A constant 64 bit floating point value."
   ^MemorySegment [^MemorySegment context double-value]
@@ -239,6 +245,14 @@
   ^MemorySegment [^MemorySegment builder operator lhs rhs arena]
   (LLVM/LLVMBuildFCmp builder (real-predicate operator) lhs rhs (name-token builder arena "")))
 
+(defn build-select
+  "Builds an llvm.select instruction: condition ? then-value : else-value."
+  ^MemorySegment [^MemorySegment builder ^MemorySegment condition
+                  ^MemorySegment then-value ^MemorySegment else-value ^Arena arena]
+  (LLVM/LLVMBuildSelect builder condition then-value else-value
+   (name-token builder arena "")))
+
+
 ;;; --- control flow -----------------------------------------------------------
 
 (defn build-br
@@ -283,6 +297,33 @@
      (pointer-array arena argument-values)
      count
      (name-token builder arena ""))))
+
+(defn- type-suffix
+  "The text suffix LLVM appends to the name of an overloaded intrinsic for a
+  given clodin type, e.g. \"f64\" -> llvm.sqrt.f64."
+  [type]
+  (case type
+    :f64 "f64"
+    :f32 "f32"
+    :i64 "i64"
+    :i32 "i32"
+    (throw (ex-info (str "No intrinsic suffix for type " type) {:type type}))))
+
+(defn build-intrinsic-fcall
+  "Declares a named LLVM intrinsic overloaded on argument-type (a clodin type
+  keyword) and calls it with argument-values. The intrinsic is identified by
+  its textual name, composed from prefix and the type suffix, e.g. prefix
+  \"llvm.sqrt\" with :f64 becomes \"llvm.sqrt.f64\". Returns the result
+  value; the result type equals argument-type. Intrinsics are lowered by the
+  JIT so no external symbol needs to be resolved."
+  [state prefix argument-type argument-values]
+  (let [{:keys [context module builder arena]} state
+        name (str prefix "." (type-suffix argument-type))
+        param-types (vec (repeat (count argument-values) argument-type))
+        function-type (function-type context arena argument-type param-types)
+        callee (get-or-add-function module (c-string arena name) function-type)]
+    (build-call builder function-type callee argument-values arena)))
+
 
 ;;; --- function parameters -----------------------------------------------------
 
