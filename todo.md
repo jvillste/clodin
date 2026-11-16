@@ -1,40 +1,5 @@
 # Clodin compiler TODOs
 
-## Decisions
-
-- [x] Generate LLVM IR with the LLVM C API (`LLVMBuild*`,
-  `LLVMAddFunction`, ...), not by rendering IR text. Implemented:
-  `clodin.llvm-api` wraps the bindings; `clodin.compiler` emits each
-  procedure through the C API into per-procedure bitcode stored in the
-  registry, then links all bitcode and JITs it with LLJIT in-process.
-  The full test suite passes on Linux/AArch64.
-- [x] Bind the LLVM C API with jextract-generated Panama bindings.
-- [x] Compile and load in-process with LLVM ORC/LLJIT. No `.ll` or `.so`
-  files and no clang child process.
-- [x] macOS on Apple Silicon is the primary target. Verify jextract
-  output, `libLLVM.dylib` discovery, and ORC JIT execution on macOS
-  before depending on them.
-- [x] Start with whole-module rebuild for hot reload. Rebuild the whole
-  LLVM module on any change, but reuse per-procedure bitcode for
-  procedures that did not change. Stable thunks and indirect calls are
-  deferred until there is a concrete use case for recompiling a single
-  function.
-- [x] Run `scripts/generate-llvm-bindings.sh` to install jextract and
-  generate the LLVM C API bindings. Tested on Linux/AArch64 with
-  LLVM 21.1: the generated bindings build a function through the C
-  API, JIT it with LLJIT, and call it through Panama. Bindings are
-  generated per platform under `target/classes/<platform>`, and
-  `target/current` points at the active set.
-- [x] On macOS, verify that jextract-generated bindings can load
-  Homebrew's `libLLVM.dylib`, run ORC JIT code, and downcall into it
-  with Panama. Verified on macOS/AArch64: the smoke test printed
-  `twice(21) = 42`. The earlier "cannot execute binary file" error
-  was caused by the Linux and macOS jextract installs sharing one
-  directory; jextract is now installed per platform.
-
-The clang and IR-text assumptions in the sections below are superseded
-by these decisions where they conflict.
-
 ## Hot reload notes from Extempore
 
 Extempore does **not** recompile the functions that depend on a changed
@@ -74,9 +39,6 @@ stores:
   site.
 - `:dirty?` — true when the entry changed since the last successful
   build.
-
-The registry does not store rendered text IR, `.ll` paths, `.so` paths,
-or clang output.
 
 `defproc` evaluation type-checks the body, generates bitcode through
 the C API, records the signature, AST, bitcode, and callees, and marks
@@ -217,17 +179,6 @@ The reference implementation lives in `src/examples/spring_layout.clj`
 to push the hot loop into native clodin code that mutates one contiguous
 `f64` coordinate buffer, and to draw it live with Java2D.
 
-### Intrinsics (done)
-
-- [x] Add `sqrt`, `abs`, `min`, `max` to the compiler.
-
-  `sqrt`/`abs` are unary, `min`/`max` are variadic folding; floats and
-  integers are supported (abs expands ints with a sign test + select).
-  They lower to `llvm.sqrt`, `llvm.fabs`, `llvm.minnum`/`llvm.maxnum`, and
-  `llvm.smin`/`llvm.smax`, added as `clodin.llvm-api/build-intrinsic-fcall`
-  and dispatched in `compile-expression` / `expression-type`. Tests:
-  `test-math-intrinsics`.
-
 ### Buffer ergonomics
 
 - [ ] Add typed array indexing over a `:ptr`.
@@ -303,7 +254,7 @@ to push the hot loop into native clodin code that mutates one contiguous
   from a `javax.swing.Timer` at ~30-60 fps, decoupling physics rate from
   paint rate.
 
-## Next feature
+## Next features
 
 - [ ] Add the Odin-style buffer/array type with a length stored in the first
   memory slot.
