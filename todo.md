@@ -177,7 +177,7 @@ did not change.
 The reference implementation lives in `src/examples/spring_layout.clj`
 (`examples.spring-layout`). The physics is pure Clojure today; the goal is
 to push the hot loop into native clodin code that mutates one contiguous
-`f64` coordinate buffer, and to draw it live with Java2D.
+`f32` coordinate buffer, and to draw it live with Java2D.
 
 ### Live visualization
 
@@ -197,7 +197,7 @@ to push the hot loop into native clodin code that mutates one contiguous
   `run-simulation-native` (n internal steps + memcpy per outer iteration)
   so the JVM is crossed every `n` steps instead of every step. Use an
   `Arena/ofShared` (not confined) since two threads touch the segment; load
-  and store of a single `f64` are atomic, so a shared segment is safe.
+  and store of a single `f32` are atomic, so a shared segment is safe.
 
 - [ ] Run the simulation off the EDT.
 
