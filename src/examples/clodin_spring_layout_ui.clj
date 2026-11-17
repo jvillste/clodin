@@ -177,9 +177,9 @@
                        (let [s (+ step offset)]
                          (when (< s max-steps)
                            (layout/step-layout-native positions displacements offsets indices
-                                                          (long node-count) (float node-distance)
-                                                          (float (* initial-temperature
-                                                                    (- 1.0 (/ (double s) max-steps))))))))
+                                                      (long node-count) (float node-distance)
+                                                      (float (* initial-temperature
+                                                                (- 1.0 (/ (double s) max-steps))))))))
                      (let [target (nth front-segments (mod (quot step steps-per-frame) 2))]
                        (.copyFrom target positions)
                        (reset! front-atom target))
@@ -280,3 +280,10 @@
         (finally
           (.dispose graphics)
           (.close (:arena layout)))))))
+
+
+(comment
+  (SwingUtilities/invokeLater #(show (clojure.edn/read-string (slurp "temp/mappa-dependency-graph.edn"))
+                                     {:iterations 2000
+                                      :fps 1}))
+  )
