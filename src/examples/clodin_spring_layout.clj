@@ -103,8 +103,9 @@
             difference-y :f32 (- y other-y)
             distance-squared :f32 (+ (* difference-x difference-x)
                                      (* difference-y difference-y))
-            distance :f32 (max (to-f32 1.0e-9) (sqrt distance-squared))
-            scale :f32 (/ ideal-squared (* distance distance))]
+            ;; repulsion scale is ideal^2 / distance^2, which uses the
+            ;; squared distance directly, so no sqrt is needed per pair
+            scale :f32 (/ ideal-squared (max (to-f32 1.0e-18) distance-squared))]
         (set displacement-x (+ displacement-x (* difference-x scale)))
         (set displacement-y (+ displacement-y (* difference-y scale)))
         (set other-index (+ other-index 1))))
