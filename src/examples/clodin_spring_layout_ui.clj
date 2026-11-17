@@ -13,14 +13,23 @@
   Rendering is plain Clojure + Java2D: arrows and text need path stroking and
   a font/glyph rasterizer, which Java2D provides for free - clodin is only
   used for the physics."
-  (:require [examples.clodin-spring-layout :as layout]
-            [clojure.test :refer [deftest is testing]])
-  (:import (java.awt BasicStroke Color Dimension Graphics2D RenderingHints)
+  (:require [clodin.compiler :as compiler]
+            [clojure.test :refer [deftest is testing]]
+            [examples.clodin-spring-layout :as layout])
+  (:import (java.awt
+            BasicStroke
+            Color
+            Dimension
+            RenderingHints)
            (java.awt.event ActionListener WindowAdapter)
            (java.awt.geom Ellipse2D$Double Line2D$Double Path2D$Double)
            (java.awt.image BufferedImage)
            (java.lang.foreign ValueLayout)
-           (javax.swing JFrame JPanel SwingUtilities Timer)))
+           (javax.swing
+            JFrame
+            JPanel
+            SwingUtilities
+            Timer)))
 
 (def ^:private background-color (Color. 245 245 245))
 (def ^:private edge-color (Color. 130 130 140))
@@ -286,4 +295,10 @@
   (SwingUtilities/invokeLater #(show (clojure.edn/read-string (slurp "temp/mappa-dependency-graph.edn"))
                                      {:iterations 2000
                                       :fps 1}))
+
+  (time (layout/layout-dependency-graph-native (clojure.edn/read-string (slurp "temp/mappa-dependency-graph.edn"))
+                                               {:node-distance 10
+                                                :iterations 5000}))
+  (compiler/set-optimization-level! #_:none
+                                    :O3)
   )
