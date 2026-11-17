@@ -809,7 +809,9 @@
                           (llvm/dispose-context context)
                           (throw error)))
             _ (llvm/verify module arena)
-            jit (llvm/create-jit arena @optimization-level)
+            _ (when-not (= :none @optimization-level)
+                (llvm/optimize-module! module arena @optimization-level))
+            jit (llvm/create-jit arena)
             _ (llvm/add-module-to-jit! jit module context)
             handles (build-handles jit arena)]
         (let [old-jit @current-jit]

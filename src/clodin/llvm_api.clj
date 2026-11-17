@@ -410,22 +410,22 @@
            "LLVM module failed verification"
            (.getString (.reinterpret message-pointer 4096) 0)))))))
 
-(defn- codegen-opt-level
-  "Maps a clodin optimization level keyword to the LLVM CodeGenOpt::Level
-  enum value (None=0, Less=1, Default=2, Aggressive=3)."
+(defn- optimization-pipeline
+  "The new-pass-manager pass pipeline string for an optimization level; nil
+  for :none (no optimization)."
   [level]
   (case level
-    :none 2
-    :O0 0
-    :O1 1
-    :O2 2
-    :O3 3
+    :none nil
+    :O0 "default<O0>"
+    :O1 "default<O1>"
+    :O2 "default<O2>"
+    :O3 "default<O3>"
     (throw (ex-info (str "Unknown optimization level: " level) {:level level}))))
 
 (defn- host-target-machine
   "Creates a TargetMachine for the host at the given LLVM codegen optimization
-  level. Used to build the LLJIT target machine so that it optimises the code
-  it emits. The caller must dispose it with LLVMDisposeTargetMachine."
+  level. LLVMRunPasses needs a target machine to run its IR optimization
+  pipeline. The caller must dispose it with LLVMDisposeTargetMachine."
   [^Arena arena codegen-level]
   (let [triple-ptr (LLVM/LLVMGetDefaultTargetTriple)
         triple (.getString triple-ptr 0)
@@ -443,6 +443,27 @@
      codegen-level
      (int 0) ; reloc: default
      (int 0)))) ; code model: default
+
+(defn optimize-module!
+  "Runs the LLVM new-pass-manager IR optimization pipeline for the given
+  level (:O0 :O1 :O2 :O3) over the module, in place. :none does nothing.
+  Optimizing preserves IEEE floating point semantics, so results are
+  unchanged, only faster. Requires the PassBuilderOptions handle that
+  LLVMRunPasses expects; it is created here via LLVMCreatePassBuilderOptions
+  and disposed afterwards."
+  [^MemorySegment module ^Arena arena level]
+  (let [pipeline (optimization-pipeline level)]
+    (when pipeline
+      (let [target-machine (host-target-machine arena 2) ; CodeGenOpt::Default
+            options (LLVM/LLVMCreatePassBuilderOptions)
+            error (LLVM/LLVMRunPasses module (c-string arena pipeline)
+                                      target-machine options)]
+        (LLVM/LLVMDisposeTargetMachine target-machine)
+        (LLVM/LLVMDisposePassBuilderOptions options)
+        (when-not (null? error)
+          (throw-error
+           {:module module :level level :pipeline pipeline}
+           (str "LLVM optimization pass " pipeline " failed")))))))
 
 (defn link-into!
   "Links the source module into the destination module, destroying the
@@ -530,26 +551,14 @@
   error-ref)
 
 (defn create-jit
-  "Creates an LLJIT instance whose target machine uses the given clodin
-  optimization level (:none :O0 :O1 :O2 :O3). :none uses the LLJIT defaults
-  exactly as before; the other levels build the JIT from a target machine at
-  the matching codegen optimization level. Returns the JIT handle."
-  ^MemorySegment [^Arena arena level]
-  (if (= level :none)
-    (let [out (.allocate arena ValueLayout/ADDRESS)]
-      (check-error (LLVM/LLVMOrcCreateLLJIT out (MemorySegment/NULL))
-                   "create LLJIT")
-      (.get out ValueLayout/ADDRESS 0))
-    (let [codegen-level (int (codegen-opt-level level))
-          target-machine (host-target-machine arena codegen-level)
-          target-machine-builder (LLVM/LLVMOrcJITTargetMachineBuilderCreateFromTargetMachine target-machine)
-          builder (LLVM/LLVMOrcCreateLLJITBuilder)
-          _ (LLVM/LLVMOrcLLJITBuilderSetJITTargetMachineBuilder builder target-machine-builder)
-          out (.allocate arena ValueLayout/ADDRESS)
-          _ (check-error (LLVM/LLVMOrcCreateLLJIT out builder)
-                         "create LLJIT")]
-      ;; LLVMOrcCreateLLJIT takes ownership of the builder
-      (.get out ValueLayout/ADDRESS 0))))
+  "Creates an LLJIT instance with LLVM's defaults. The optimization level is
+  applied earlier, by running the IR pass pipeline over the module (see
+  optimize-module!), not via the codegen level. Returns the JIT handle."
+  ^MemorySegment [^Arena arena]
+  (let [out (.allocate arena ValueLayout/ADDRESS)]
+    (check-error (LLVM/LLVMOrcCreateLLJIT out (MemorySegment/NULL))
+                 "create LLJIT")
+    (.get out ValueLayout/ADDRESS 0)))
 
 (defn jit-main-dylib
   ^MemorySegment [^MemorySegment jit]

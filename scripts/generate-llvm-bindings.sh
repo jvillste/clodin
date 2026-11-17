@@ -404,6 +404,25 @@ headers=(
     "$llvm_include/llvm-c/Support.h"
     "$llvm_include/llvm-c/Target.h"
     "$llvm_include/llvm-c/TargetMachine.h"
+# LLVM 20+ renames the PassBuilderOptions constructors; jextract emits
+# whichever this LLVM provides: LLVMCreatePassBuilderOptions /
+# LLVMDisposePassBuilderOptions (20+) or LLVMPassBuilderOptionsCreate /
+# LLVMPassBuilderOptionsDispose (earlier). clodin.llvm-api's optimize-module!
+
+# uses the 20+ names and relies on them being present (see PassBuilder.h,
+# which is included above).
+headers=(
+    "$llvm_include/llvm-c/Analysis.h"
+    "$llvm_include/llvm-c/BitReader.h"
+    "$llvm_include/llvm-c/BitWriter.h"
+    "$llvm_include/llvm-c/Core.h"
+    "$llvm_include/llvm-c/Error.h"
+    "$llvm_include/llvm-c/Linker.h"
+    "$llvm_include/llvm-c/LLJIT.h"
+    "$llvm_include/llvm-c/Orc.h"
+    "$llvm_include/llvm-c/Support.h"
+    "$llvm_include/llvm-c/Target.h"
+    "$llvm_include/llvm-c/TargetMachine.h"
     "$llvm_include/llvm-c/Transforms/PassBuilder.h"
 )
 
