@@ -171,40 +171,6 @@ did not change.
   the module. A background compile could be started after registration
   and joined only when a procedure is actually called.
 
-
-## Spring layout on a single buffer
-
-The reference implementation lives in `src/examples/spring_layout.clj`
-(`examples.spring-layout`). The physics is pure Clojure today; the goal is
-to push the hot loop into native clodin code that mutates one contiguous
-`f32` coordinate buffer, and to draw it live with Java2D.
-
-### Live visualization
-
-- [ ] Add a Swing viewer that draws the graph with Java2D.
-
-  Plain Clojure renderer: `BufferedImage` + `Graphics2D` with antialiasing,
-  a world->pixels transform, edges as `Line2D`/`Polygon` with an arrowhead
-  at the dependent->dependency end, nodes as filled ovals, and labels via
-  `drawString`. Do **not** rasterize with clodin: arrows + text need path
-  stroking and a font/glyph rasterizer that Java2D provides for free.
-
-- [ ] Use a double buffer for the simulation/display handoff.
-
-  The simulation thread writes a back buffer; every `n` steps (about
-  5-15) it copies back->front; the EDT draws only the front buffer so every
-  frame is a complete, tearing-free snapshot. The swap can be folded into
-  `run-simulation-native` (n internal steps + memcpy per outer iteration)
-  so the JVM is crossed every `n` steps instead of every step. Use an
-  `Arena/ofShared` (not confined) since two threads touch the segment; load
-  and store of a single `f32` are atomic, so a shared segment is safe.
-
-- [ ] Run the simulation off the EDT.
-
-  Simulation on its own plain executor thread; the EDT just calls `repaint`
-  from a `javax.swing.Timer` at ~30-60 fps, decoupling physics rate from
-  paint rate.
-
 ## Next features
 
 - [ ] Add the Odin-style buffer/array type with a length stored in the first

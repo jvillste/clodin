@@ -225,15 +225,14 @@
           (vec (repeat node-count []))
           edge-index-pairs))
 
-(defn layout-dependency-graph-native
-  "Native counterpart of `examples.spring-layout/layout-dependency-graph`:
-  returns a map from every var of the dependency graph to {:x ... :y ...}
-  after the given number of spring layout steps, computed by the clodin
-  procedures on a single f32 coordinate buffer. The initial circle positions
-  come from the pure implementation (which returns them for zero iterations),
-  so both simulations start from the same place."
-  [dependency-graph & [{:keys [node-distance iterations]
-                        :or {node-distance 10 iterations 200}}]]
+(defn graph-layout
+  "Allocates a layout for the given dependency graph: the shared arena, the
+  position and displacement scratch buffers, the CSR neighbour buffers, and
+  the initial circle positions written into the positions buffer. Returns
+  {:vars [...] :layout <layout>} where layout is the map from
+  layout-buffers. The arena stays open until the caller closes it, so this
+  can be used for live simulations."
+  [dependency-graph & [{:keys [node-distance] :or {node-distance 10}}]]
   (let [initial (spring-layout/layout-dependency-graph dependency-graph
                                                        {:node-distance node-distance
                                                         :iterations 0})
@@ -243,8 +242,21 @@
                                              (count vars))
         initial-positions (mapv (fn [var] (let [{:keys [x y]} (get initial var)] [x y])) vars)
         layout (layout-buffers neighbours)]
+    (write-positions! layout initial-positions)
+    {:vars vars :layout layout}))
+
+(defn layout-dependency-graph-native
+  "Native counterpart of `examples.spring-layout/layout-dependency-graph`:
+  returns a map from every var of the dependency graph to {:x ... :y ...}
+  after the given number of spring layout steps, computed by the clodin
+  procedures on a single f32 coordinate buffer. The initial circle positions
+  come from the pure implementation (which returns them for zero iterations),
+  so both simulations start from the same place."
+  [dependency-graph & [{:keys [node-distance iterations]
+                        :or {node-distance 10 iterations 200}}]]
+  (let [{:keys [vars layout]} (graph-layout dependency-graph
+                                           {:node-distance node-distance})]
     (try
-      (write-positions! layout initial-positions)
       (run-simulation! layout node-distance iterations)
       (into {}
             (map-indexed (fn [node-index [x y]]
