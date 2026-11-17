@@ -179,47 +179,6 @@ The reference implementation lives in `src/examples/spring_layout.clj`
 to push the hot loop into native clodin code that mutates one contiguous
 `f64` coordinate buffer, and to draw it live with Java2D.
 
-### Buffer ergonomics
-
-- [ ] Represent the neighbour lists as CSR buffers.
-
-  Flatten the `neighbours` vector-of-vectors once into an `offsets`
-  (`node-count + 1` i64s) and `indices` (`2 * edge-count` i64s) pair of
-  segments built in Clojure and passed to the native procs as `:ptr`s.
-
-### Native simulation
-
-- [ ] Port `step-layout` to a native void proc.
-
-  Signature operating entirely on caller-owned buffers:
-
-  ```clojure
-  (defproc step-layout-native
-    [positions :ptr                     ; n x 2 doubles
-     displacement-scratch :ptr         ; scratch, same shape
-     offsets :ptr  indices :ptr        ; CSR neighbours
-     node-count :i64
-     node-distance :f64  temperature :f64]
-    ...)    ; fill displacements, then cull positions in place
-  ```
-
-  Per-node displacement returns a pair, so the two displacement values are
-  written into the scratch buffer rather than returned (clodin procs return
-  one value).
-
-- [ ] Port `run-simulation` to a native void proc with the cooling loop.
-
-  `run-simulation-native` loops `iterations` inside native code (calling
-  `step-layout-native`), so the JVM is crossed once per run, not once per
-  step. Keep initial positions (`sin`/`cos` circle) computed in Clojure and
-  written into the buffer once.
-
-- [ ] Verify the native result against the pure implementation.
-
-  Run `run-simulation-native` and the existing pure
-  `examples.spring-layout/run-simulation` on the same dependency graph and
-  compare the final positions within the `minimum-distance` tolerance.
-
 ### Live visualization
 
 - [ ] Add a Swing viewer that draws the graph with Java2D.

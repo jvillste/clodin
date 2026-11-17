@@ -32,7 +32,14 @@
   Math helpers: (sqrt x), (abs x), (min a b ...) and (max a b ...). sqrt
   and abs take floats; abs also accepts integers. min and max accept floats
   or integers, all operands sharing one type. They lower to the llvm.sqrt,
-  llvm.fabs, llvm.minnum/llvm.maxnum and llvm.smin/llvm.smax intrinsics."
+  llvm.fabs, llvm.minnum/llvm.maxnum and llvm.smin/llvm.smax intrinsics.
+
+  (to-float x) converts an integer to a 64 bit float and (to-f32 x)
+  converts an integer or a 64 bit float to a 32 bit float. Float literals
+  are 64 bit, so f32 constants are written (to-f32 1.0e-9).
+
+  (if condition then else) chooses between two same-typed value expressions
+  with an llvm.select, so both branches must be pure."
   (:require [clodin.llvm-api :as llvm]
             [clojure.test :refer [deftest is run-tests testing]])
   (:import (java.lang.foreign Arena FunctionDescriptor Linker Linker$Option
@@ -288,6 +295,25 @@
                                     (:arena state) nil)]
       [state result :f64])))
 
+(defn- compile-to-f32
+  "Compiles (to-f32 x), a cast of an integer or a 64 bit float value to a
+  32 bit float."
+  [state environment expression]
+  (when-not (= 2 (count expression))
+    (throw (ex-info "to-f32 expects exactly one operand" {:expression expression})))
+  (let [[state value type] (compile-expression state environment (second expression))]
+    (case type
+      :f64 (let [result (llvm/build-fptrunc (:builder state) value
+                                            (llvm/type-for (:context state) :f32)
+                                            (:arena state) nil)]
+             [state result :f32])
+      (:i64 :i32) (let [result (llvm/build-sitofp (:builder state) value
+                                                  (llvm/type-for (:context state) :f32)
+                                                  (:arena state) nil)]
+                    [state result :f32])
+      (throw (ex-info (str "to-f32 expects an integer or a 64 bit float, got " type)
+                      {:type type})))))
+
 (defn- compile-load
   "Compiles (load type pointer) into an llvm load instruction."
   [state environment expression]
@@ -523,6 +549,29 @@
                    (llvm/build-icmp builder operator (first values) (second values) arena))]
       [state result :i1])))
 
+(defn- compile-if
+  "Compiles (if condition then else) with an llvm.select instruction, so it
+  is a value-producing expression. Both branches are compiled as values of
+  the same type and select evaluates both operands, so the branches must be
+  pure expressions without side effects."
+  [state environment expression]
+  (when-not (= 4 (count expression))
+    (throw (ex-info "if expects (if condition then else)" {:expression expression})))
+  (let [[condition-form then-form else-form] (rest expression)
+        [state condition-value condition-type]
+        (compile-expression state environment condition-form)]
+    (when-not (= :i1 condition-type)
+      (throw (ex-info (str "if condition must be a comparison, got " condition-type)
+                      {:type condition-type})))
+    (let [[state then-value then-type] (compile-expression state environment then-form)
+          [state else-value else-type] (compile-expression state environment else-form)]
+      (when-not (= then-type else-type)
+        (throw (ex-info (str "if branches must have the same type, got " then-type " and " else-type)
+                        {:then-type then-type :else-type else-type})))
+      (let [result (llvm/build-select (:builder state) condition-value
+                                      then-value else-value (:arena state))]
+        [state result then-type]))))
+
 (defn- compile-while
   "Compiles (while condition body...) into a condition block, a body block
   and an end block. The condition must be an i1."
@@ -570,6 +619,7 @@
         (#{'+ '- '* '/} operator) (compile-arithmetic state environment operator (rest expression))
         (#{'< '<= '> '>= '= 'not=} operator) (compile-comparison state environment operator (rest expression))
         (= operator 'to-float) (compile-to-float state environment expression)
+        (= operator 'to-f32) (compile-to-f32 state environment expression)
         (= operator 'sqrt) (compile-sqrt state environment expression)
         (= operator 'abs) (compile-abs state environment expression)
         (#{'min 'max} operator) (compile-min-or-max state environment operator (rest expression))
@@ -581,6 +631,7 @@
         (= operator 'to-pointer) (compile-to-pointer state environment expression)
         (= operator 'let) (compile-let state environment expression)
         (= operator 'set) (compile-set state environment expression)
+        (= operator 'if) (compile-if state environment expression)
         (= operator 'while) (compile-while state environment expression)
         :else (compile-procedure-call state environment operator (rest expression))))
     :else (throw (ex-info (str "Unsupported clodin expression: " expression)
@@ -612,6 +663,7 @@
           (#{'+ '- '* '/} operator) (expression-type environment (second expression))
           (#{'< '<= '> '>= '= 'not=} operator) :i1
           (= operator 'to-float) :f64
+          (= operator 'to-f32) :f32
           (#{'sqrt 'abs} operator) (expression-type environment (second expression))
           (#{'min 'max} operator) (expression-type environment (second expression))
           (= operator 'load) (second expression)
@@ -628,6 +680,7 @@
                                     (partition 3 bindings))]
             (expression-type environment (last inner-body)))
           (= operator 'set) nil
+          (= operator 'if) (expression-type environment (nth expression 2))
           (= operator 'while) nil
           :else (let [procedure (get @procedure-registry (str operator))]
                   (:return-type procedure)))))
@@ -1091,6 +1144,33 @@
   (testing "a let inside a while is hoisted and reused"
     (is (= 14 (sum-squares 4)))
     (is (= 0 (sum-squares 0)))))
+
+;;; if and to-f32 support
+(defproc if-choose [a :i64 b :i64]
+  (if (< a b) a b))
+
+(defproc choice-abs [x :f64]
+  (if (< x 0.0) (abs x) x))
+
+(defproc halve-f32 [x :f32]
+  (/ x (to-f32 2)))
+
+(defproc f32-from-f64 [x :f64]
+  (to-f32 x))
+
+(defproc f32-from-i64 [x :i64]
+  (to-f32 x))
+
+(deftest test-if
+  (is (= 2 (if-choose 2 5)))
+  (is (= 2 (if-choose 5 2)))
+  (is (= 3.0 (choice-abs -3.0)))
+  (is (= 3.0 (choice-abs 3.0))))
+
+(deftest test-to-f32
+  (is (= 2.5 (halve-f32 5.0)))
+  (is (= 1.5 (f32-from-f64 1.5)))
+  (is (= 3.0 (f32-from-i64 3))))
 
 (defn -main
   [& _]

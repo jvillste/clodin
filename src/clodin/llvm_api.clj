@@ -194,6 +194,14 @@
                   ^MemorySegment dest-type ^Arena arena ^String name]
   (LLVM/LLVMBuildSIToFP builder value dest-type (name-token builder arena name)))
 
+(defn build-fptrunc
+  "Truncates a wider floating point value (e.g. f64) to a narrower one
+  (e.g. f32)."
+  ^MemorySegment [^MemorySegment builder ^MemorySegment value
+                  ^MemorySegment dest-type ^Arena arena ^String name]
+  (LLVM/LLVMBuildFPTrunc builder value dest-type (name-token builder arena name)))
+
+
 (defn build-inttoptr
   ^MemorySegment [^MemorySegment builder ^MemorySegment value
                   ^MemorySegment dest-type ^Arena arena ^String name]
