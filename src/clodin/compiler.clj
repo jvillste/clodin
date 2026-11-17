@@ -66,6 +66,23 @@
 (defonce current-jit (atom nil))
 (defonce compile-lock (Object.))
 
+;;; The LLVM IR optimization level used when a module is built, one of
+;;; :none (JIT the IR as emitted, the default) or :O0/:O1/:O2/:O3. The
+;;; pipeline only optimizes, never changes IEEE floating point results, so
+;;; all levels produce the same numerical output.
+;;;
+(def ^:private optimization-level (atom :none))
+
+(defn set-optimization-level!
+  "Sets the LLVM IR optimization level used on the next module build and
+  forces a recompile. Levels: :none, :O0, :O1, :O2, :O3."
+  [level]
+  (when-not (contains? #{:none :O0 :O1 :O2 :O3} level)
+    (throw (ex-info (str "Unknown optimization level: " level) {:level level})))
+  (reset! optimization-level level)
+  (reset! module-dirty true)
+  nil)
+
 ;;; ---------------------------------------------------------------------------
 ;;; Panama integration
 ;;; ---------------------------------------------------------------------------
@@ -792,7 +809,7 @@
                           (llvm/dispose-context context)
                           (throw error)))
             _ (llvm/verify module arena)
-            jit (llvm/create-jit arena)
+            jit (llvm/create-jit arena @optimization-level)
             _ (llvm/add-module-to-jit! jit module context)
             handles (build-handles jit arena)]
         (let [old-jit @current-jit]
@@ -1171,6 +1188,18 @@
   (is (= 2.5 (halve-f32 5.0)))
   (is (= 1.5 (f32-from-f64 1.5)))
   (is (= 3.0 (f32-from-i64 3))))
+
+(deftest test-optimization-level
+  (testing "set-optimization-level! preserves results at every level"
+    (try
+      (set-optimization-level! :O3)
+      (is (= 2.5 (halve 5.0)))
+      (is (= 7 (add-both 3 4)))
+      (finally
+        (set-optimization-level! :none))))
+  (testing "rejects unknown levels"
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (set-optimization-level! :O9)))))
 
 (defn -main
   [& _]

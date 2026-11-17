@@ -10,7 +10,8 @@
   This mirrors the memory layout of the native version (the working set is
   equally cache friendly), so any speed difference is from execution, not
   from smaller data."
-  (:require [examples.clodin-spring-layout :as clodin]
+  (:require [clodin.compiler :as compiler]
+            [examples.clodin-spring-layout :as clodin]
             [examples.spring-layout :as spring-layout]
             [clojure.test :refer [deftest is testing]]))
 
@@ -330,6 +331,33 @@
                                index clojure-ms clodin-ms))
               {:clojure-ms clojure-ms :clodin-ms clodin-ms}))
           (range runs))))
+
+(defn benchmark-optimization-levels
+  "Measures the native clodin simulation time at each LLVM optimization level
+  (:none :O0 :O1 :O2 :O3), plus the Clojure-buffer implementation as a
+  reference. For each level it sets
+  clodin.compiler/set-optimization-level!, forces a recompile, then times
+  `repetitions` runs of a fresh simulation at that level. Returns
+  {:clojure-ms ... :levels {<level> {:clodin-ms ...} ...}}.
+
+  Note: LLJIT's codegen optimization level only tunes the code-generation
+  backend; the in-process LLVM IR pass pipeline is not run (LLVMRunPasses is
+  not usable with the current jextract bindings)."
+  [& [{:keys [node-count iterations edges-per-var repetitions seed]
+       :or {node-count 200 iterations 30 edges-per-var 3 repetitions 5 seed 1}}]]
+  (let [;; reference Clojure time (independent of the clodin level)
+        [_ clojure-run] (simulation-runners node-count edges-per-var iterations seed)
+        clojure-ms (mean-time-ms clojure-run repetitions)
+        levels (into {}
+                     (mapv (fn [level]
+                             (compiler/set-optimization-level! level)
+                             (let [[native-run _]
+                                   (simulation-runners node-count edges-per-var iterations seed)]
+                               (native-run) ; triggers the recompile at this level
+                               (native-run) ; warm
+                               [level {:clodin-ms (mean-time-ms native-run repetitions)}]))
+                           [:none :O0 :O1 :O2 :O3]))]
+    {:clojure-ms clojure-ms :levels levels}))
 
 (defn -main
   [& _]
