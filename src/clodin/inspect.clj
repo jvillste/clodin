@@ -175,6 +175,36 @@
           (finally
             (io/delete-file object-file true))))))))
 
+(defn print-llvm-ir!
+  "Prints the LLVM IR stored for the named procedure."
+  ([procedure-name] (println (llvm-ir procedure-name)))
+  ([procedure-name options] (println (llvm-ir procedure-name options))))
+
+(defn print-assembly!
+  "Prints the target assembly for the named procedure."
+  ([procedure-name] (println (assembly procedure-name)))
+  ([procedure-name options] (println (assembly procedure-name options))))
+
+(defn print-disassembly!
+  "Prints the disassembled machine code for the named procedure."
+  ([procedure-name] (println (disassembly procedure-name)))
+  ([procedure-name options] (println (disassembly procedure-name options))))
+
+(defn print-module-llvm-ir!
+  "Prints the LLVM IR of the linked module for a namespace."
+  ([namespace] (println (module-llvm-ir namespace)))
+  ([namespace options] (println (module-llvm-ir namespace options))))
+
+(defn print-module-assembly!
+  "Prints the target assembly of the linked module for a namespace."
+  ([namespace] (println (module-assembly namespace)))
+  ([namespace options] (println (module-assembly namespace options))))
+
+(defn print-module-disassembly!
+  "Prints the disassembled machine code of the linked module for a namespace."
+  ([namespace] (println (module-disassembly namespace)))
+  ([namespace options] (println (module-disassembly namespace options))))
+
 (deftest test-llvm-ir
   (testing "the stored bitcode prints as llvm ir"
     (is (re-find #"define i64 @add-both" (llvm-ir "add-both")))))
@@ -190,3 +220,11 @@
                  (module-llvm-ir 'examples.standalone-lib)))
     (is (re-find #"greet"
                  (module-assembly 'examples.standalone-lib)))))
+
+(deftest test-print-functions
+  (testing "print-*! prints the inspection output"
+    (is (= (str (llvm-ir "add-both") "\n")
+           (with-out-str (print-llvm-ir! "add-both"))))
+    (is (= (str (module-llvm-ir 'examples.standalone-lib) "\n")
+           (with-out-str
+             (print-module-llvm-ir! 'examples.standalone-lib))))))
