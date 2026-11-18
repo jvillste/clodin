@@ -15,8 +15,9 @@
   the boundary, when clojure code calls a native procedure.
 
   Untyped constant integers are treated as 64 bit integers. Booleans use the
-  :i1 type: comparisons produce :i1, true and false are :i1 literals, and
-  :i1 can be used for locals, parameters, returns and buffer elements.
+  :boolean type: comparisons produce :boolean, true and false are :boolean
+  literals, and :boolean can be used for locals, parameters, returns and
+  buffer elements.
 
   Pointers use the :ptr type. Memory is accessed with
   (load type pointer), (store type pointer value), (pointer-add pointer
@@ -25,7 +26,7 @@
   Uniform element buffers are read and written with (buffer-get pointer
   type index) and (buffer-set pointer type index value), where index counts
   elements: the offset is index times the element size (8 bytes for
-  :i64/:f64/:ptr, 4 bytes for :i32/:f32, 1 byte for :i1).
+  :i64/:f64/:ptr, 4 bytes for :i32/:f32, 1 byte for :boolean).
 
   External C functions are declared with extern, for example
   (extern printf [:ptr] :i32 :varargs). The JIT resolves the symbol from the
@@ -174,7 +175,7 @@
 (defn value-layout
   [type]
   (case type
-    :i1 ValueLayout/JAVA_BOOLEAN
+    :boolean ValueLayout/JAVA_BOOLEAN
     :i64 ValueLayout/JAVA_LONG
     :i32 ValueLayout/JAVA_INT
     :f64 ValueLayout/JAVA_DOUBLE
@@ -183,7 +184,7 @@
     (throw (ex-info (str "Unsupported clodin type: " type) {:type type}))))
 
 (deftest test-value-layout
-  (is (= ValueLayout/JAVA_BOOLEAN (value-layout :i1)))
+  (is (= ValueLayout/JAVA_BOOLEAN (value-layout :boolean)))
   (is (= ValueLayout/JAVA_LONG (value-layout :i64)))
   (is (= ValueLayout/JAVA_INT (value-layout :i32)))
   (is (= ValueLayout/JAVA_DOUBLE (value-layout :f64)))
@@ -204,12 +205,12 @@
   descriptor expects for the given clodin type."
   [type value]
   (case type
-    :i1 (cond
-          (instance? Boolean value) value
-          (integer? value) (not (zero? value))
-          :else (throw (ex-info (str "Expected a boolean or integer for :i1, got "
-                                     (some-> value class .getName))
-                                {:type type :value value})))
+    :boolean (cond
+               (instance? Boolean value) value
+               (integer? value) (not (zero? value))
+               :else (throw (ex-info (str "Expected a boolean or integer for :boolean, got "
+                                          (some-> value class .getName))
+                                      {:type type :value value})))
     :i64 (long value)
     :i32 (int value)
     :f64 (double value)
@@ -504,7 +505,7 @@
 
 (defn- compile-to-i32
   "Compiles (to-i32 x), truncating a 64 bit integer to 32 bits or zero
-  extending an i1 boolean."
+  extending a :boolean."
   [state environment expression]
   (when-not (= 2 (count expression))
     (throw (ex-info "to-i32 expects exactly one operand" {:expression expression})))
@@ -515,16 +516,16 @@
                                           (llvm/type-for (:context state) :i32)
                                           (:arena state) nil)]
              [state result :i32])
-      :i1 (let [result (llvm/build-zext (:builder state) value
-                                        (llvm/type-for (:context state) :i32)
-                                        (:arena state) nil)]
-            [state result :i32])
+      :boolean (let [result (llvm/build-zext (:builder state) value
+                                             (llvm/type-for (:context state) :i32)
+                                             (:arena state) nil)]
+                 [state result :i32])
       (throw (ex-info (str "to-i32 expects an integer, got " type)
                       {:type type})))))
 
 (defn- compile-to-i64
   "Compiles (to-i64 x), sign extending a 32 bit integer to 64 bits or zero
-  extending an i1 boolean."
+  extending a :boolean."
   [state environment expression]
   (when-not (= 2 (count expression))
     (throw (ex-info "to-i64 expects exactly one operand" {:expression expression})))
@@ -535,10 +536,10 @@
                                          (llvm/type-for (:context state) :i64)
                                          (:arena state) nil)]
              [state result :i64])
-      :i1 (let [result (llvm/build-zext (:builder state) value
-                                        (llvm/type-for (:context state) :i64)
-                                        (:arena state) nil)]
-            [state result :i64])
+      :boolean (let [result (llvm/build-zext (:builder state) value
+                                             (llvm/type-for (:context state) :i64)
+                                             (:arena state) nil)]
+                 [state result :i64])
       (throw (ex-info (str "to-i64 expects an integer, got " type)
                       {:type type})))))
 
@@ -614,7 +615,7 @@
   "The size in bytes of one buffer element of the given type."
   [type]
   (case type
-    :i1 1
+    :boolean 1
     :i64 8
     :i32 4
     :f64 8
@@ -769,7 +770,7 @@
 
 (defn- compile-comparison
   "Compiles a binary comparison into an llvm icmp or fcmp instruction.
-  The result is an i1."
+  The result is a :boolean."
   [state environment operator operand-forms]
   (when-not (= 2 (count operand-forms))
     (throw (ex-info (str "Comparison " operator " needs exactly 2 operands")
@@ -786,7 +787,7 @@
           result (if (float-type? type)
                    (llvm/build-fcmp builder operator (first values) (second values) arena)
                    (llvm/build-icmp builder operator (first values) (second values) arena))]
-      [state result :i1])))
+      [state result :boolean])))
 
 (defn- compile-if
   "Compiles (if condition then else) with an llvm.select instruction, so it
@@ -799,7 +800,7 @@
   (let [[condition-form then-form else-form] (rest expression)
         [state condition-value condition-type]
         (compile-expression state environment condition-form)]
-    (when-not (= :i1 condition-type)
+    (when-not (= :boolean condition-type)
       (throw (ex-info (str "if condition must be a comparison, got " condition-type)
                       {:type condition-type})))
     (let [[state then-value then-type] (compile-expression state environment then-form)
@@ -813,7 +814,7 @@
 
 (defn- compile-while
   "Compiles (while condition body...) into a condition block, a body block
-  and an end block. The condition must be an i1."
+  and an end block. The condition must be a :boolean."
   [state environment expression]
   (let [condition-form (second expression)
         body-forms (drop 2 expression)]
@@ -832,7 +833,7 @@
       (let [state (assoc state :current-block condition-block)
             [state condition-value condition-type]
             (compile-expression state environment condition-form)]
-        (when-not (= :i1 condition-type)
+        (when-not (= :boolean condition-type)
           (throw (ex-info (str "while condition must be a comparison, got " condition-type)
                           {:type condition-type})))
         (llvm/build-cond-br builder condition-value body-block end-block)
@@ -850,9 +851,9 @@
   (cond
     (integer? expression) [state (llvm/const-int (:context state) expression) :i64]
     (float? expression) [state (llvm/const-real (:context state) expression) :f64]
-    (boolean? expression) [state (llvm/const-int-of-type (:context state) :i1
+    (boolean? expression) [state (llvm/const-int-of-type (:context state) :boolean
                                                          (if expression 1 0))
-                           :i1]
+                           :boolean]
     (string? expression) (compile-string-literal state expression)
     (symbol? expression) (compile-local-reference state environment expression)
     (seq? expression)
@@ -900,7 +901,7 @@
   (cond
     (integer? expression) :i64
     (float? expression) :f64
-    (boolean? expression) :i1
+    (boolean? expression) :boolean
     (string? expression) :ptr
     (symbol? expression) (:type (get environment expression))
     (seq? expression)
@@ -908,7 +909,7 @@
       (when (symbol? operator)
         (cond
           (#{'+ '- '* '/} operator) (expression-type environment (second expression))
-          (#{'< '<= '> '>= '= 'not=} operator) :i1
+          (#{'< '<= '> '>= '= 'not=} operator) :boolean
           (= operator 'to-float) :f64
           (= operator 'to-f32) :f32
           (= operator 'to-i32) :i32
@@ -1723,15 +1724,15 @@
 (defproc is-greater [a :i64 b :i64]
   (> a b))
 
-(defproc choose-by-flag [flag :i1 a :i64 b :i64]
+(defproc choose-by-flag [flag :boolean a :i64 b :i64]
   (if flag a b))
 
 (defproc count-if-greater [a :i64 b :i64]
-  (let [flag :i1 (> a b)]
+  (let [flag :boolean (> a b)]
     (if flag 1 0)))
 
-(defproc flip-flag [flag :i1]
-  (let [current :i1 flag]
+(defproc flip-flag [flag :boolean]
+  (let [current :boolean flag]
     (set current (if current false true))
     (if current 1 0)))
 
@@ -1744,11 +1745,11 @@
 (defproc flag-to-i64 [a :i64 b :i64]
   (to-i64 (> a b)))
 
-(defproc set-flag [pointer :ptr index :i64 value :i1]
-  (buffer-set pointer :i1 index value))
+(defproc set-flag [pointer :ptr index :i64 value :boolean]
+  (buffer-set pointer :boolean index value))
 
 (defproc get-flag [pointer :ptr index :i64]
-  (buffer-get pointer :i1 index))
+  (buffer-get pointer :boolean index))
 
 (defproc seed-random [seed :i32]
   (srand seed))
@@ -1815,12 +1816,12 @@
     (is (= 42 (widen-to-i64 42)))
     (is (= -1 (widen-to-i64 -1)))))
 
-(deftest test-i1
-  (testing "comparisons produce i1 values that cross the jvm boundary"
+(deftest test-boolean
+  (testing "comparisons produce :boolean values that cross the jvm boundary"
     (is (true? (is-greater 5 3)))
     (is (false? (is-greater 3 5))))
 
-  (testing "i1 parameters and let bindings"
+  (testing ":boolean parameters and let bindings"
     (is (= 7 (choose-by-flag true 7 9)))
     (is (= 9 (choose-by-flag false 7 9)))
     (is (= 1 (count-if-greater 5 3)))
@@ -1828,16 +1829,16 @@
     (is (= 1 (flip-flag false)))
     (is (= 0 (flip-flag true)))
 
-  (testing "boolean literals are i1"
+  (testing "boolean literals are :boolean"
     (is (true? (always-true))))
 
-  (testing "i1 widens to i32 and i64"
+  (testing ":boolean widens to i32 and i64"
     (is (= 1 (flag-to-i32 5 3)))
     (is (= 0 (flag-to-i32 3 5)))
     (is (= 1 (flag-to-i64 5 3)))
     (is (= 0 (flag-to-i64 3 5)))))
 
-(deftest test-i1-buffer
+(deftest test-boolean-buffer
   (let [arena (Arena/ofShared)
         buffer (.allocate arena 4)]
     (try

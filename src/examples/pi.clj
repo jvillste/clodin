@@ -71,8 +71,8 @@
             (set i (- i 1)))
           (buffer-set a :i64 1 (- q (* 10 (/ q 10))))
           (set q (/ q 10))
-          (let [is-nine :i1 (= q 9)
-                is-ten :i1 (= q 10)
+          (let [is-nine :boolean (= q 9)
+                is-ten :boolean (= q 10)
                 emit-head :i64 (if is-nine 0 1)
                 head-value :i64 (if is-ten (+ predigit 1) predigit)
                 tail-count :i64 (if is-nine 0 nines)
@@ -101,7 +101,7 @@
             carry-index :i64 (- last-index 1)]
         (while (> carry 0)
           (let [value :i64 (+ (buffer-get digits :i64 carry-index) carry)
-                overflow :i1 (>= value 10)
+                overflow :boolean (>= value 10)
                 next-carry :i64 (if overflow 1 0)
                 stored-value :i64 (if overflow (- value 10) value)]
             (buffer-set digits :i64 carry-index stored-value)
