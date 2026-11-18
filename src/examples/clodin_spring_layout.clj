@@ -12,8 +12,9 @@
   2*node, y at 2*node+1), and the neighbour lists live in CSR form
   (offsets + indices). See `layout-buffers`."
   (:require [clodin.compiler :refer [defproc]]
-            [examples.spring-layout :as spring-layout]
-            [clojure.test :refer [deftest is testing]])
+            [clodin.inspect ::as inspect]
+            [clojure.test :refer [deftest is testing]]
+            [examples.spring-layout :as spring-layout])
   (:import (java.lang.foreign Arena ValueLayout)))
 
 (def ^:private minimum-distance
@@ -372,3 +373,15 @@
     (let [positions (layout-dependency-graph-native example-graph {:node-distance 10})]
       (is (< (mean-distance positions [[:a1 :c2] [:b1 :a2] [:c1 :b2]])
              (mean-distance positions [[:a1 :a2] [:a1 :b2] [:b1 :b2]]))))))
+
+
+(comment
+  (println (clodin.inspect/module-llvm-ir *ns*))
+  (println (clodin.inspect/module-disassembly *ns*))
+
+  (println (clodin.inspect/disassembly  "step-layout-native"))
+  (println (clodin.inspect/assembly  "step-layout-native"))
+
+
+
+  ) ;; TODO: remove me

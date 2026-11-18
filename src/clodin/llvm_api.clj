@@ -449,6 +449,14 @@
         (LLVM/LLVMDisposeMemoryBuffer buffer)))
     bytes))
 
+(defn module-to-string
+  "Returns the module's textual LLVM IR."
+  ^String [^MemorySegment module]
+  (let [pointer (LLVM/LLVMPrintModuleToString module)
+        text (.getString pointer 0)]
+    (LLVM/LLVMDisposeMessage pointer)
+    text))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Verification and linking
 ;;; ---------------------------------------------------------------------------
@@ -488,31 +496,37 @@
 
 (defn- host-target-machine
   "Creates a TargetMachine for the host at the given LLVM codegen optimization
-  level. LLVMRunPasses needs a target machine to run its IR optimization
-  pipeline. The caller must dispose it with LLVMDisposeTargetMachine."
-  [^Arena arena codegen-level]
-  (let [triple-ptr (LLVM/LLVMGetDefaultTargetTriple)
-        triple (.getString triple-ptr 0)
-        target-slot (.allocate arena ValueLayout/ADDRESS)
-        error-slot (.allocate arena ValueLayout/ADDRESS)
-        ok (LLVM/LLVMGetTargetFromTriple (c-string arena triple)
-                                         target-slot error-slot)]
-    (when-not (zero? ok)
-      (throw-error {:triple triple} "unknown host target triple"))
-    (LLVM/LLVMCreateTargetMachine
-     (.get target-slot ValueLayout/ADDRESS 0)
-     (c-string arena triple)
-     (c-string arena "")  ; CPU (must be a real, possibly empty, string)
-     (c-string arena "")  ; features
-     codegen-level
-     (int 0) ; reloc: default
-     (int 0)))) ; code model: default
+  level and relocation model. LLVMRunPasses needs a target machine to run its
+  IR optimization pipeline. The caller must dispose it with
+  LLVMDisposeTargetMachine."
+  ([^Arena arena codegen-level]
+   (host-target-machine arena codegen-level 0))
+  ([^Arena arena codegen-level relocation-model]
+   (let [triple-ptr (LLVM/LLVMGetDefaultTargetTriple)
+         triple (.getString triple-ptr 0)
+         target-slot (.allocate arena ValueLayout/ADDRESS)
+         error-slot (.allocate arena ValueLayout/ADDRESS)
+         ok (LLVM/LLVMGetTargetFromTriple (c-string arena triple)
+                                          target-slot error-slot)]
+     (when-not (zero? ok)
+       (throw-error {:triple triple} "unknown host target triple"))
+     (LLVM/LLVMCreateTargetMachine
+      (.get target-slot ValueLayout/ADDRESS 0)
+      (c-string arena triple)
+      (c-string arena "")  ; CPU (must be a real, possibly empty, string)
+      (c-string arena "")  ; features
+      codegen-level
+      (int relocation-model)
+      (int 0))))) ; code model: default
 
 (defn create-target-machine
-  "Creates a host TargetMachine for object emission. The caller must dispose it
+  "Creates a host TargetMachine for object emission. pic? selects the PIC
+  relocation model, which shared libraries need. The caller must dispose it
   with dispose-target-machine."
-  ^MemorySegment [^Arena arena]
-  (host-target-machine arena 2)) ; CodeGenOpt::Default
+  (^MemorySegment [^Arena arena]
+   (create-target-machine arena {}))
+  (^MemorySegment [^Arena arena {:keys [pic?] :or {pic? false}}]
+   (host-target-machine arena 2 (if pic? 2 0)))) ; CodeGenOpt::Default, LLVMRelocPIC
 
 (defn dispose-target-machine
   [^MemorySegment target-machine]
@@ -544,6 +558,34 @@
          (if (null? message-pointer)
            "LLVM object emission failed"
            (.getString (.reinterpret message-pointer 4096) 0)))))))
+
+(defn emit-to-memory-buffer
+  "Emits the module to an in-memory buffer using the given codegen file type
+  (LLVMAssemblyFile or LLVMObjectFile) and returns the bytes."
+  [^MemorySegment target-machine ^MemorySegment module ^long codegen-type
+   ^Arena arena]
+  (let [error-slot (.allocate arena ValueLayout/ADDRESS)
+        out-slot (.allocate arena ValueLayout/ADDRESS)
+        failed (LLVM/LLVMTargetMachineEmitToMemoryBuffer
+                target-machine module (int codegen-type) error-slot out-slot)]
+    (when-not (zero? failed)
+      (let [message-pointer (.get error-slot ValueLayout/ADDRESS 0)]
+        (throw-error
+         {:codegen-type codegen-type}
+         (if (null? message-pointer)
+           "LLVM code emission failed"
+           (.getString (.reinterpret message-pointer 4096) 0)))))
+    (let [buffer (.get out-slot ValueLayout/ADDRESS 0)
+          size (int (LLVM/LLVMGetBufferSize buffer))
+          start (LLVM/LLVMGetBufferStart buffer)
+          bytes (byte-array size)]
+      (try
+        (let [view (.reinterpret start size)]
+          (dotimes [index size]
+            (aset-byte bytes index (.get view ValueLayout/JAVA_BYTE index))))
+        (finally
+          (LLVM/LLVMDisposeMemoryBuffer buffer)))
+      bytes)))
 
 (defn optimize-module!
   "Runs the LLVM new-pass-manager IR optimization pipeline for the given

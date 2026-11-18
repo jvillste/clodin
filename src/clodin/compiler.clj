@@ -60,9 +60,10 @@
             [clodin.native-stdout :as native-stdout]
             [clojure.java.io :as io]
             [clojure.java.shell :as shell]
+            [clojure.string :as string]
             [clojure.test :refer [deftest is run-tests testing]])
   (:import (java.lang.foreign Arena FunctionDescriptor Linker Linker$Option
-                              MemorySegment ValueLayout)))
+                              MemorySegment SymbolLookup ValueLayout)))
 
 (declare compile-expression compile-body)
 
@@ -160,6 +161,11 @@
   (reset! optimization-level level)
   (reset! module-dirty true)
   nil)
+
+(defn current-optimization-level
+  "The LLVM IR optimization level used for the next module build."
+  []
+  @optimization-level)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Panama integration
@@ -1134,6 +1140,50 @@
   []
   (:namespace (get @procedure-registry "main")))
 
+(defn- namespace-closure-from
+  "The union of the call-graph closures of root-namespace and
+  extra-namespaces."
+  [root-namespace extra-namespaces]
+  (reduce (fn [closure namespace]
+            (into closure (namespace-closure (str namespace))))
+          (namespace-closure (str root-namespace))
+          extra-namespaces))
+
+(defn procedures-for-namespace
+  "Returns the procedures that would be linked for root-namespace and the
+  namespaces it calls into. Requires root-namespace and any extra namespaces
+  first. Unlike build-executable!, this does not require a procedure named
+  main, so it also works for library namespaces.
+
+  Options:
+    :extra-namespaces  additional namespaces to include"
+  ([root-namespace]
+   (procedures-for-namespace root-namespace {}))
+  ([root-namespace {:keys [extra-namespaces] :or {extra-namespaces []}}]
+   (let [root-namespace (symbol (str root-namespace))
+         extra-namespaces (mapv #(symbol (str %)) extra-namespaces)]
+     (doseq [namespace (cons root-namespace extra-namespaces)]
+       (require namespace))
+     (procedures-in-namespaces
+      (namespace-closure-from root-namespace extra-namespaces)))))
+
+(defn with-linked-module
+  "Calls f with a linked module built from procedures and the arena used to
+  create it. The module, context and arena are disposed after f returns."
+  [procedures f]
+  (llvm/init-targets!)
+  (let [arena (Arena/ofConfined)]
+    (try
+      (let [context (llvm/new-context)
+            module (link-procedures procedures context arena)]
+        (try
+          (f module arena)
+          (finally
+            (llvm/dispose-module module)
+            (llvm/dispose-context context))))
+      (finally
+        (.close arena)))))
+
 (defn build-executable!
   "Builds a standalone native executable from the procedures defined in
   root-namespace and the namespaces they call into. One of those namespaces
@@ -1162,58 +1212,127 @@
                          extra-namespaces []}
                     :as options}]
    (let [root-namespace (symbol (str root-namespace))
-         extra-namespaces (mapv #(symbol (str %)) extra-namespaces)]
-     (doseq [namespace (cons root-namespace extra-namespaces)]
-       (require namespace))
-     (let [root-name (str root-namespace)
-           root-closure (reduce (fn [closure namespace]
-                                  (into closure (namespace-closure (str namespace))))
-                                (namespace-closure root-name)
-                                extra-namespaces)
-           entry-namespace (main-namespace)
-           namespaces (if (and entry-namespace
-                              (not (contains? root-closure entry-namespace)))
-                        (into root-closure (namespace-closure entry-namespace))
-                        root-closure)
-           procedures (procedures-in-namespaces namespaces)]
-       (when (empty? procedures)
-         (throw (ex-info (str "No clodin procedures found in " root-name
-                              " or the namespaces it calls")
-                         {:namespace root-name})))
-       (when-not (contains? procedures "main")
-         (throw (ex-info (str "No procedure named main in " root-name
-                              " or the namespaces it calls")
-                         {:namespace root-name
-                          :namespaces namespaces})))
-       (llvm/init-targets!)
-       (let [arena (Arena/ofConfined)]
-         (try
-           (let [context (llvm/new-context)
-                 module (link-procedures procedures context arena)
-                 target-machine (llvm/create-target-machine arena)]
-             (try
-               (llvm/set-module-target! module target-machine arena)
-               (llvm/verify module arena)
-               (let [level (or (:optimization-level options) @optimization-level)]
-                 (when-not (= :none level)
-                   (llvm/optimize-module! module arena level)))
-               (let [object-path (str output ".o")]
-                 (io/make-parents output)
-                 (llvm/emit-object-file! target-machine module object-path arena)
-                 (let [{:keys [exit err]}
-                       (apply shell/sh
-                              (concat [linker "-o" output object-path] linker-args))]
-                   (when-not (zero? exit)
-                     (throw (ex-info (str "Linking failed: " err)
-                                     {:exit exit :err err :output output})))
-                   (io/delete-file object-path true)
-                   output))
+         extra-namespaces (mapv #(symbol (str %)) extra-namespaces)
+         procedures (procedures-for-namespace root-namespace
+                                              {:extra-namespaces extra-namespaces})
+         entry-namespace (main-namespace)
+         procedures (if (and entry-namespace
+                             (not (contains? procedures "main")))
+                      (merge procedures (procedures-for-namespace entry-namespace))
+                      procedures)]
+     (when (empty? procedures)
+       (throw (ex-info (str "No clodin procedures found in " root-namespace
+                            " or the namespaces it calls")
+                       {:namespace root-namespace})))
+     (when-not (contains? procedures "main")
+       (throw (ex-info (str "No procedure named main in " root-namespace
+                            " or the namespaces it calls")
+                       {:namespace root-namespace
+                        :namespaces (set (map :namespace (vals procedures)))})))
+     (llvm/init-targets!)
+     (let [arena (Arena/ofConfined)]
+       (try
+         (let [context (llvm/new-context)
+               module (link-procedures procedures context arena)
+               target-machine (llvm/create-target-machine arena)]
+           (try
+             (llvm/set-module-target! module target-machine arena)
+             (llvm/verify module arena)
+             (let [level (or (:optimization-level options) @optimization-level)]
+               (when-not (= :none level)
+                 (llvm/optimize-module! module arena level)))
+             (let [object-path (str output ".o")]
+               (io/make-parents output)
+               (llvm/emit-object-file! target-machine module object-path arena)
+               (let [{:keys [exit err]}
+                     (apply shell/sh
+                            (concat [linker "-o" output object-path] linker-args))]
+                 (when-not (zero? exit)
+                   (throw (ex-info (str "Linking failed: " err)
+                                   {:exit exit :err err :output output})))
+                 (io/delete-file object-path true)
+                 output))
              (finally
                (llvm/dispose-target-machine target-machine)
                (llvm/dispose-module module)
                (llvm/dispose-context context))))
-           (finally
-             (.close arena))))))))
+         (finally
+           (.close arena)))))))
+
+(defn- shared-library-extension
+  []
+  (if (string/includes? (System/getProperty "os.name") "Mac") "dylib" "so"))
+
+(defn- shared-library-linker-flags
+  []
+  (if (string/includes? (System/getProperty "os.name") "Mac")
+    ["-dynamiclib"]
+    ["-shared"]))
+
+(defn build-library!
+  "Builds a shared library from the procedures defined in root-namespace and
+  the namespaces they call into. Unlike build-executable!, no procedure named
+  main is required. The procedures keep external linkage, so the linker
+  exports them as dynamic symbols.
+
+  Options:
+    :output              output path (default libclodin.so or libclodin.dylib)
+    :optimization-level  :none, :O0, :O1, :O2 or :O3 (defaults to the
+                         compiler's current level)
+    :linker              linker driver command (default \"cc\")
+    :linker-args         extra arguments passed to the linker driver
+    :extra-namespaces    additional namespaces to link
+
+  Returns the output path. The intermediate object file is removed after a
+  successful link."
+  ([root-namespace]
+   (build-library! root-namespace {}))
+  ([root-namespace {:keys [output linker linker-args extra-namespaces]
+                    :or {output (str "libclodin." (shared-library-extension))
+                         linker "cc"
+                         linker-args []
+                         extra-namespaces []}
+                    :as options}]
+   (let [root-namespace (symbol (str root-namespace))
+         extra-namespaces (mapv #(symbol (str %)) extra-namespaces)
+         procedures (procedures-for-namespace root-namespace
+                                              {:extra-namespaces extra-namespaces})]
+     (when (empty? procedures)
+       (throw (ex-info (str "No clodin procedures found in " root-namespace
+                            " or the namespaces it calls")
+                       {:namespace root-namespace})))
+     (llvm/init-targets!)
+     (let [arena (Arena/ofConfined)]
+       (try
+         (let [context (llvm/new-context)
+               module (link-procedures procedures context arena)
+               target-machine (llvm/create-target-machine arena {:pic? true})]
+           (try
+             (llvm/set-module-target! module target-machine arena)
+             (llvm/verify module arena)
+             (let [level (or (:optimization-level options) @optimization-level)]
+               (when-not (= :none level)
+                 (llvm/optimize-module! module arena level)))
+             (let [object-path (str output ".o")]
+               (io/make-parents output)
+               (llvm/emit-object-file! target-machine module object-path arena)
+               (let [{:keys [exit err]}
+                     (apply shell/sh
+                            (concat [linker]
+                                    (shared-library-linker-flags)
+                                    ["-o" output object-path]
+                                    linker-args))]
+                 (when-not (zero? exit)
+                   (throw (ex-info (str "Linking failed: " err)
+                                   {:exit exit :err err :output output})))
+                 (io/delete-file object-path true)
+                 output))
+             (finally
+               (llvm/dispose-target-machine target-machine)
+               (llvm/dispose-module module)
+               (llvm/dispose-context context))))
+         (finally
+           (.close arena)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Compilation entry point (macro)
@@ -1642,6 +1761,33 @@
   (testing "the clojure wrapper writes native stdout to *out*"
     (is (= "value = 42\n"
            (with-out-str (print-value 42))))))
+
+(deftest test-build-library
+  (let [output (str (System/getProperty "java.io.tmpdir")
+                    "/clodin-test-lib-" (System/nanoTime)
+                    (if (string/includes? (System/getProperty "os.name") "Mac")
+                      ".dylib" ".so"))]
+    (try
+      (build-library! 'examples.standalone-lib {:output output})
+      (let [arena (Arena/ofConfined)]
+        (try
+          (let [lookup (SymbolLookup/libraryLookup output arena)
+                greet (.orElseThrow (.find lookup "greet"))
+                descriptor (FunctionDescriptor/of
+                            ValueLayout/JAVA_INT
+                            (into-array java.lang.foreign.MemoryLayout
+                                        [ValueLayout/ADDRESS]))
+                handle (.downcallHandle (Linker/nativeLinker) greet descriptor
+                                        (make-array Linker$Option 0))
+                text (.allocateFrom arena "library")]
+            (is (= "hello, library\n"
+                   (with-out-str
+                     (native-stdout/with-native-stdout
+                       (.invokeWithArguments handle (object-array [text])))))))
+          (finally
+            (.close arena))))
+      (finally
+        (io/delete-file output true)))))
 
 (deftest test-extern-strlen
   (testing "string literals are null terminated C strings"
