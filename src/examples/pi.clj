@@ -38,7 +38,7 @@
 
     3.1415926536"
   (:require [clodin.compiler :refer [defproc extern]]
-            [clodin.repl :refer [with-native-stdout]]))
+            [clojure.test :refer [deftest is]]))
 
 (extern printf [:ptr] :i32 :varargs)
 (extern atoi [:ptr] :i32)
@@ -128,9 +128,11 @@
   (print-pi (atoi (load :ptr (pointer-add argv 8))))
   (to-i32 0))
 
-  (comment
-    (clodin.compiler/build-executable! *ns* {:output "pi"})
+(deftest test-print-pi
+  (is (= "3.1415926536\n" (with-out-str (print-pi 10)))))
 
-    (with-native-stdout
-      (print-pi 10))
-    )
+(comment
+  (clodin.compiler/build-executable! *ns* {:output "pi"})
+
+  (time (print-pi 5000))
+  )

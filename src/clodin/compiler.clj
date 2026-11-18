@@ -57,6 +57,7 @@
   (if condition then else) chooses between two same-typed value expressions
   with an llvm.select, so both branches must be pure."
   (:require [clodin.llvm-api :as llvm]
+            [clodin.native-stdout :as native-stdout]
             [clojure.java.io :as io]
             [clojure.java.shell :as shell]
             [clojure.test :refer [deftest is run-tests testing]])
@@ -1245,7 +1246,8 @@
                                                     return-type body-forms)]
     (register-procedure! namespace (str name) param-names param-types return-type bitcode callees)
     `(defn ~name [~@param-names]
-       (invoke-procedure ~(str name) [~@param-names]))))
+       (native-stdout/capture-native-stdout
+        (fn [] (invoke-procedure ~(str name) [~@param-names]))))))
 
 (defmacro defproc
   "Defines a native clodin procedure.
@@ -1257,6 +1259,10 @@
   API. The bitcode is stored in the registry, but the JIT is not run yet.
   The whole module is compiled and loaded lazily in-process on the first
   call to any native procedure wrapper.
+
+  The generated Clojure wrapper captures the C stdout stream and writes it
+  to *out*, so printf output from the procedure appears in the REPL. Call
+  invoke-procedure directly to bypass the capture.
 
   An explicit return type can be given by putting a type keyword before
   the body forms; without it the return type is inferred from the last
@@ -1631,6 +1637,11 @@
 (deftest test-extern-printf
   (testing "printf is callable and returns the number of bytes written"
     (is (= 0 (print-nothing)))))
+
+(deftest test-defproc-captures-native-stdout
+  (testing "the clojure wrapper writes native stdout to *out*"
+    (is (= "value = 42\n"
+           (with-out-str (print-value 42))))))
 
 (deftest test-extern-strlen
   (testing "string literals are null terminated C strings"
