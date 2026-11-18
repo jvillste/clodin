@@ -1,4 +1,3 @@
-/.DS_Store
 /.clj-kondo/
 /.lsp/
 /references/
@@ -8,5 +7,7 @@
 /.nrepl-port
 /temp/
 /target/
+/build/
 /hs_err_pid*.log
 /replay_pid*.log
+.DS_Store

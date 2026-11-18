@@ -25,6 +25,12 @@
   elements: the offset is index times the element size (8 bytes for
   :i64/:f64/:ptr, 4 bytes for :i32/:f32).
 
+  External C functions are declared with extern, for example
+  (extern printf [:ptr] :i32 :varargs). The JIT resolves the symbol from the
+  host process, so libc functions are available without linking anything.
+  Clojure string literals compile to constant C strings and are passed as
+  :ptr.
+
   Local variables are introduced with (let [name type value ...] body...)
   and mutated with (set name value). Loops are written with
   (while condition body...).
@@ -35,8 +41,9 @@
   llvm.fabs, llvm.minnum/llvm.maxnum and llvm.smin/llvm.smax intrinsics.
 
   (to-float x) converts an integer to a 64 bit float and (to-f32 x)
-  converts an integer or a 64 bit float to a 32 bit float. Float literals
-  are 64 bit, so f32 constants are written (to-f32 1.0e-9).
+  converts an integer or a 64 bit float to a 32 bit float. (to-i32 x)
+  truncates a 64 bit integer to 32 bits. Float literals are 64 bit, so f32
+  constants are written (to-f32 1.0e-9).
 
   (if condition then else) chooses between two same-typed value expressions
   with an llvm.select, so both branches must be pure."
@@ -61,6 +68,65 @@
 ;;; ---------------------------------------------------------------------------
 
 (def procedure-registry (atom {}))
+
+;;; external-registry maps an external C function name to
+;;; {:param-types [...] :return-type ... :varargs? bool}. External functions
+;;; are declared with the extern macro and resolved by the JIT from the host
+;;; process, so they need no bitcode of their own.
+(def external-registry (atom {}))
+
+(def ^:private supported-types #{:i64 :i32 :f64 :f32 :ptr})
+
+(defn register-external!
+  "Registers the signature of an external C function so clodin procedures can
+  call it. The function is resolved by the JIT from the host process at call
+  time. varargs? declares a C variadic function such as printf."
+  [name param-types return-type varargs?]
+  (when-not (symbol? name)
+    (throw (ex-info "External function name must be a symbol" {:name name})))
+  (when-not (vector? param-types)
+    (throw (ex-info "External function parameter types must be a vector"
+                    {:name name :param-types param-types})))
+  (doseq [type (concat param-types (when return-type [return-type]))]
+    (when-not (contains? supported-types type)
+      (throw (ex-info (str "Unsupported external function type: " type)
+                      {:name name :type type}))))
+  (when (contains? @procedure-registry (str name))
+    (throw (ex-info (str "External function " name
+                         " conflicts with a clodin procedure of the same name")
+                    {:name name})))
+  (let [signature {:param-types (vec param-types)
+                   :return-type return-type
+                   :varargs? (boolean varargs?)}]
+    (when-let [existing (get @external-registry (str name))]
+      (when-not (= existing signature)
+        (throw (ex-info (str "External function " name
+                             " was already declared with a different signature")
+                        {:name name :existing existing :signature signature}))))
+    (swap! external-registry assoc (str name) signature))
+  nil)
+
+(defmacro extern
+  "Declares an external C function so clodin procedures can call it.
+
+  (extern printf [:ptr] :i32 :varargs)
+  (extern strlen [:ptr] :i64)
+
+  param-types lists the fixed argument types. A trailing :varargs makes the
+  function variadic, so calls may pass extra arguments after the fixed ones.
+  A return type of :void (or nil) declares a function that returns nothing.
+  The symbol is resolved by the JIT from the host process, so libc functions
+  such as printf and strlen are available without linking anything."
+  [name param-types return-type & options]
+  (doseq [option options]
+    (when-not (= option :varargs)
+      (throw (ex-info (str "Unknown extern option: " option)
+                      {:option option}))))
+  (register-external! name param-types
+                      (when-not (= :void return-type) return-type)
+                      (boolean (some #{:varargs} options)))
+  nil)
+
 (def procedure-handles (atom {}))
 (def module-dirty (atom true))
 (defonce current-jit (atom nil))
@@ -71,7 +137,7 @@
 ;;; pipeline only optimizes, never changes IEEE floating point results, so
 ;;; all levels produce the same numerical output.
 ;;;
-(def ^:private optimization-level (atom :none))
+(def ^:private optimization-level (atom :O3 #_:none))
 
 (defn set-optimization-level!
   "Sets the LLVM IR optimization level used on the next module build and
@@ -241,6 +307,85 @@
           [state result (:return-type procedure)]
           [state nil nil])))))
 
+(defn- promote-variadic-argument
+  "Applies the C default argument promotion to a variadic argument. Clodin
+  has no types narrower than 32 bits, so only f32 needs promoting to f64."
+  [state value type]
+  (if (= :f32 type)
+    [(llvm/build-fpext (:builder state) value
+                       (llvm/type-for (:context state) :f64)
+                       (:arena state) nil)
+     :f64]
+    [value type]))
+
+(defn- compile-external-call
+  "Compiles a call to an external C function declared with extern. The
+  function is declared in the module and resolved by the JIT from the host
+  process. Variadic arguments are promoted the way a C compiler would."
+  [state environment procedure-symbol
+   {:keys [param-types return-type varargs?]} argument-forms]
+  (let [fixed-count (count param-types)
+        argument-count (count argument-forms)]
+    (when (or (< argument-count fixed-count)
+              (and (not varargs?) (not= argument-count fixed-count)))
+      (throw (ex-info (str "External function " procedure-symbol " expects "
+                           (if varargs?
+                             (str "at least " fixed-count)
+                             (str fixed-count))
+                           " arguments, got " argument-count)
+                      {:procedure procedure-symbol
+                       :param-types param-types
+                       :varargs? varargs?})))
+    (let [[state argument-values argument-types]
+          (compile-operands state environment argument-forms)
+          [state argument-values argument-types]
+          (if varargs?
+            (reduce (fn [[state values types] index]
+                      (if (< index fixed-count)
+                        [state values types]
+                        (let [[value type]
+                              (promote-variadic-argument state (nth values index)
+                                                         (nth types index))]
+                          [state (assoc values index value)
+                           (assoc types index type)])))
+                    [state (vec argument-values) (vec argument-types)]
+                    (range argument-count))
+            [state (vec argument-values) (vec argument-types)])
+          fixed-types (subvec argument-types 0 fixed-count)]
+      (when-not (= fixed-types param-types)
+        (throw (ex-info (str "Argument types " fixed-types
+                             " do not match fixed parameters " param-types
+                             " for external function " procedure-symbol)
+                        {:procedure procedure-symbol
+                         :argument-types fixed-types})))
+      (let [{:keys [context module builder arena]} state
+            function-type (llvm/function-type context arena return-type
+                                              param-types varargs?)
+            callee (llvm/get-or-add-function
+                    module (llvm/c-string arena (str procedure-symbol))
+                    function-type)
+            result (llvm/build-call builder function-type callee
+                                    argument-values arena)]
+        (if return-type
+          [state result return-type]
+          [state nil nil])))))
+
+(defn- compile-call
+  "Dispatches a call to either a clodin procedure or an external C function."
+  [state environment procedure-symbol argument-forms]
+  (let [name (str procedure-symbol)]
+    (cond
+      (contains? @procedure-registry name)
+      (compile-procedure-call state environment procedure-symbol argument-forms)
+
+      (contains? @external-registry name)
+      (compile-external-call state environment procedure-symbol
+                             (get @external-registry name) argument-forms)
+
+      :else
+      (throw (ex-info (str "Unknown clodin procedure: " procedure-symbol)
+                      {:procedure procedure-symbol})))))
+
 (defn- compile-sqrt
   "Compiles (sqrt x), the square root of a floating point value, lowered to
   the llvm.sqrt intrinsic."
@@ -330,6 +475,31 @@
                     [state result :f32])
       (throw (ex-info (str "to-f32 expects an integer or a 64 bit float, got " type)
                       {:type type})))))
+
+(defn- compile-to-i32
+  "Compiles (to-i32 x), truncating a 64 bit integer to 32 bits."
+  [state environment expression]
+  (when-not (= 2 (count expression))
+    (throw (ex-info "to-i32 expects exactly one operand" {:expression expression})))
+  (let [[state value type] (compile-expression state environment (second expression))]
+    (case type
+      :i32 [state value :i32]
+      :i64 (let [result (llvm/build-trunc (:builder state) value
+                                          (llvm/type-for (:context state) :i32)
+                                          (:arena state) nil)]
+             [state result :i32])
+      (throw (ex-info (str "to-i32 expects an integer, got " type)
+                      {:type type})))))
+
+(defn- compile-string-literal
+  "Compiles a Clojure string literal into a private constant null terminated
+  UTF-8 global and returns its address as a :ptr."
+  [state value]
+  (let [index (:string-counter state)
+        global-name (str ".clodin." (:procedure-name state) ".string." index)
+        global (llvm/build-global-string (:context state) (:module state)
+                                         (:arena state) value global-name)]
+    [(update state :string-counter inc) global :ptr]))
 
 (defn- compile-load
   "Compiles (load type pointer) into an llvm load instruction."
@@ -628,6 +798,7 @@
   (cond
     (integer? expression) [state (llvm/const-int (:context state) expression) :i64]
     (float? expression) [state (llvm/const-real (:context state) expression) :f64]
+    (string? expression) (compile-string-literal state expression)
     (symbol? expression) (compile-local-reference state environment expression)
     (seq? expression)
     (let [operator (first expression)
@@ -637,6 +808,7 @@
         (#{'< '<= '> '>= '= 'not=} operator) (compile-comparison state environment operator (rest expression))
         (= operator 'to-float) (compile-to-float state environment expression)
         (= operator 'to-f32) (compile-to-f32 state environment expression)
+        (= operator 'to-i32) (compile-to-i32 state environment expression)
         (= operator 'sqrt) (compile-sqrt state environment expression)
         (= operator 'abs) (compile-abs state environment expression)
         (#{'min 'max} operator) (compile-min-or-max state environment operator (rest expression))
@@ -650,7 +822,7 @@
         (= operator 'set) (compile-set state environment expression)
         (= operator 'if) (compile-if state environment expression)
         (= operator 'while) (compile-while state environment expression)
-        :else (compile-procedure-call state environment operator (rest expression))))
+        :else (compile-call state environment operator (rest expression))))
     :else (throw (ex-info (str "Unsupported clodin expression: " expression)
                           {:expression expression}))))
 
@@ -672,6 +844,7 @@
   (cond
     (integer? expression) :i64
     (float? expression) :f64
+    (string? expression) :ptr
     (symbol? expression) (:type (get environment expression))
     (seq? expression)
     (let [operator (first expression)]
@@ -681,6 +854,7 @@
           (#{'< '<= '> '>= '= 'not=} operator) :i1
           (= operator 'to-float) :f64
           (= operator 'to-f32) :f32
+          (= operator 'to-i32) :i32
           (#{'sqrt 'abs} operator) (expression-type environment (second expression))
           (#{'min 'max} operator) (expression-type environment (second expression))
           (= operator 'load) (second expression)
@@ -699,8 +873,10 @@
           (= operator 'set) nil
           (= operator 'if) (expression-type environment (nth expression 2))
           (= operator 'while) nil
-          :else (let [procedure (get @procedure-registry (str operator))]
-                  (:return-type procedure)))))
+          :else (let [procedure (get @procedure-registry (str operator))
+                      external (get @external-registry (str operator))]
+                  (or (:return-type procedure)
+                      (:return-type external))))))
     :else nil))
 
 ;;; Procedure -> bitcode
@@ -720,6 +896,7 @@
             entry-block (llvm/append-entry-block function builder context arena "entry")
             state {:arena arena :context context :module module :builder builder
                    :function function :entry-block entry-block :current-block entry-block
+                   :procedure-name name :string-counter 0
                    :callees {}}
             environment (into {} (map (fn [param-name param-type index]
                                         [param-name {:type param-type
@@ -752,6 +929,10 @@
   dirty. The module is compiled later, once, when a native procedure is
   first called."
   [name param-names param-types return-type bitcode callees]
+  (when (contains? @external-registry name)
+    (throw (ex-info (str "Procedure " name
+                         " conflicts with an external function of the same name")
+                    {:procedure name})))
   (swap! procedure-registry assoc name
          {:param-types (vec param-types)
           :return-type return-type
@@ -1190,6 +1371,70 @@
   (is (= 2.5 (halve-f32 5.0)))
   (is (= 1.5 (f32-from-f64 1.5)))
   (is (= 3.0 (f32-from-i64 3))))
+
+;;; External C functions
+;;;
+;;; extern registers a C function signature. The JIT resolves the symbol from
+;;; the host process, so libc is available without linking anything. String
+;;; literals compile to private constant globals and are passed as :ptr.
+
+(extern printf [:ptr] :i32 :varargs)
+(extern sprintf [:ptr :ptr] :i32 :varargs)
+(extern strlen [:ptr] :i64)
+(extern srand [:i32] :void)
+
+(defproc print-nothing []
+  (printf ""))
+
+(defproc string-length-of-hello []
+  (strlen "hello"))
+
+(defproc string-length-of-empty []
+  (strlen ""))
+
+(defproc format-value-into-buffer [buffer :ptr]
+  (sprintf buffer "value=%ld" 12345))
+
+(defproc format-f32-into-buffer [buffer :ptr value :f32]
+  (sprintf buffer "%.1f" value))
+
+(defproc print-value [value :i64]
+  (printf "value = %ld\n" value))
+
+(defproc truncate-to-i32 [value :i64]
+  (to-i32 value))
+
+(defproc seed-random [seed :i32]
+  (srand seed))
+
+(deftest test-extern-printf
+  (testing "printf is callable and returns the number of bytes written"
+    (is (= 0 (print-nothing)))))
+
+(deftest test-extern-strlen
+  (testing "string literals are null terminated C strings"
+    (is (= 5 (string-length-of-hello)))
+    (is (= 0 (string-length-of-empty)))))
+
+(deftest test-extern-sprintf
+  (let [arena (Arena/ofShared)
+        buffer (.allocate arena 64)]
+    (try
+      (is (= 11 (format-value-into-buffer buffer)))
+      (is (= "value=12345" (.getString buffer 0)))
+      (is (= 3 (format-f32-into-buffer buffer 2.5)))
+      (is (= "2.5" (.getString buffer 0)))
+      (finally
+        (.close arena)))))
+
+(deftest test-to-i32
+  (testing "to-i32 truncates a 64 bit integer"
+    (is (= 42 (truncate-to-i32 42)))
+    (is (= 0 (truncate-to-i32 4294967296)))))
+
+(deftest test-extern-void-return
+  (testing "a void external function produces no value"
+    (is (nil? (seed-random 1)))))
 
 (deftest test-optimization-level
   (testing "set-optimization-level! preserves results at every level"

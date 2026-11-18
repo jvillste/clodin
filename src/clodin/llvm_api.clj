@@ -76,17 +76,21 @@
     array))
 
 (defn function-type
-  "Builds the LLVMFunctionType for a signature."
-  ^MemorySegment [^MemorySegment context ^Arena arena return-type param-types]
-  (let [return-t (if return-type
-                   (type-for context return-type)
-                   (void-type context))
-        param-count (count param-types)]
-    (LLVM/LLVMFunctionType
-     return-t
-     (pointer-array arena (map #(type-for context %) param-types))
-     param-count
-     0)))
+  "Builds the LLVMFunctionType for a signature. A vararg? of true marks the
+  function as C variadic, so calls may pass extra arguments after the fixed
+  param-types."
+  (^MemorySegment [^MemorySegment context ^Arena arena return-type param-types]
+   (function-type context arena return-type param-types false))
+  (^MemorySegment [^MemorySegment context ^Arena arena return-type param-types vararg?]
+   (let [return-t (if return-type
+                    (type-for context return-type)
+                    (void-type context))
+         param-count (count param-types)]
+     (LLVM/LLVMFunctionType
+      return-t
+      (pointer-array arena (map #(type-for context %) param-types))
+      param-count
+      (if vararg? 1 0)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Context, module, builder lifecycle
@@ -153,6 +157,27 @@
   ^MemorySegment [^MemorySegment context double-value]
   (LLVM/LLVMConstReal (LLVM/LLVMDoubleTypeInContext context) (double double-value)))
 
+(defn build-global-string
+  "Creates a private constant global holding value as a null terminated UTF-8
+  C string and returns the global value. With opaque pointers the global's
+  pointer type is :ptr, so it can be passed directly to a function expecting
+  a char pointer."
+  ^MemorySegment [^MemorySegment context ^MemorySegment module ^Arena arena
+                  ^String value ^String name]
+  (let [bytes (.getBytes value java.nio.charset.StandardCharsets/UTF_8)
+        length (alength bytes)
+        native-bytes (.allocate arena (max 1 (long length)))
+        _ (when (pos? length)
+            (.copyFrom native-bytes (MemorySegment/ofArray bytes)))
+        constant (LLVM/LLVMConstStringInContext2 context native-bytes
+                                                  (long length) 0)
+        global (LLVM/LLVMAddGlobal module (LLVM/LLVMTypeOf constant)
+                                   (c-string arena name))]
+    (LLVM/LLVMSetInitializer global constant)
+    (LLVM/LLVMSetGlobalConstant global 1)
+    (LLVM/LLVMSetLinkage global (LLVM/LLVMPrivateLinkage))
+    global))
+
 ;;; ---------------------------------------------------------------------------
 ;;; Instruction builders (all insert at the builder's current position)
 ;;; ---------------------------------------------------------------------------
@@ -199,6 +224,19 @@
   ^MemorySegment [^MemorySegment builder ^MemorySegment value
                   ^MemorySegment dest-type ^Arena arena ^String name]
   (LLVM/LLVMBuildFPTrunc builder value dest-type (name-token builder arena name)))
+
+(defn build-fpext
+  "Extends a narrower floating point value (e.g. f32) to a wider one
+  (e.g. f64). Used for C default argument promotions in variadic calls."
+  ^MemorySegment [^MemorySegment builder ^MemorySegment value
+                  ^MemorySegment dest-type ^Arena arena ^String name]
+  (LLVM/LLVMBuildFPExt builder value dest-type (name-token builder arena name)))
+
+(defn build-trunc
+  "Truncates a wider integer value (e.g. i64) to a narrower one (e.g. i32)."
+  ^MemorySegment [^MemorySegment builder ^MemorySegment value
+                  ^MemorySegment dest-type ^Arena arena ^String name]
+  (LLVM/LLVMBuildTrunc builder value dest-type (name-token builder arena name)))
 
 (defn build-inttoptr
   ^MemorySegment [^MemorySegment builder ^MemorySegment value
