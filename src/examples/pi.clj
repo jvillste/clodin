@@ -37,7 +37,8 @@
   Expected output:
 
     3.1415926536"
-  (:require [clodin.compiler :refer [defproc extern]]))
+  (:require [clodin.compiler :refer [defproc extern]]
+            [clodin.repl :refer [with-native-stdout]]))
 
 (extern printf [:ptr] :i32 :varargs)
 (extern atoi [:ptr] :i32)
@@ -129,4 +130,7 @@
 
   (comment
     (clodin.compiler/build-executable! *ns* {:output "pi"})
+
+    (with-native-stdout
+      (print-pi 10))
     )
