@@ -31,6 +31,12 @@
   Clojure string literals compile to constant C strings and are passed as
   :ptr.
 
+  Standalone executables are built with
+  (build-executable! 'my.namespace {:output \"my-program\"}), which links the
+  procedures defined in my.namespace and the namespaces they call, then hands
+  the object file to the system C linker. One of those namespaces must define
+  a procedure named main.
+
   Local variables are introduced with (let [name type value ...] body...)
   and mutated with (set name value). Loops are written with
   (while condition body...).
@@ -48,6 +54,8 @@
   (if condition then else) chooses between two same-typed value expressions
   with an llvm.select, so both branches must be pure."
   (:require [clodin.llvm-api :as llvm]
+            [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
             [clojure.test :refer [deftest is run-tests testing]])
   (:import (java.lang.foreign Arena FunctionDescriptor Linker Linker$Option
                               MemorySegment ValueLayout)))
@@ -925,16 +933,17 @@
         (.close arena)))))
 
 (defn- register-procedure!
-  "Registers the bitcode and signature of a procedure and marks the module
-  dirty. The module is compiled later, once, when a native procedure is
-  first called."
-  [name param-names param-types return-type bitcode callees]
+  "Registers the bitcode, signature and defining namespace of a procedure and
+  marks the module dirty. The module is compiled later, once, when a native
+  procedure is first called."
+  [namespace name param-names param-types return-type bitcode callees]
   (when (contains? @external-registry name)
     (throw (ex-info (str "Procedure " name
                          " conflicts with an external function of the same name")
                     {:procedure name})))
   (swap! procedure-registry assoc name
-         {:param-types (vec param-types)
+         {:namespace namespace
+          :param-types (vec param-types)
           :return-type return-type
           :bitcode bitcode
           :callees callees})
@@ -945,19 +954,27 @@
 ;;; Whole module build : linked bitcode -> in-process JIT
 ;;; ---------------------------------------------------------------------------
 
-(defn- link-module
-  "Parses every procedure's stored bitcode into a single linked module in
-  the given context."
-  [context arena]
-  (when (empty? @procedure-registry)
-    (throw (ex-info "No clodin procedures registered to compile" {})))
+(defn- link-procedures
+  "Parses the stored bitcode of the given procedures into a single linked
+  module in the given context."
+  [procedures context arena]
+  (when (empty? procedures)
+    (throw (ex-info "No clodin procedures to link" {})))
   (reduce (fn [merged {:keys [bitcode]}]
             (let [module (llvm/parse-bitcode context bitcode arena)]
               (if (nil? merged)
                 module
                 (llvm/link-into! merged module))))
           nil
-          (vals @procedure-registry)))
+          (vals procedures)))
+
+(defn- link-module
+  "Parses every registered procedure's stored bitcode into a single linked
+  module in the given context."
+  [context arena]
+  (when (empty? @procedure-registry)
+    (throw (ex-info "No clodin procedures registered to compile" {})))
+  (link-procedures @procedure-registry context arena))
 
 (defn- build-handles
   "Builds a panama downcall handle for every registered procedure from its
@@ -1034,13 +1051,136 @@
                    (map coerce-argument (:param-types procedure) arguments))))))
 
 ;;; ---------------------------------------------------------------------------
+;;; Standalone executable build
+;;; ---------------------------------------------------------------------------
+
+(defn- namespace-closure
+  "Returns the set of namespaces reachable from root-namespace by following
+  procedure calls. A procedure's callees are recorded when it is compiled, so
+  the closure covers exactly the namespaces whose procedures are used."
+  [root-namespace]
+  (let [registry @procedure-registry
+        namespace-of (fn [procedure-name]
+                       (:namespace (get registry procedure-name)))
+        callee-namespaces (fn [[_procedure-name procedure]]
+                            (keep namespace-of (keys (:callees procedure))))]
+    (loop [pending [root-namespace]
+           seen #{}]
+      (if-let [namespace (first pending)]
+        (if (contains? seen namespace)
+          (recur (rest pending) seen)
+          (let [procedures (filter (fn [[_procedure-name procedure]]
+                                     (= namespace (:namespace procedure)))
+                                   registry)
+                next-namespaces (mapcat callee-namespaces procedures)]
+            (recur (concat (rest pending) next-namespaces)
+                   (conj seen namespace))))
+        seen))))
+
+(defn- procedures-in-namespaces
+  "Returns the registry entries whose defining namespace is in namespaces."
+  [namespaces]
+  (into {}
+        (filter (fn [[_procedure-name procedure]]
+                  (contains? namespaces (:namespace procedure))))
+        @procedure-registry))
+
+(defn- main-namespace
+  "The namespace that defines the procedure named main, or nil."
+  []
+  (:namespace (get @procedure-registry "main")))
+
+(defn build-executable!
+  "Builds a standalone native executable from the procedures defined in
+  root-namespace and the namespaces they call into. One of those namespaces
+  must define a procedure named main.
+
+  root-namespace is required first, so its defproc forms register their
+  bitcode. The procedure call graph then selects the namespaces to link. If
+  main lives in a namespace that is loaded but not called from root-namespace,
+  its namespace is added so the entry point is always present.
+
+  Options:
+    :output              output path (default \"a.out\")
+    :optimization-level  :none, :O0, :O1, :O2 or :O3 (defaults to the
+                         compiler's current level)
+    :linker              linker driver command (default \"cc\")
+    :linker-args         extra arguments passed to the linker driver
+    :extra-namespaces    additional namespaces to link, for procedures that
+                         are not reachable from root-namespace by calls
+
+  Returns the output path. The intermediate object file is removed after a
+  successful link."
+  ([root-namespace]
+   (build-executable! root-namespace {}))
+  ([root-namespace {:keys [output linker linker-args extra-namespaces]
+                    :or {output "a.out" linker "cc" linker-args []
+                         extra-namespaces []}
+                    :as options}]
+   (let [root-namespace (symbol (str root-namespace))
+         extra-namespaces (mapv #(symbol (str %)) extra-namespaces)]
+     (doseq [namespace (cons root-namespace extra-namespaces)]
+       (require namespace))
+     (let [root-name (str root-namespace)
+           root-closure (reduce (fn [closure namespace]
+                                  (into closure (namespace-closure (str namespace))))
+                                (namespace-closure root-name)
+                                extra-namespaces)
+           entry-namespace (main-namespace)
+           namespaces (if (and entry-namespace
+                              (not (contains? root-closure entry-namespace)))
+                        (into root-closure (namespace-closure entry-namespace))
+                        root-closure)
+           procedures (procedures-in-namespaces namespaces)]
+       (when (empty? procedures)
+         (throw (ex-info (str "No clodin procedures found in " root-name
+                              " or the namespaces it calls")
+                         {:namespace root-name})))
+       (when-not (contains? procedures "main")
+         (throw (ex-info (str "No procedure named main in " root-name
+                              " or the namespaces it calls")
+                         {:namespace root-name
+                          :namespaces namespaces})))
+       (llvm/init-targets!)
+       (let [arena (Arena/ofConfined)]
+         (try
+           (let [context (llvm/new-context)
+                 module (link-procedures procedures context arena)
+                 target-machine (llvm/create-target-machine arena)]
+             (try
+               (llvm/set-module-target! module target-machine arena)
+               (llvm/verify module arena)
+               (let [level (or (:optimization-level options) @optimization-level)]
+                 (when-not (= :none level)
+                   (llvm/optimize-module! module arena level)))
+               (let [object-path (str output ".o")]
+                 (io/make-parents output)
+                 (llvm/emit-object-file! target-machine module object-path arena)
+                 (let [{:keys [exit err]}
+                       (apply shell/sh
+                              (concat [linker "-o" output object-path] linker-args))]
+                   (when-not (zero? exit)
+                     (throw (ex-info (str "Linking failed: " err)
+                                     {:exit exit :err err :output output})))
+                   (io/delete-file object-path true)
+                   output))
+             (finally
+               (llvm/dispose-target-machine target-machine)
+               (llvm/dispose-module module)
+               (llvm/dispose-context context))))
+           (finally
+             (.close arena))))))))
+
+;;; ---------------------------------------------------------------------------
 ;;; Compilation entry point (macro)
 ;;; ---------------------------------------------------------------------------
 
 (defn- defproc-form
   "Type-checks and generates the bitcode for the procedure described by a
-  defproc form and returns the clojure defn form that calls it."
-  [name params body]
+  defproc form and returns the clojure defn form that calls it. namespace is
+  the namespace the procedure is defined in, used by build-executable! to
+  select procedures."
+  [namespace name params body]
   (when-not (symbol? name)
     (throw (ex-info "Procedure name must be a symbol" {:name name})))
   (when-not (vector? params)
@@ -1060,7 +1200,7 @@
         return-type (or explicit-return-type inferred-return-type)
         {:keys [bitcode callees]} (build-procedure! (str name) param-names param-types
                                                     return-type body-forms)]
-    (register-procedure! (str name) param-names param-types return-type bitcode callees)
+    (register-procedure! namespace (str name) param-names param-types return-type bitcode callees)
     `(defn ~name [~@param-names]
        (invoke-procedure ~(str name) [~@param-names]))))
 
@@ -1086,7 +1226,7 @@
   mutated with (set name value). Loops are written with
   (while condition body...)."
   [name params & body]
-  (defproc-form name params body))
+  (defproc-form (str *ns*) name params body))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Procedures and tests
@@ -1281,6 +1421,11 @@
 (deftest test-add-both
   (is (= 7 (add-both 3 4)))
   (is (= -2 (add-both 2 -4))))
+
+(deftest test-procedure-namespace
+  (testing "defproc records the namespace that defines the procedure"
+    (is (= "clodin.compiler"
+           (:namespace (get @procedure-registry "add-both"))))))
 
 (deftest test-add-gigabyte
   (testing "untyped constant integers are 64 bit integers"

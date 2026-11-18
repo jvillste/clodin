@@ -460,6 +460,14 @@
     :O3 "default<O3>"
     (throw (ex-info (str "Unknown optimization level: " level) {:level level}))))
 
+(defn target-triple
+  "The default target triple of the host."
+  ^String []
+  (let [triple-pointer (LLVM/LLVMGetDefaultTargetTriple)
+        triple (.getString triple-pointer 0)]
+    (LLVM/LLVMDisposeMessage triple-pointer)
+    triple))
+
 (defn- host-target-machine
   "Creates a TargetMachine for the host at the given LLVM codegen optimization
   level. LLVMRunPasses needs a target machine to run its IR optimization
@@ -481,6 +489,43 @@
      codegen-level
      (int 0) ; reloc: default
      (int 0)))) ; code model: default
+
+(defn create-target-machine
+  "Creates a host TargetMachine for object emission. The caller must dispose it
+  with dispose-target-machine."
+  ^MemorySegment [^Arena arena]
+  (host-target-machine arena 2)) ; CodeGenOpt::Default
+
+(defn dispose-target-machine
+  [^MemorySegment target-machine]
+  (LLVM/LLVMDisposeTargetMachine target-machine))
+
+(defn set-module-target!
+  "Sets the module's target triple and data layout to the host target machine's.
+  Required before emitting a native object file."
+  [^MemorySegment module ^MemorySegment target-machine ^Arena arena]
+  (LLVM/LLVMSetTarget module (c-string arena (target-triple)))
+  (let [target-data (LLVM/LLVMCreateTargetDataLayout target-machine)
+        layout-pointer (LLVM/LLVMCopyStringRepOfTargetData target-data)
+        layout (.getString layout-pointer 0)]
+    (LLVM/LLVMDisposeMessage layout-pointer)
+    (LLVM/LLVMDisposeTargetData target-data)
+    (LLVM/LLVMSetDataLayout module (c-string arena layout))))
+
+(defn emit-object-file!
+  "Emits the module as a native object file at path."
+  [^MemorySegment target-machine ^MemorySegment module ^String path ^Arena arena]
+  (let [error-slot (.allocate arena ValueLayout/ADDRESS)
+        failed (LLVM/LLVMTargetMachineEmitToFile
+                target-machine module (c-string arena path)
+                (LLVM/LLVMObjectFile) error-slot)]
+    (when-not (zero? failed)
+      (let [message-pointer (.get error-slot ValueLayout/ADDRESS 0)]
+        (throw-error
+         {:path path}
+         (if (null? message-pointer)
+           "LLVM object emission failed"
+           (.getString (.reinterpret message-pointer 4096) 0)))))))
 
 (defn optimize-module!
   "Runs the LLVM new-pass-manager IR optimization pipeline for the given
