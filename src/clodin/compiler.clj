@@ -14,7 +14,9 @@
   module, so those calls never touch the jvm. The jvm is only involved at
   the boundary, when clojure code calls a native procedure.
 
-  Untyped constant integers are treated as 64 bit integers.
+  Untyped constant integers are treated as 64 bit integers. Booleans use the
+  :i1 type: comparisons produce :i1, true and false are :i1 literals, and
+  :i1 can be used for locals, parameters, returns and buffer elements.
 
   Pointers use the :ptr type. Memory is accessed with
   (load type pointer), (store type pointer value), (pointer-add pointer
@@ -23,7 +25,7 @@
   Uniform element buffers are read and written with (buffer-get pointer
   type index) and (buffer-set pointer type index value), where index counts
   elements: the offset is index times the element size (8 bytes for
-  :i64/:f64/:ptr, 4 bytes for :i32/:f32).
+  :i64/:f64/:ptr, 4 bytes for :i32/:f32, 1 byte for :i1).
 
   External C functions are declared with extern, for example
   (extern printf [:ptr] :i32 :varargs). The JIT resolves the symbol from the
@@ -48,8 +50,9 @@
 
   (to-float x) converts an integer to a 64 bit float and (to-f32 x)
   converts an integer or a 64 bit float to a 32 bit float. (to-i32 x)
-  truncates a 64 bit integer to 32 bits. Float literals are 64 bit, so f32
-  constants are written (to-f32 1.0e-9).
+  truncates a 64 bit integer to 32 bits and (to-i64 x) sign extends a 32 bit
+  integer to 64 bits. Float literals are 64 bit, so f32 constants are written
+  (to-f32 1.0e-9).
 
   (if condition then else) chooses between two same-typed value expressions
   with an llvm.select, so both branches must be pure."
@@ -164,6 +167,7 @@
 (defn value-layout
   [type]
   (case type
+    :i1 ValueLayout/JAVA_BOOLEAN
     :i64 ValueLayout/JAVA_LONG
     :i32 ValueLayout/JAVA_INT
     :f64 ValueLayout/JAVA_DOUBLE
@@ -172,6 +176,7 @@
     (throw (ex-info (str "Unsupported clodin type: " type) {:type type}))))
 
 (deftest test-value-layout
+  (is (= ValueLayout/JAVA_BOOLEAN (value-layout :i1)))
   (is (= ValueLayout/JAVA_LONG (value-layout :i64)))
   (is (= ValueLayout/JAVA_INT (value-layout :i32)))
   (is (= ValueLayout/JAVA_DOUBLE (value-layout :f64)))
@@ -192,6 +197,12 @@
   descriptor expects for the given clodin type."
   [type value]
   (case type
+    :i1 (cond
+          (instance? Boolean value) value
+          (integer? value) (not (zero? value))
+          :else (throw (ex-info (str "Expected a boolean or integer for :i1, got "
+                                     (some-> value class .getName))
+                                {:type type :value value})))
     :i64 (long value)
     :i32 (int value)
     :f64 (double value)
@@ -485,7 +496,8 @@
                       {:type type})))))
 
 (defn- compile-to-i32
-  "Compiles (to-i32 x), truncating a 64 bit integer to 32 bits."
+  "Compiles (to-i32 x), truncating a 64 bit integer to 32 bits or zero
+  extending an i1 boolean."
   [state environment expression]
   (when-not (= 2 (count expression))
     (throw (ex-info "to-i32 expects exactly one operand" {:expression expression})))
@@ -496,7 +508,31 @@
                                           (llvm/type-for (:context state) :i32)
                                           (:arena state) nil)]
              [state result :i32])
+      :i1 (let [result (llvm/build-zext (:builder state) value
+                                        (llvm/type-for (:context state) :i32)
+                                        (:arena state) nil)]
+            [state result :i32])
       (throw (ex-info (str "to-i32 expects an integer, got " type)
+                      {:type type})))))
+
+(defn- compile-to-i64
+  "Compiles (to-i64 x), sign extending a 32 bit integer to 64 bits or zero
+  extending an i1 boolean."
+  [state environment expression]
+  (when-not (= 2 (count expression))
+    (throw (ex-info "to-i64 expects exactly one operand" {:expression expression})))
+  (let [[state value type] (compile-expression state environment (second expression))]
+    (case type
+      :i64 [state value :i64]
+      :i32 (let [result (llvm/build-sext (:builder state) value
+                                         (llvm/type-for (:context state) :i64)
+                                         (:arena state) nil)]
+             [state result :i64])
+      :i1 (let [result (llvm/build-zext (:builder state) value
+                                        (llvm/type-for (:context state) :i64)
+                                        (:arena state) nil)]
+            [state result :i64])
+      (throw (ex-info (str "to-i64 expects an integer, got " type)
                       {:type type})))))
 
 (defn- compile-string-literal
@@ -571,6 +607,7 @@
   "The size in bytes of one buffer element of the given type."
   [type]
   (case type
+    :i1 1
     :i64 8
     :i32 4
     :f64 8
@@ -806,6 +843,9 @@
   (cond
     (integer? expression) [state (llvm/const-int (:context state) expression) :i64]
     (float? expression) [state (llvm/const-real (:context state) expression) :f64]
+    (boolean? expression) [state (llvm/const-int-of-type (:context state) :i1
+                                                         (if expression 1 0))
+                           :i1]
     (string? expression) (compile-string-literal state expression)
     (symbol? expression) (compile-local-reference state environment expression)
     (seq? expression)
@@ -817,6 +857,7 @@
         (= operator 'to-float) (compile-to-float state environment expression)
         (= operator 'to-f32) (compile-to-f32 state environment expression)
         (= operator 'to-i32) (compile-to-i32 state environment expression)
+        (= operator 'to-i64) (compile-to-i64 state environment expression)
         (= operator 'sqrt) (compile-sqrt state environment expression)
         (= operator 'abs) (compile-abs state environment expression)
         (#{'min 'max} operator) (compile-min-or-max state environment operator (rest expression))
@@ -852,6 +893,7 @@
   (cond
     (integer? expression) :i64
     (float? expression) :f64
+    (boolean? expression) :i1
     (string? expression) :ptr
     (symbol? expression) (:type (get environment expression))
     (seq? expression)
@@ -863,6 +905,7 @@
           (= operator 'to-float) :f64
           (= operator 'to-f32) :f32
           (= operator 'to-i32) :i32
+          (= operator 'to-i64) :i64
           (#{'sqrt 'abs} operator) (expression-type environment (second expression))
           (#{'min 'max} operator) (expression-type environment (second expression))
           (= operator 'load) (second expression)
@@ -1549,6 +1592,39 @@
 (defproc truncate-to-i32 [value :i64]
   (to-i32 value))
 
+(defproc widen-to-i64 [value :i32]
+  (to-i64 value))
+
+(defproc is-greater [a :i64 b :i64]
+  (> a b))
+
+(defproc choose-by-flag [flag :i1 a :i64 b :i64]
+  (if flag a b))
+
+(defproc count-if-greater [a :i64 b :i64]
+  (let [flag :i1 (> a b)]
+    (if flag 1 0)))
+
+(defproc flip-flag [flag :i1]
+  (let [current :i1 flag]
+    (set current (if current false true))
+    (if current 1 0)))
+
+(defproc always-true []
+  true)
+
+(defproc flag-to-i32 [a :i64 b :i64]
+  (to-i32 (> a b)))
+
+(defproc flag-to-i64 [a :i64 b :i64]
+  (to-i64 (> a b)))
+
+(defproc set-flag [pointer :ptr index :i64 value :i1]
+  (buffer-set pointer :i1 index value))
+
+(defproc get-flag [pointer :ptr index :i64]
+  (buffer-get pointer :i1 index))
+
 (defproc seed-random [seed :i32]
   (srand seed))
 
@@ -1576,6 +1652,48 @@
   (testing "to-i32 truncates a 64 bit integer"
     (is (= 42 (truncate-to-i32 42)))
     (is (= 0 (truncate-to-i32 4294967296)))))
+
+(deftest test-to-i64
+  (testing "to-i64 sign extends a 32 bit integer"
+    (is (= 42 (widen-to-i64 42)))
+    (is (= -1 (widen-to-i64 -1)))))
+
+(deftest test-i1
+  (testing "comparisons produce i1 values that cross the jvm boundary"
+    (is (true? (is-greater 5 3)))
+    (is (false? (is-greater 3 5))))
+
+  (testing "i1 parameters and let bindings"
+    (is (= 7 (choose-by-flag true 7 9)))
+    (is (= 9 (choose-by-flag false 7 9)))
+    (is (= 1 (count-if-greater 5 3)))
+    (is (= 0 (count-if-greater 3 5))))
+    (is (= 1 (flip-flag false)))
+    (is (= 0 (flip-flag true)))
+
+  (testing "boolean literals are i1"
+    (is (true? (always-true))))
+
+  (testing "i1 widens to i32 and i64"
+    (is (= 1 (flag-to-i32 5 3)))
+    (is (= 0 (flag-to-i32 3 5)))
+    (is (= 1 (flag-to-i64 5 3)))
+    (is (= 0 (flag-to-i64 3 5)))))
+
+(deftest test-i1-buffer
+  (let [arena (Arena/ofShared)
+        buffer (.allocate arena 4)]
+    (try
+      (set-flag buffer 0 true)
+      (set-flag buffer 1 false)
+      (set-flag buffer 2 true)
+      (is (true? (get-flag buffer 0)))
+      (is (false? (get-flag buffer 1)))
+      (is (true? (get-flag buffer 2)))
+      (is (true? (.get buffer ValueLayout/JAVA_BOOLEAN 0)))
+      (is (false? (.get buffer ValueLayout/JAVA_BOOLEAN 1)))
+      (finally
+        (.close arena)))))
 
 (deftest test-extern-void-return
   (testing "a void external function produces no value"

@@ -45,6 +45,7 @@
   "Returns the LLVMTypeRef for a clodin type in the given context."
   ^MemorySegment [^MemorySegment context type]
   (case type
+    :i1 (LLVM/LLVMInt1TypeInContext context)
     :i64 (LLVM/LLVMInt64TypeInContext context)
     :i32 (LLVM/LLVMInt32TypeInContext context)
     :f64 (LLVM/LLVMDoubleTypeInContext context)
@@ -148,9 +149,14 @@
   (LLVM/LLVMConstInt (LLVM/LLVMInt64TypeInContext context) (long long-value) 0))
 
 (defn const-int-of-type
-  "A constant integer of the given clodin type."
+  "A constant integer of the given clodin type. i1 values are normalized to
+  0 or 1 so any truthy integer can be used as a boolean constant."
   ^MemorySegment [^MemorySegment context type long-value]
-  (LLVM/LLVMConstInt (type-for context type) (long long-value) 0))
+  (LLVM/LLVMConstInt (type-for context type)
+                     (long (if (= :i1 type)
+                             (if (zero? long-value) 0 1)
+                             long-value))
+                     0))
 
 (defn const-real
   "A constant 64 bit floating point value."
@@ -237,6 +243,18 @@
   ^MemorySegment [^MemorySegment builder ^MemorySegment value
                   ^MemorySegment dest-type ^Arena arena ^String name]
   (LLVM/LLVMBuildTrunc builder value dest-type (name-token builder arena name)))
+
+(defn build-sext
+  "Sign-extends a narrower integer value (e.g. i32) to a wider one (e.g. i64)."
+  ^MemorySegment [^MemorySegment builder ^MemorySegment value
+                  ^MemorySegment dest-type ^Arena arena ^String name]
+  (LLVM/LLVMBuildSExt builder value dest-type (name-token builder arena name)))
+
+(defn build-zext
+  "Zero-extends a narrower integer value (e.g. i1) to a wider one (e.g. i32)."
+  ^MemorySegment [^MemorySegment builder ^MemorySegment value
+                  ^MemorySegment dest-type ^Arena arena ^String name]
+  (LLVM/LLVMBuildZExt builder value dest-type (name-token builder arena name)))
 
 (defn build-inttoptr
   ^MemorySegment [^MemorySegment builder ^MemorySegment value
