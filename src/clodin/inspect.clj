@@ -4,7 +4,8 @@
   (llvm-ir \"add-both\")     ; textual LLVM IR from the stored bitcode
   (assembly \"add-both\")    ; target assembly after optimization
   (disassembly \"add-both\") ; objdump/otool output for the emitted object file"
-  (:require [clodin.compiler :as compiler]
+  (:require [clodin.annotate :as annotate]
+            [clodin.compiler :as compiler]
             [clodin.llvm-api :as llvm]
             [clojure.java.io :as io]
             [clojure.java.shell :as shell]
@@ -175,6 +176,56 @@
           (finally
             (io/delete-file object-file true))))))))
 
+(defn annotate-proc-assembly
+  "Returns the named procedure's assembly annotated with descriptions."
+  ([procedure-name] (annotate/annotate-assembly (assembly procedure-name)))
+  ([procedure-name options]
+   (annotate/annotate-assembly (assembly procedure-name options))))
+
+(defn print-annotated-proc-assembly!
+  "Prints the named procedure's assembly with descriptions."
+  ([procedure-name] (annotate/print-annotated-assembly! (assembly procedure-name)))
+  ([procedure-name options]
+   (annotate/print-annotated-assembly! (assembly procedure-name options))))
+
+(defn annotate-module-assembly
+  "Returns the linked module's assembly annotated with descriptions."
+  ([namespace] (annotate/annotate-assembly (module-assembly namespace)))
+  ([namespace options]
+   (annotate/annotate-assembly (module-assembly namespace options))))
+
+(defn print-annotated-module-assembly!
+  "Prints the linked module's assembly with descriptions."
+  ([namespace] (annotate/print-annotated-assembly! (module-assembly namespace)))
+  ([namespace options]
+   (annotate/print-annotated-assembly! (module-assembly namespace options))))
+
+(defn annotate-proc-disassembly
+  "Returns the named procedure's disassembly annotated with descriptions."
+  ([procedure-name] (annotate/annotate-disassembly (disassembly procedure-name)))
+  ([procedure-name options]
+   (annotate/annotate-disassembly (disassembly procedure-name options))))
+
+(defn print-annotated-proc-disassembly!
+  "Prints the named procedure's disassembly with descriptions."
+  ([procedure-name]
+   (annotate/print-annotated-disassembly! (disassembly procedure-name)))
+  ([procedure-name options]
+   (annotate/print-annotated-disassembly! (disassembly procedure-name options))))
+
+(defn annotate-module-disassembly
+  "Returns the linked module's disassembly annotated with descriptions."
+  ([namespace] (annotate/annotate-disassembly (module-disassembly namespace)))
+  ([namespace options]
+   (annotate/annotate-disassembly (module-disassembly namespace options))))
+
+(defn print-annotated-module-disassembly!
+  "Prints the linked module's disassembly with descriptions."
+  ([namespace]
+   (annotate/print-annotated-disassembly! (module-disassembly namespace)))
+  ([namespace options]
+   (annotate/print-annotated-disassembly! (module-disassembly namespace options))))
+
 (defn print-llvm-ir!
   "Prints the LLVM IR stored for the named procedure."
   ([procedure-name] (println (llvm-ir procedure-name)))
@@ -212,6 +263,50 @@
 (deftest test-assembly
   (testing "the procedure emits target assembly"
     (is (re-find #"add-both" (assembly "add-both")))))
+
+(deftest test-annotate-assembly
+  (testing "instructions get plain-english descriptions"
+    (is (re-find #"x22 = x3"
+                 (annotate/annotate-assembly "\tmov\tx22, x3"))))
+  (testing "vector instructions describe their lanes"
+    (is (re-find #"v18 \(4 x f32\) = v3 \(4 x f32\) - v16 \(4 x f32\)"
+                 (annotate/annotate-assembly
+                  "\tfsub\tv18.4s, v3.4s, v16.4s"))))
+  (testing "structure stores describe the element type and post-index"
+    (let [annotated (annotate/annotate-assembly
+                    "\tst2.4s\t{ v4, v5 }, [x9], #32")]
+      (is (re-find #"store 2 interleaved vectors" annotated))
+      (is (re-find #"v4 \(4 x f32\)" annotated))
+      (is (re-find #"advance the address by 32 bytes" annotated))))
+  (testing "vector compares and horizontal adds are described"
+    (is (re-find #"lanes of v1 \(4 x f32\) > v6 \(4 x f32\)"
+                 (annotate/annotate-assembly "\tfcmgt\tv5.4s, v1.4s, v6.4s")))
+    (is (re-find #"horizontal add"
+                 (annotate/annotate-assembly "\tfaddp\ts2, v2.2s"))))
+  (testing "suffixed simd mnemonics are described"
+    (is (re-find #"v0 \(4 x f32\) = v1 \(4 x f32\) \+ v2 \(4 x f32\)"
+                 (annotate/annotate-assembly "\tfadd.4s\tv0, v1, v2"))))
+  (testing "conditional compares are described"
+    (is (re-find #"compare x0 with x8; otherwise set flags to 2"
+                 (annotate/annotate-assembly "\tccmp\tx0, x8, #2, lo")))))
+
+(deftest test-annotate-disassembly
+  (testing "objdump instruction lines are annotated"
+    (is (re-find #"x0 = x1 \+ x0"
+                 (annotate/annotate-disassembly
+                  "   0:\t8b000020 \tadd\tx0, x1, x0"))))
+  (testing "objdump function labels are annotated"
+    (is (re-find #"function add-both"
+                 (annotate/annotate-disassembly
+                  "0000000000000000 <add-both>:"))))
+  (testing "otool instruction lines are annotated"
+    (is (re-find #"return to caller"
+                 (annotate/annotate-disassembly
+                  "0000000000000004\tret"))))
+  (testing "macos space-separated instruction lines are annotated"
+    (is (re-find #"compare x2 with immediate #0x1"
+                 (annotate/annotate-disassembly
+                  "       0: f100045f         cmp    x2, #0x1")))))
 
 (deftest test-module-inspection-without-main
   (require 'examples.standalone-lib)

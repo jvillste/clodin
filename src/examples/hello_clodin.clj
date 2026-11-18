@@ -1,5 +1,6 @@
 (ns examples.hello-clodin
-  (:require [clodin.compiler :refer [extern defproc]]))
+  (:require [clodin.compiler :refer [defproc extern]]
+            [clodin.inspect :as inspect]))
 
 (extern printf [:ptr] :i32 :varargs)
 
@@ -8,6 +9,7 @@
   (to-i32 0))
 
 (comment
-  (clodin.compiler/build-executable! *ns*
-                                     {:output "hello"})
+  (clodin.compiler/build-executable! *ns* {:output "hello"})
+
+  (inspect/print-annotated-proc-assembly! "main")
   )

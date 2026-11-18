@@ -11,8 +11,9 @@
   and a displacement scratch buffer hold 2 f32s per node (x at index
   2*node, y at 2*node+1), and the neighbour lists live in CSR form
   (offsets + indices). See `layout-buffers`."
-  (:require [clodin.compiler :refer [defproc]]
-            [clodin.inspect ::as inspect]
+  (:require [clodin.annotate :as annotate]
+            [clodin.compiler :refer [defproc]]
+            [clodin.inspect :as inspect]
             [clojure.test :refer [deftest is testing]]
             [examples.spring-layout :as spring-layout])
   (:import (java.lang.foreign Arena ValueLayout)))
@@ -377,11 +378,11 @@
 
 (comment
   (clodin.inspect/print-module-llvm-ir! *ns*)
-  (clodin.inspect/print-module-assembly! *ns*)
-  (clodin.inspect/print-module-disassembly! *ns*)
+  (clodin.inspect/print-annotated-module-assembly! *ns*)
+  (clodin.inspect/print-annotated-module-disassembly! *ns*)
 
   (clodin.inspect/print-llvm-ir! "step-layout-native")
-  (clodin.inspect/print-assembly! "step-layout-native")
+  (clodin.inspect/print-annotated-proc-assembly! "step-layout-native")
   (clodin.inspect/print-disassembly! "step-layout-native")
 
   )
