@@ -376,12 +376,12 @@
 
 
 (comment
-  (println (clodin.inspect/module-llvm-ir *ns*))
-  (println (clodin.inspect/module-disassembly *ns*))
+  (clodin.inspect/print-module-llvm-ir! *ns*)
+  (clodin.inspect/print-module-assembly! *ns*)
+  (clodin.inspect/print-module-disassembly! *ns*)
 
-  (println (clodin.inspect/disassembly  "step-layout-native"))
-  (println (clodin.inspect/assembly  "step-layout-native"))
+  (clodin.inspect/print-llvm-ir! "step-layout-native")
+  (clodin.inspect/print-assembly! "step-layout-native")
+  (clodin.inspect/print-disassembly! "step-layout-native")
 
-
-
-  ) ;; TODO: remove me
+  )
