@@ -62,7 +62,8 @@
             [clojure.java.io :as io]
             [clojure.java.shell :as shell]
             [clojure.string :as string]
-            [clojure.test :refer [deftest is run-tests testing]])
+            [clojure.test :refer [deftest is run-tests testing]]
+            [examples.standalone-lib])
   (:import (java.lang.foreign Arena FunctionDescriptor Linker Linker$Option
                               MemorySegment SymbolLookup ValueLayout)))
 
@@ -146,6 +147,21 @@
 (defonce current-jit (atom nil))
 (defonce compile-lock (Object.))
 
+;; The build mode. :monolithic relinks every procedure into one module on
+;; each build; :reloadable gives every reloadable procedure a stable stub and
+;; installs a new body module per compilation. See todo.md.
+(defonce build-mode (atom :monolithic))
+
+;; Process-wide counter for the body symbols foo$1, foo$2, ... so a body
+;; symbol is never reused within a session.
+(defonce body-counter (atom 0))
+
+;; installed-stubs maps a stub symbol to its JIT addresses and handles. A stub
+;; is installed once and never recreated until a full reset.
+(defonce installed-stubs (atom {}))
+
+(declare define-proc! reemit-all-bodies! reset-module! set-build-mode!)
+
 ;;; The LLVM IR optimization level used when a module is built, one of
 ;;; :none (JIT the IR as emitted, the default) or :O0/:O1/:O2/:O3. The
 ;;; pipeline only optimizes, never changes IEEE floating point results, so
@@ -160,7 +176,9 @@
   (when-not (contains? #{:none :O0 :O1 :O2 :O3} level)
     (throw (ex-info (str "Unknown optimization level: " level) {:level level})))
   (reset! optimization-level level)
-  (reset! module-dirty true)
+  (if (= @build-mode :reloadable)
+    (reset-module!)
+    (reset! module-dirty true))
   nil)
 
 (defn current-optimization-level
@@ -297,6 +315,36 @@
           result (reduce step (first values) (rest values))]
       [state result type])))
 
+(def ^:dynamic *call-target*
+  "How a call site names its callee: :stub in reloadable mode and :public for
+  monolithic builds and AOT output."
+  :stub)
+
+(defn- call-target-symbol
+  "The symbol a call site should reference for the given procedure."
+  [procedure name]
+  (if (= *call-target* :public)
+    name
+    (or (:stub-symbol procedure) name)))
+
+(defn- procedure-signature
+  "The ABI signature of a procedure registry entry."
+  [entry]
+  {:param-types (vec (:param-types entry))
+   :return-type (:return-type entry)})
+
+(defn- next-body-symbol
+  "A fresh body symbol for name. Body symbols are never reused."
+  [name]
+  (str name "$" (swap! body-counter inc)))
+
+(defn- valid-procedure-name!
+  "Generated symbols use $ suffixes, so user names must not contain one."
+  [name]
+  (when (string/includes? (str name) "$")
+    (throw (ex-info "Procedure and global names must not contain '$'"
+                    {:name name}))))
+
 (defn- compile-procedure-call
   "Compiles a call to another clodin procedure. The call is emitted as a
   direct llvm call inside the JIT module, so the jvm is not involved when
@@ -321,7 +369,8 @@
                         {:procedure procedure-symbol
                          :argument-types (vec argument-types)})))
       (let [{:keys [module context builder arena]} state
-            name-token (llvm/c-string arena name)
+            target-name (call-target-symbol procedure name)
+            name-token (llvm/c-string arena target-name)
             callee-type (llvm/function-type context arena (:return-type procedure)
                                             (:param-types procedure))
             callee (llvm/get-or-add-function module name-token callee-type)
@@ -943,19 +992,23 @@
 
 (defn- build-procedure!
   "Builds the LLVM IR for a single procedure through the C API and returns
-  {:bitcode byte[] :return-type ... :result-value ... :callees {...}}."
-  [name param-names param-types return-type body-forms]
+  {:bitcode byte[] :return-type ... :result-value ... :callees {...}}.
+  name is the public procedure name used in error messages and string
+  symbol names; emitted-name is the function and module symbol. In
+  reloadable mode emitted-name is foo$N, in monolithic mode it is foo."
+  [name emitted-name param-names param-types return-type body-forms]
   (let [arena (Arena/ofConfined)
         context (llvm/new-context)
-        module (llvm/new-module context (str name))
+        module (llvm/new-module context (str emitted-name))
         function-type (llvm/function-type context arena return-type param-types)]
     (try
-      (let [function (llvm/add-function module (llvm/c-string arena (str name)) function-type)
+      (let [function (llvm/add-function module (llvm/c-string arena (str emitted-name))
+                                       function-type)
             builder (llvm/new-builder context)
             entry-block (llvm/append-entry-block function builder context arena "entry")
             state {:arena arena :context context :module module :builder builder
                    :function function :entry-block entry-block :current-block entry-block
-                   :procedure-name name :string-counter 0
+                   :procedure-name emitted-name :string-counter 0
                    :callees {}}
             environment (into {} (map (fn [param-name param-type index]
                                         [param-name {:type param-type
@@ -983,23 +1036,422 @@
         (llvm/dispose-context context)
         (.close arena)))))
 
-(defn- register-procedure!
-  "Registers the bitcode, signature and defining namespace of a procedure and
-  marks the module dirty. The module is compiled later, once, when a native
-  procedure is first called."
-  [namespace name param-names param-types return-type bitcode callees]
+;;; ---------------------------------------------------------------------------
+;;; Reloadable mode: stubs, body modules, installation
+;;;
+;;; A reloadable procedure is a stable stub module (a pointer cell plus a
+;;; thunk that loads it atomically) and one body module per compilation.
+;;; Redefinition adds a body module and calls the stub's setter, so callers
+;;; keep calling the same symbol and running native loops see the new body.
+;;; ---------------------------------------------------------------------------
+
+(defn- ensure-jit!
+  "Returns the long-lived LLJIT, creating it on first use. Reloadable mode
+  keeps one JIT for the session; reset-module! disposes it."
+  []
+  (or @current-jit
+      (locking compile-lock
+        (or @current-jit
+            (let [arena (Arena/ofConfined)]
+              (try
+                (llvm/init-targets!)
+                (let [jit (llvm/create-jit arena)]
+                  (reset! current-jit jit)
+                  jit)
+                (finally
+                  (.close arena))))))))
+
+(defn- downcall-handle
+  "Builds a panama downcall handle for a JIT symbol address."
+  [address return-type param-types]
+  (when-not address
+    (throw (ex-info "JIT symbol has no address" {:address address})))
+  (.downcallHandle (Linker/nativeLinker)
+                   (MemorySegment/ofAddress (long address))
+                   (function-descriptor return-type param-types)
+                   (make-array Linker$Option 0)))
+
+(defn- install-stub!
+  "Builds and adds the stub module for stub-symbol: an atomic pointer cell,
+  the stable thunk that loads it, and the setter that stores into it. A stub
+  is installed once and never recreated. Returns its addresses and setter
+  handle."
+  [stub-symbol param-types return-type]
+  (let [jit (ensure-jit!)
+        arena (Arena/ofConfined)]
+    (try
+      (let [context (llvm/new-context)
+            module (llvm/new-module context stub-symbol)
+            pointer (llvm/pointer-type context)
+            cell (llvm/add-global module pointer
+                                 (llvm/c-string arena (str stub-symbol "$cell")))
+            thunk-type (llvm/function-type context arena return-type param-types)
+            thunk (llvm/add-function module (llvm/c-string arena stub-symbol) thunk-type)
+            builder (llvm/new-builder context)
+            _ (llvm/append-entry-block thunk builder context arena "entry")
+            code (llvm/build-atomic-load builder pointer cell arena "code")
+            arguments (mapv #(llvm/get-param thunk %) (range (count param-types)))
+            result (llvm/build-call builder thunk-type code arguments arena)
+            _ (if return-type
+                (llvm/build-ret builder result)
+                (llvm/build-ret-void builder))
+            _ (llvm/dispose-builder builder)
+            ;; The cell starts at an unbound body rather than null, so a call
+            ;; that races an install traps in abort instead of jumping to
+            ;; address zero. The unbound body has the stub's signature.
+            abort-type (llvm/function-type context arena nil [])
+            abort (llvm/add-function module (llvm/c-string arena "abort") abort-type)
+            unbound (llvm/add-function module
+                                         (llvm/c-string arena (str stub-symbol "$unbound"))
+                                         thunk-type)
+            unbound-builder (llvm/new-builder context)
+            _ (llvm/append-entry-block unbound unbound-builder context arena "entry")
+            _ (llvm/build-call unbound-builder abort-type abort [] arena)
+            _ (llvm/build-unreachable unbound-builder)
+            _ (llvm/dispose-builder unbound-builder)
+            _ (llvm/set-initializer cell unbound)
+            thunk-type (llvm/function-type context arena return-type param-types)
+            thunk (llvm/add-function module (llvm/c-string arena stub-symbol) thunk-type)
+            builder (llvm/new-builder context)
+            _ (llvm/append-entry-block thunk builder context arena "entry")
+            code (llvm/build-atomic-load builder pointer cell arena "code")
+            arguments (mapv #(llvm/get-param thunk %) (range (count param-types)))
+            result (llvm/build-call builder thunk-type code arguments arena)
+            _ (if return-type
+                (llvm/build-ret builder result)
+                (llvm/build-ret-void builder))
+            _ (llvm/dispose-builder builder)
+            setter-type (llvm/function-type context arena nil [:ptr])
+            setter (llvm/add-function module (llvm/c-string arena (str stub-symbol "$set"))
+                                      setter-type)
+            setter-builder (llvm/new-builder context)
+            _ (llvm/append-entry-block setter setter-builder context arena "entry")
+            _ (llvm/build-atomic-store setter-builder (llvm/get-param setter 0) cell arena)
+            _ (llvm/build-ret-void setter-builder)
+            _ (llvm/dispose-builder setter-builder)
+            _ (llvm/verify module arena)
+            added? (volatile! false)]
+        (try
+          (vreset! added? true)
+          (llvm/add-module-to-jit! jit module context)
+          (let [thunk-address (llvm/lookup-address jit (llvm/c-string arena stub-symbol) arena)
+                setter-address (llvm/lookup-address
+                                jit (llvm/c-string arena (str stub-symbol "$set")) arena)]
+            {:thunk-address thunk-address
+             :setter-address setter-address
+             :setter-handle (downcall-handle setter-address nil [:ptr])})
+          (finally
+            (when-not @added?
+              (llvm/dispose-module module)
+              (llvm/dispose-context context)))))
+      (finally
+        (.close arena)))))
+
+(defn- install-body!
+  "Adds body bitcode as a new module and points the stub's cell at it. The
+  old body stays mapped, so a native frame executing it is not disturbed."
+  [stub-symbol body-symbol bitcode]
+  (let [stub (get @installed-stubs stub-symbol)
+        _ (when-not stub
+            (throw (ex-info (str "No installed stub " stub-symbol)
+                            {:stub stub-symbol})))
+        jit (ensure-jit!)
+        arena (Arena/ofConfined)]
+    (try
+      (let [context (llvm/new-context)
+            module (llvm/parse-bitcode context bitcode arena)
+            added? (volatile! false)]
+        (try
+          (when-not (= :none @optimization-level)
+            (llvm/optimize-module! module arena @optimization-level))
+          (vreset! added? true)
+          (llvm/add-module-to-jit! jit module context)
+          (let [body-address (llvm/lookup-address jit (llvm/c-string arena body-symbol) arena)]
+            (when-not body-address
+              (throw (ex-info (str "JIT has no body symbol " body-symbol)
+                              {:body body-symbol})))
+            (.invokeWithArguments (:setter-handle stub)
+                                  (object-array [(MemorySegment/ofAddress (long body-address))]))
+            body-address)
+          (finally
+            (when-not @added?
+              (llvm/dispose-module module)
+              (llvm/dispose-context context)))))
+      (finally
+        (.close arena)))))
+
+(defn- ensure-stub-for-entry!
+  "Gives entry a stub symbol for its signature, minting and installing one
+  if needed, and keeps the JVM thunk handle in step with the current stub."
+  [name entry]
+  (let [signature (procedure-signature entry)
+        stubs (:stubs entry {})
+        revision (inc (:sig-counter entry 0))
+        stub-symbol (or (get stubs signature)
+                        (if (= revision 1)
+                          name
+                          (str name "$sig" revision)))
+        entry (assoc entry
+                     :stubs (assoc stubs signature stub-symbol)
+                     :sig-counter revision
+                     :stub-symbol stub-symbol
+                     :stub-signature signature)]
+    (when-not (contains? @installed-stubs stub-symbol)
+      (let [stub (install-stub! stub-symbol (:param-types entry) (:return-type entry))]
+        (swap! installed-stubs assoc stub-symbol
+               (merge stub {:procedure name :signature signature}))))
+    (when (not= stub-symbol (:stub-symbol (get @procedure-handles name)))
+      (let [stub (get @installed-stubs stub-symbol)]
+        (swap! procedure-handles assoc name
+               {:stub-symbol stub-symbol
+                :handle (downcall-handle (:thunk-address stub)
+                                         (:return-type entry)
+                                         (:param-types entry))})))
+    entry))
+
+(defn- infer-return-type
+  "The return type inferred from an entry's AST, or nil for a void body."
+  [entry]
+  (let [environment (into {} (map (fn [param-name param-type]
+                                    [param-name {:type param-type}])
+                                  (:param-names entry) (:param-types entry)))]
+    (expression-type environment (last (:ast entry)))))
+
+(defn- settle-signatures!
+  "Recomputes every inferred return type until the registry is consistent.
+  A return-type change can change the inferred return type of a caller, so
+  a single pass is not enough. Explicit return types are never changed."
+  []
+  (let [limit (inc (count @procedure-registry))]
+    (loop [iteration 0]
+      (let [changed? (volatile! false)]
+        (doseq [[name entry] @procedure-registry]
+          (when-not (:explicit-return-type entry)
+            (let [inferred (infer-return-type entry)]
+              (when (not= inferred (:return-type entry))
+                (swap! procedure-registry assoc-in [name :return-type] inferred)
+                (vreset! changed? true)))))
+        (when @changed?
+          (when (>= iteration limit)
+            (throw (ex-info "Inferred procedure return types did not settle" {})))
+          (recur (inc iteration))))))
+  nil)
+
+(defn- reemit-all-bodies!
+  "Rebuilds every registered procedure from its AST in the current mode.
+  Monolithic mode re-emits public names and marks the module dirty for the
+  next whole-module build. Reloadable mode assigns a stub to every entry
+  first, then builds every body, then installs them, so a codegen failure
+  leaves the old bodies playing. Signature changes are handled by a full
+  re-emission: return types are inferred, and the fixpoint above needs all
+  entries to agree before any body is emitted."
+  []
+  (settle-signatures!)
+  (if (= @build-mode :monolithic)
+    (do
+      (doseq [[name entry] @procedure-registry]
+        (let [{:keys [bitcode callees]}
+              (binding [*call-target* :public]
+                (build-procedure! name name
+                                  (:param-names entry) (:param-types entry)
+                                  (:return-type entry) (:ast entry)))]
+          (swap! procedure-registry assoc name
+                 (assoc entry
+                        :bitcode bitcode
+                        :callees callees
+                        :body-symbol name
+                        :stub-symbol nil
+                        :stub-signature nil
+                        :stubs {}
+                        :sig-counter 0))))
+      (reset! module-dirty true))
+    (let [entries (into {} (map (fn [[name entry]]
+                                  [name (ensure-stub-for-entry! name entry)])
+                                @procedure-registry))
+          _ (swap! procedure-registry merge entries)
+          pending (into {}
+                        (map (fn [[name entry]]
+                               (let [body-symbol (next-body-symbol name)
+                                     {:keys [bitcode callees]}
+                                     (binding [*call-target* :stub]
+                                       (build-procedure! name body-symbol
+                                                         (:param-names entry)
+                                                         (:param-types entry)
+                                                         (:return-type entry)
+                                                         (:ast entry)))]
+                                 [name {:body-symbol body-symbol
+                                        :bitcode bitcode
+                                        :callees callees}]))
+                             entries))]
+      (doseq [[name {:keys [body-symbol bitcode callees]}] pending]
+        (let [entry (get @procedure-registry name)]
+          (install-body! (:stub-symbol entry) body-symbol bitcode)
+          (swap! procedure-registry assoc name
+                 (assoc entry
+                        :body-symbol body-symbol
+                        :bitcode bitcode
+                        :callees callees
+                        :generation (inc (:generation entry 0))))))))
+  nil)
+
+(defn define-proc!
+  "Defines or redefines a procedure from already parsed parts. The defproc
+  macro calls this at macro expansion time; tests call it directly.
+  In monolithic mode the body is emitted under the public name and the
+  whole module is rebuilt lazily on the next call. In reloadable mode the
+  stub is installed on first definition and a redefinition installs one new
+  body. A signature change re-emits every body because inferred return
+  types must settle across the whole call graph."
+  [namespace name param-names param-types body-forms explicit-return-type static?]
+  (valid-procedure-name! name)
   (when (contains? @external-registry name)
     (throw (ex-info (str "Procedure " name
                          " conflicts with an external function of the same name")
                     {:procedure name})))
-  (swap! procedure-registry assoc name
-         {:namespace namespace
-          :param-types (vec param-types)
-          :return-type return-type
-          :bitcode bitcode
-          :callees callees})
-  (reset! module-dirty true)
+  (when (and static? (= @build-mode :reloadable))
+    (throw (ex-info "Static procedures are not implemented yet"
+                    {:procedure name})))
+  (let [environment (into {} (map (fn [param-name param-type]
+                                    [param-name {:type param-type}])
+                                  param-names param-types))
+        inferred (expression-type environment (last body-forms))
+        return-type (or explicit-return-type inferred)
+        definition {:namespace namespace
+                    :param-names (vec param-names)
+                    :param-types (vec param-types)
+                    :return-type return-type
+                    :explicit-return-type explicit-return-type
+                    :ast body-forms
+                    :kind (if static? :static :reloadable)}]
+    (locking compile-lock
+      (let [existing (get @procedure-registry name)
+            signature (procedure-signature definition)
+            signature-changed? (and existing
+                                    (not= signature (procedure-signature existing)))]
+        (cond
+          (= @build-mode :monolithic)
+          (if signature-changed?
+            (let [snapshot @procedure-registry]
+              (swap! procedure-registry assoc name (merge existing definition))
+              (try
+                (reemit-all-bodies!)
+                (catch Throwable error
+                  (reset! procedure-registry snapshot)
+                  (throw error))))
+            (let [{:keys [bitcode callees]}
+                  (binding [*call-target* :public]
+                    (build-procedure! name name (:param-names definition)
+                                      (:param-types definition) return-type body-forms))]
+              (swap! procedure-registry assoc name
+                     (assoc (merge existing definition)
+                            :body-symbol name
+                            :bitcode bitcode
+                            :callees callees
+                            :stub-symbol nil
+                            :stub-signature nil
+                            :stubs {}
+                            :sig-counter 0
+                            :generation (inc (:generation existing 0))))
+              (reset! module-dirty true)))
+
+          (nil? existing)
+          (let [provisional (assoc definition
+                                 :body-symbol nil
+                                 :bitcode nil
+                                 :callees {}
+                                 :stub-symbol nil
+                                 :stub-signature nil
+                                 :stubs {}
+                                 :sig-counter 0
+                                 :generation 1)]
+            (swap! procedure-registry assoc name provisional)
+            (try
+              (let [entry (ensure-stub-for-entry! name provisional)]
+                (swap! procedure-registry assoc name entry)
+                (let [body-symbol (next-body-symbol name)
+                      {:keys [bitcode callees]}
+                      (binding [*call-target* :stub]
+                        (build-procedure! name body-symbol
+                                          (:param-names entry) (:param-types entry)
+                                          (:return-type entry) body-forms))]
+                  (install-body! (:stub-symbol entry) body-symbol bitcode)
+                  (swap! procedure-registry assoc name
+                         (assoc entry
+                                :body-symbol body-symbol
+                                :bitcode bitcode
+                                :callees callees
+                                :generation 1))))
+              (catch Throwable error
+                (swap! procedure-registry dissoc name)
+                (swap! procedure-handles dissoc name)
+                (throw error))))
+
+          signature-changed?
+          (let [snapshot @procedure-registry
+                handles-snapshot @procedure-handles]
+            (swap! procedure-registry assoc name
+                   (assoc (merge existing definition)
+                          :generation (inc (:generation existing 0))))
+            (try
+              (reemit-all-bodies!)
+              (catch Throwable error
+                (reset! procedure-registry snapshot)
+                (reset! procedure-handles handles-snapshot)
+                (throw error))))
+
+          :else
+          (let [stub-symbol (:stub-symbol existing)
+                _ (when-not stub-symbol
+                    (throw (ex-info (str "Procedure " name
+                                         " has no stub in reloadable mode")
+                                    {:procedure name})))
+                body-symbol (next-body-symbol name)
+                {:keys [bitcode callees]}
+                (binding [*call-target* :stub]
+                  (build-procedure! name body-symbol (:param-names definition)
+                                    (:param-types definition) return-type body-forms))]
+            (install-body! stub-symbol body-symbol bitcode)
+            (swap! procedure-registry assoc name
+                   (assoc (merge existing definition)
+                          :body-symbol body-symbol
+                          :bitcode bitcode
+                          :callees callees
+                          :generation (inc (:generation existing 0)))))))))
   nil)
+
+(defn reset-module!
+  "Disposes the JIT, drops every stub, body, handle and global, and rebuilds
+  and loads every procedure from its AST in the current mode. This
+  invalidates every native function pointer and every JVM downcall handle,
+  so it must not run while native code is executing."
+  []
+  (locking compile-lock
+    (let [jit @current-jit]
+      (reset! current-jit nil)
+      (reset! procedure-handles {})
+      (reset! installed-stubs {})
+      (reset! module-dirty true)
+      (when jit
+        (llvm/dispose-jit jit))
+      (reemit-all-bodies!)
+      nil)))
+
+(defn set-build-mode!
+  "Switches between :monolithic and :reloadable. Switching resets the JIT and
+  re-emits every procedure from its AST, so it must not run while native code
+  is executing."
+  [mode]
+  (when-not (#{:monolithic :reloadable} mode)
+    (throw (ex-info (str "Unknown build mode: " mode) {:mode mode})))
+  (when-not (= mode @build-mode)
+    (reset! build-mode mode)
+    (reset-module!))
+  mode)
+
+(defn current-build-mode
+  "The current build mode, :monolithic or :reloadable."
+  []
+  @build-mode)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Whole module build : linked bitcode -> in-process JIT
@@ -1029,7 +1481,8 @@
 
 (defn- build-handles
   "Builds a panama downcall handle for every registered procedure from its
-  machine code address in the given JIT."
+  machine code address in the given JIT. Monolithic mode installs bodies under
+  their public names, so the handle points straight at the body."
   [jit arena]
   (into {}
         (map (fn [[name {:keys [param-types return-type]}]]
@@ -1037,10 +1490,8 @@
                  (when-not address
                    (throw (ex-info (str "JIT has no symbol for procedure " name)
                                    {:procedure name})))
-                 [name (.downcallHandle (Linker/nativeLinker)
-                                        (MemorySegment/ofAddress address)
-                                        (function-descriptor return-type param-types)
-                                        (make-array Linker$Option 0))])))
+                 [name {:stub-symbol nil
+                        :handle (downcall-handle address return-type param-types)}])))
         @procedure-registry))
 
 (defn- recompile-module!
@@ -1073,11 +1524,11 @@
 
 (defn compile-module!
   "Compiles and loads the accumulated module if a procedure registration
-  marked it dirty. This batches all defproc forms evaluated since the last
-  compile into one in-process JIT build."
+  marked it dirty. This is the monolithic mode build path; reloadable mode
+  installs bodies eagerly and never compiles here."
   []
   (locking compile-lock
-    (when @module-dirty
+    (when (and (= @build-mode :monolithic) @module-dirty)
       (recompile-module!)
       (reset! module-dirty false))
     nil))
@@ -1092,7 +1543,8 @@
     (when-not procedure
       (throw (ex-info (str "Unknown clodin procedure: " name) {:procedure name})))
     (compile-module!)
-    (let [handle (get @procedure-handles name)]
+    (let [handle-entry (get @procedure-handles name)
+          handle (:handle handle-entry)]
       (when-not handle
         (throw (ex-info (str "No downcall handle for clodin procedure: " name)
                         {:procedure name})))
@@ -1168,22 +1620,41 @@
      (procedures-in-namespaces
       (namespace-closure-from root-namespace extra-namespaces)))))
 
+(defn- procedures-for-linking
+  "Re-emits the chosen procedures from their AST for an offline link: public
+  names, direct calls and no stubs. Returns registry entries with fresh
+  bitcode."
+  [procedures]
+  (binding [*call-target* :public]
+    (into {}
+          (map (fn [[name entry]]
+                 (let [{:keys [bitcode callees]}
+                       (build-procedure! name name
+                                         (:param-names entry) (:param-types entry)
+                                         (:return-type entry) (:ast entry))]
+                   [name (assoc entry
+                                :bitcode bitcode
+                                :callees callees
+                                :body-symbol name)])))
+          procedures)))
+
 (defn with-linked-module
   "Calls f with a linked module built from procedures and the arena used to
   create it. The module, context and arena are disposed after f returns."
   [procedures f]
-  (llvm/init-targets!)
-  (let [arena (Arena/ofConfined)]
-    (try
-      (let [context (llvm/new-context)
-            module (link-procedures procedures context arena)]
-        (try
-          (f module arena)
-          (finally
-            (llvm/dispose-module module)
-            (llvm/dispose-context context))))
-      (finally
-        (.close arena)))))
+  (let [procedures (procedures-for-linking procedures)]
+    (llvm/init-targets!)
+    (let [arena (Arena/ofConfined)]
+      (try
+        (let [context (llvm/new-context)
+              module (link-procedures procedures context arena)]
+          (try
+            (f module arena)
+            (finally
+              (llvm/dispose-module module)
+              (llvm/dispose-context context))))
+        (finally
+          (.close arena))))))
 
 (defn build-executable!
   "Builds a standalone native executable from the procedures defined in
@@ -1234,7 +1705,7 @@
      (let [arena (Arena/ofConfined)]
        (try
          (let [context (llvm/new-context)
-               module (link-procedures procedures context arena)
+               module (link-procedures (procedures-for-linking procedures) context arena)
                target-machine (llvm/create-target-machine arena)]
            (try
              (llvm/set-module-target! module target-machine arena)
@@ -1306,7 +1777,7 @@
      (let [arena (Arena/ofConfined)]
        (try
          (let [context (llvm/new-context)
-               module (link-procedures procedures context arena)
+               module (link-procedures (procedures-for-linking procedures) context arena)
                target-machine (llvm/create-target-machine arena {:pic? true})]
            (try
              (llvm/set-module-target! module target-machine arena)
@@ -1340,10 +1811,10 @@
 ;;; ---------------------------------------------------------------------------
 
 (defn- defproc-form
-  "Type-checks and generates the bitcode for the procedure described by a
-  defproc form and returns the clojure defn form that calls it. namespace is
-  the namespace the procedure is defined in, used by build-executable! to
-  select procedures."
+  "Parses a defproc form, defines the procedure through define-proc! and
+  returns the clojure defn form that calls it. namespace is the namespace
+  the procedure is defined in, used by build-executable! to select
+  procedures."
   [namespace name params body]
   (when-not (symbol? name)
     (throw (ex-info "Procedure name must be a symbol" {:name name})))
@@ -1356,15 +1827,10 @@
         param-names (mapv first param-pairs)
         param-types (mapv second param-pairs)
         explicit-return-type (when (keyword? (first body)) (first body))
-        body-forms (if explicit-return-type (next body) body)
-        parameter-environment (into {} (map (fn [name type]
-                                              [name {:type type}])
-                                            param-names param-types))
-        inferred-return-type (expression-type parameter-environment (last body-forms))
-        return-type (or explicit-return-type inferred-return-type)
-        {:keys [bitcode callees]} (build-procedure! (str name) param-names param-types
-                                                    return-type body-forms)]
-    (register-procedure! namespace (str name) param-names param-types return-type bitcode callees)
+        body-forms (if explicit-return-type (next body) body)]
+    (define-proc! namespace (str name) param-names param-types body-forms
+                  explicit-return-type
+                  (boolean (:static (meta name))))
     `(defn ~name [~@param-names]
        (native-stdout/capture-native-stdout
         (fn [] (invoke-procedure ~(str name) [~@param-names]))))))
@@ -1376,9 +1842,10 @@
 
   At macroexpansion time the body is type checked (untyped constant
   integers are 64 bit integers) and rendered as llvm ir through the LLVM C
-  API. The bitcode is stored in the registry, but the JIT is not run yet.
-  The whole module is compiled and loaded lazily in-process on the first
-  call to any native procedure wrapper.
+  API. In the default :monolithic mode the bitcode is stored in the
+  registry and the whole module is compiled lazily on the first call. In
+  :reloadable mode the stub is installed and the body is loaded eagerly,
+  so a redefinition takes effect in native callers on their next call.
 
   The generated Clojure wrapper captures the C stdout stream and writes it
   to *out*, so printf output from the procedure appears in the REPL. Call
@@ -1868,6 +2335,138 @@
   (testing "rejects unknown levels"
     (is (thrown? clojure.lang.ExceptionInfo
                  (set-optimization-level! :O9)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Reloadable mode tests
+;;;
+;;; These use define-proc! at run time instead of defproc forms, because a
+;;; defproc form inside deftest would be expanded (and registered) when the
+;;; namespace loads, not when the test runs.
+;;; ---------------------------------------------------------------------------
+
+(deftest test-reloadable-redefinition-propagates
+  (try
+    (set-build-mode! :reloadable)
+    (define-proc! "clodin.compiler" "reload-test-value" [] [] [1] nil false)
+    (define-proc! "clodin.compiler" "reload-test-caller" [] []
+                  '[(reload-test-value)] nil false)
+    (is (= 1 (invoke-procedure "reload-test-caller" [])))
+    (define-proc! "clodin.compiler" "reload-test-value" [] [] [2] nil false)
+    (testing "an already compiled native caller sees the new body"
+      (is (= 2 (invoke-procedure "reload-test-caller" []))))
+    (testing "the body symbol is versioned but the stub keeps its name"
+      (is (string/includes? (:body-symbol (get @procedure-registry
+                                            "reload-test-value"))
+                            "$"))
+      (is (= "reload-test-value"
+             (:stub-symbol (get @procedure-registry "reload-test-value")))))
+    (finally
+      (set-build-mode! :monolithic))))
+
+(deftest test-reloadable-preserves-buffer-state
+  (let [arena (Arena/ofShared)
+        buffer (.allocate arena 8)]
+    (try
+      (set-build-mode! :reloadable)
+      (define-proc! "clodin.compiler" "reload-test-bump" ['pointer] [:ptr]
+                    '[(let [value :i64 (load :i64 pointer)]
+                        (store :i64 pointer (+ value 1))
+                        value)]
+                    :i64 false)
+      (is (= 0 (invoke-procedure "reload-test-bump" [buffer])))
+      (is (= 1 (invoke-procedure "reload-test-bump" [buffer])))
+      (define-proc! "clodin.compiler" "reload-test-bump" ['pointer] [:ptr]
+                    '[(let [value :i64 (load :i64 pointer)]
+                        (store :i64 pointer (+ value 10))
+                        value)]
+                    :i64 false)
+      (testing "the new body reads the memory the old body wrote"
+        (is (= 2 (invoke-procedure "reload-test-bump" [buffer])))
+        (is (= 12 (invoke-procedure "reload-test-bump" [buffer]))))
+      (finally
+        (set-build-mode! :monolithic)
+        (.close arena)))))
+
+(deftest test-reloadable-signature-change-cascades
+  (try
+    (set-build-mode! :reloadable)
+    (define-proc! "clodin.compiler" "reload-test-producer" [] [] [1] nil false)
+    (define-proc! "clodin.compiler" "reload-test-consumer" [] []
+                  '[(reload-test-producer)] nil false)
+    (is (= 1 (invoke-procedure "reload-test-consumer" [])))
+    (define-proc! "clodin.compiler" "reload-test-producer" [] [] [1.5] nil false)
+    (testing "the callers are re-emitted and their inferred types follow"
+      (is (= 1.5 (invoke-procedure "reload-test-producer" [])))
+      (is (= 1.5 (invoke-procedure "reload-test-consumer" [])))
+      (is (= :f64 (:return-type (get @procedure-registry
+                                  "reload-test-consumer")))))
+    (testing "the old stub is replaced by a signature stub"
+      (is (not= "reload-test-producer"
+                (:stub-symbol (get @procedure-registry
+                                "reload-test-producer")))))
+    (finally
+      (set-build-mode! :monolithic))))
+
+(deftest test-build-mode-switch
+  (try
+    (set-build-mode! :reloadable)
+    (define-proc! "clodin.compiler" "reload-test-mode" [] [] [7] nil false)
+    (is (= 7 (invoke-procedure "reload-test-mode" [])))
+    (set-build-mode! :monolithic)
+    (is (= :monolithic (current-build-mode)))
+    (is (= 7 (invoke-procedure "reload-test-mode" [])))
+    (set-build-mode! :reloadable)
+    (is (= :reloadable (current-build-mode)))
+    (is (= 7 (invoke-procedure "reload-test-mode" [])))
+    (finally
+      (set-build-mode! :monolithic))))
+
+(deftest test-reloadable-caller-calls-the-stub
+  (try
+    (set-build-mode! :reloadable)
+    (define-proc! "clodin.compiler" "reload-test-ir-callee" [] [] [1] nil false)
+    (define-proc! "clodin.compiler" "reload-test-ir-caller" [] []
+                  '[(reload-test-ir-callee)] nil false)
+    (let [llvm-ir (requiring-resolve 'clodin.inspect/llvm-ir)
+          ir (llvm-ir "reload-test-ir-caller")]
+      (is (string/includes? ir "@reload-test-ir-callee"))
+      (is (not (string/includes? ir "@reload-test-ir-callee$"))))
+    (finally
+      (set-build-mode! :monolithic))))
+
+(deftest test-reloadable-native-loop-sees-new-body
+  (let [arena (Arena/ofShared)
+        flag (.allocate arena 8)
+        out (.allocate arena 8)
+        previous-level (current-optimization-level)]
+    (try
+      (set-optimization-level! :none)
+      (set-build-mode! :reloadable)
+      (.set flag ValueLayout/JAVA_LONG 0 0)
+      (define-proc! "clodin.compiler" "reload-test-loop-synth" [] [] [1] nil false)
+      (define-proc! "clodin.compiler" "reload-test-loop-driver" ['flag 'out] [:ptr :ptr]
+                    '[(let [index :i64 0]
+                        (while (= (load :i64 flag) 0)
+                          (buffer-set out :i64 0 (reload-test-loop-synth))
+                          (set index (+ index 1)))
+                        index)]
+                    :i64 false)
+      (let [worker (future (invoke-procedure "reload-test-loop-driver" [flag out]))]
+        (try
+          (Thread/sleep 200)
+          (is (= 1 (.get out ValueLayout/JAVA_LONG 0)))
+          (define-proc! "clodin.compiler" "reload-test-loop-synth" [] [] [2] nil false)
+          (Thread/sleep 200)
+          (testing "the running native loop picks up the new body"
+            (is (= 2 (.get out ValueLayout/JAVA_LONG 0))))
+          (finally
+            (.set flag ValueLayout/JAVA_LONG 0 1)))
+        (is (integer? (deref worker 10000 ::timeout))))
+    (finally
+      (.set flag ValueLayout/JAVA_LONG 0 1)
+      (set-build-mode! :monolithic)
+      (set-optimization-level! previous-level)
+      (.close arena)))))
 
 (defn -main
   [& _]

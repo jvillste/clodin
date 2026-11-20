@@ -164,6 +164,27 @@
   ^MemorySegment [^MemorySegment context double-value]
   (LLVM/LLVMConstReal (LLVM/LLVMDoubleTypeInContext context) (double double-value)))
 
+(defn pointer-type
+  "The opaque pointer type, used for cells and globals."
+  ^MemorySegment [^MemorySegment context]
+  (LLVM/LLVMPointerTypeInContext context 0))
+
+(defn const-null
+  "The null constant of the given LLVM type."
+  ^MemorySegment [^MemorySegment type]
+  (LLVM/LLVMConstNull type))
+
+(defn add-global
+  "Adds an external-linkage global variable of the given type and name to
+  module and returns it. Its initializer is set separately."
+  ^MemorySegment [^MemorySegment module ^MemorySegment type ^MemorySegment name]
+  (LLVM/LLVMAddGlobal module type name))
+
+(defn set-initializer
+  "Sets the initializer of a global variable."
+  [^MemorySegment global ^MemorySegment value]
+  (LLVM/LLVMSetInitializer global value))
+
 (defn build-global-string
   "Creates a private constant global holding value as a null terminated UTF-8
   C string and returns the global value. With opaque pointers the global's
@@ -206,6 +227,30 @@
 (defn build-store
   ^MemorySegment [^MemorySegment builder ^MemorySegment value ^MemorySegment pointer]
   (LLVM/LLVMBuildStore builder value pointer))
+
+;; LLVMAtomicOrdering values. The jextract bindings do not generate the
+;; enum constants, and LLVMSetOrdering takes the ordering as an int.
+(def ^:private +atomic-acquire+ 4)
+(def ^:private +atomic-release+ 5)
+
+(defn build-atomic-load
+  "Builds an atomic load with acquire ordering. Setting the ordering also
+  marks the instruction atomic, so optimizers cannot hoist or remove it."
+  ^MemorySegment [^MemorySegment builder ^MemorySegment element-type
+                  ^MemorySegment pointer ^Arena arena ^String name]
+  (let [instruction (LLVM/LLVMBuildLoad2 builder element-type pointer
+                                        (name-token builder arena name))]
+    (LLVM/LLVMSetOrdering instruction +atomic-acquire+)
+    instruction))
+
+(defn build-atomic-store
+  "Builds an atomic store with release ordering. Setting the ordering also
+  marks the instruction atomic."
+  ^MemorySegment [^MemorySegment builder ^MemorySegment value
+                  ^MemorySegment pointer ^Arena arena]
+  (let [instruction (LLVM/LLVMBuildStore builder value pointer)]
+    (LLVM/LLVMSetOrdering instruction +atomic-release+)
+    instruction))
 
 (defn- build-binary
   [build-fn builder lhs rhs name arena]
@@ -333,6 +378,12 @@
 (defn build-ret-void
   [^MemorySegment builder]
   (LLVM/LLVMBuildRetVoid builder))
+
+(defn build-unreachable
+  "Terminates the current block with unreachable. Used by the unbound stub
+  body after a call to abort."
+  ^MemorySegment [^MemorySegment builder]
+  (LLVM/LLVMBuildUnreachable builder))
 
 (defn position-at-end
   [^MemorySegment builder ^MemorySegment block]
