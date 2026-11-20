@@ -44,9 +44,9 @@
   (.start (Thread. (fn []
                      (spin-until-stopped)
                      (println! "spinning stopped"))))
+  (report)
   @running?
   (reset! running? false)
-  (report)
   (bump-turns 10)
   (report)
   (reset! scale 2.0)
