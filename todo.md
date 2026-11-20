@@ -173,22 +173,87 @@ The cell load is `atomic acquire` and the setter store is `atomic release`:
 
 ### Globals
 
-- `def` defines a global in its own `global:g` module. Globals are the
-  supported way to keep state across redefinitions: buffers, oscillator
-  phases, voice tables, and pointers to malloc'ed memory.
-- A global is not declared in a procedure's stub module. It has its own stable
-  module so that a procedure stub never owns state.
-- Initial form is `(def g :i64 0)`. Start with scalar types and `:ptr`;
+Implemented in `clodin.globals` and the `defvar` macro. The decisions below
+supersede the earlier `def` sketch.
+
+- The surface form is `(defvar name type literal)`. `def` is a Clojure
+  special form and cannot be used as a macro, so `defvar` is the name.
+  Supported types are `:boolean`, `:i64`, `:i32`, `:f64`, `:f32` and `:ptr`;
   aggregate types are deferred.
-- Semantics are `defonce`-like: a redefinition or reload leaves an
-  already-bound global alone, both its module and its value. Explicit mutation
-  uses a separate store/set form (still to be added).
-- Globals use the same atomic acquire/release access as the cell when another
-  thread may write them: a loop that reads such a global must not cache it.
-  A global that is only written by its defining thread can use plain
-  accesses.
-- Ownership is deferred: memory held by a global is not freed automatically
-  and is lost on a reset. This is documented behaviour.
+- In clodin source the name reads as a value and `(set name value)` writes it.
+  A local or parameter shadows a global of the same name.
+- Every global owns one storage slot in JIT memory. In `:reloadable` mode the
+  storage lives in its own `globals` module, added once per JIT generation.
+  A procedure module only declares the symbol as an external global, so
+  storage is never duplicated into a procedure body.
+- In `:monolithic` mode the storage modules are linked into the procedure
+  module, because the whole JIT is replaced on every rebuild anyway. A
+  monolithic rebuild therefore reinitialises every global from its source
+  initial value. Globals do not survive a monolithic rebuild; stateful
+  programs use `:reloadable` mode.
+- `:boolean` globals are stored as an `i32` slot holding 0 or 1. LLVM can
+  only perform atomic accesses on byte-sized types (an atomic `i1` access is
+  rejected by the verifier), and the JVM `VarHandle` cannot compare-and-set a
+  boolean. An `i32` slot is the one representation that gives real atomic
+  loads, stores and compare-and-set on both sides. Native code converts
+  between `i1` and the slot.
+- Access is always atomic: native reads use `atomic acquire` loads, native
+  `set` uses `atomic release` stores, and the JVM side uses `VarHandle`
+  acquire/release accesses. A native loop that reads a global therefore never
+  caches it, even at `:O3`. This is unconditional rather than opt-in: an
+  atomic acquire/release access on x86-64 is a plain move and on arm64 one
+  `ldar`/`stlr`, so the cost is acceptable and there is no way to get the
+  concurrency wrong.
+- An external global declaration must state its alignment. A module without a
+  data layout defaults `i64` to ABI alignment 4, and LLVM then cannot prove
+  an atomic access is naturally aligned, so it lowers the access to an
+  out-of-line `__atomic_load`/`__atomic_store` call, which the JIT cannot
+  resolve. Both the storage module and every referencing declaration set the
+  natural alignment explicitly.
+- The JVM side sees each global as a `Global` object implementing
+  `clojure.lang.IDeref` and `clojure.lang.IAtom2`. `deref`, `reset!`,
+  `swap!`, `compare-and-set!`, `reset-vals!` and `swap-vals!` therefore work
+  unchanged. The object stores only the global's name and resolves the current
+  storage address on every access, so a JIT rebuild or reset never leaves a
+  stale pointer behind.
+  - `reset!`, `swap!` and `compare-and-set!` dispatch on `IAtom`, and
+    `reset-vals!`/`swap-vals!` on `IAtom2`; neither requires an actual
+    `clojure.lang.Atom`.
+  - `compare-and-set!` compares the raw storage representation, not identity.
+    For `:ptr` that is the address, and for `:boolean` it is 0 or 1.
+  - `IRef` (watches, validators) is deliberately not implemented: native
+    writes could never notify a JVM watch.
+- `swap!` is a compare-and-set retry loop, so concurrent JVM writers are
+  safe. A native `set` is a plain release store, not a compare-and-set, so a
+  native write racing a `swap!` can be overwritten. That is ordinary
+  last-writer-wins and is documented rather than prevented.
+- Native compare-and-set and atomic read-modify-write are not implemented
+  yet. See "Future global features".
+- Re-evaluation is per-type rather than `defonce`-like:
+  - same type: the live value and its storage are kept, and only the recorded
+    source initial value changes, so the next reset uses the new literal;
+  - different type: treated like a procedure signature change. A fresh native
+    symbol (`name$gN`) is minted, fresh storage is installed and every body
+    is re-emitted, so code emitted against the old layout can never read the
+    new storage through the old type. A procedure that still declares the old
+    type fails to compile with a clear error.
+- `defvar` always initialises on first definition. There is no
+  `defvaronce` yet; see "Future global features".
+- Globals are bare-named for now, like procedures, so names must not collide
+  with a procedure, an extern or another global. Names containing `$` are
+  rejected because generated symbols use that suffix.
+- A global must be registered before the `defproc` that reads it, because
+  procedure bodies are compiled at macroexpansion time. `declare-var` is
+  deferred; see "Future global features".
+- A full reset or a build-mode switch drops all storage and reinstalls it
+  from the source initial values.
+- `build-executable!` and `build-library!` link the storage modules of every
+  global referenced by the selected procedures, so an offline binary owns its
+  globals and has no hot reload.
+- Ownership is deferred: memory a `:ptr` global points at is not freed
+  automatically and the pointer is lost on a reset.
+- A native loop blocks the JVM thread that entered it, so a `reset!` that is
+  meant to stop it must come from another thread (for example a `future`).
 
 ### Redefinition
 
@@ -400,13 +465,16 @@ did not change.
   compiled. Declarations are registry entries with `:body nil` and are
   skipped by AOT builds.
 
-- [ ] Add `def` for globals.
+- [x] Add `defvar` for globals.
 
-  One stable `global:name` module per global, added once and never re-created
-  by redefinition. Start with scalar types and `:ptr`, `(def g :i64 0)`,
-  `defonce`-like semantics, and atomic acquire/release access by default when
-  another thread may write the global. Aggregate types,
-  explicit mutation, and ownership/free are deferred.
+  Implemented in `clodin.globals` plus a `defvar` macro. One storage slot per
+  global, its own `globals` module in `:reloadable` mode and linked into the
+  procedure module in `:monolithic` mode. Scalar types and `:ptr`;
+  atomic acquire/release access by default; a `Global` handle implementing
+  `IDeref` and `IAtom2` so `reset!`, `swap!`, `compare-and-set!`,
+  `reset-vals!` and `swap-vals!` work. A type change mints `name$gN` and
+  re-emits every body. Covered by `test-globals-*` in `clodin.compiler`.
+  Superseded the earlier `def` sketch; see "Globals" above.
 
 - [ ] Add static stubless procedures.
 
@@ -431,8 +499,54 @@ did not change.
   change re-emits callers and updates their inferred types; switching
   between modes works in both directions; a caller body calls the stub
   symbol; and a running native `while` loop observes a swap mid-loop. The
-  loop test runs at `:none` because user pointer loads are not yet volatile,
-  so a spin-loop flag load could otherwise be hoisted.
+  loop test runs at `:none`, and a flag passed as a raw `:ptr` is still not
+  atomic, so a spin-loop flag load through a pointer could be hoisted. A
+  `defvar` global does not have that problem: its access is always atomic, so
+  `test-globals-native-loop-sees-reset` runs at `:O3`.
+
+## Future global features
+
+Deferred deliberately; everything on this list is a separate iteration.
+
+- [ ] Native compare-and-set and atomic read-modify-write.
+  `(compare-and-set-var name expected new)` and `(atomic-add name value)`
+  lowered to `cmpxchg`/`atomicrmw`, so a native loop can do a lock-free
+  counter update. Until then a native `(set name (+ name 1))` is a
+  non-atomic load, add and store: safe against a single writer plus JVM
+  `swap!`, but it can lose an increment against a concurrent native writer.
+  The storage is already atomic, so only the instruction is missing.
+
+- [ ] `defvaronce`.
+  `defvar` always initialises, so re-evaluating one re-runs registration.
+  A `defvaronce` would keep an already-bound global untouched, like
+  `defonce`, and would be the natural form for a global that should never be
+  reset by a reload.
+
+- [ ] `declare-var`.
+  Procedure bodies are compiled at macroexpansion time, so a global must be
+  registered before the `defproc` that reads it. `(declare-var name type)`
+  would register the type and storage without an initial value, so a global
+  can be forward declared below its first user. Calls would see zero or nil
+  until the real `defvar` initialises it.
+
+- [ ] Aggregate global types.
+  Buffers, structs and arrays as global storage. Needs the Odin-style buffer
+  type first, then a constant-expression form for the initializer.
+
+- [ ] Namespace-qualified global symbols.
+  Globals are bare-named, so two namespaces cannot both define `counter`.
+  This is blocked on the general namespace-aware module state, the same
+  blocker as procedures.
+
+- [ ] Ownership and freeing.
+  A `:ptr` global can hold malloc'ed memory but nothing frees it, and a
+  reset loses the pointer. Needs a designated owner or a finalizer
+  convention.
+
+- [ ] Watches and validators.
+  Requires implementing `IRef`. A native write can never notify a JVM
+  watch, so this is only meaningful for a global that native code never
+  writes. Validators would apply to JVM writes only.
 
 ## Unimplemented speedups
 

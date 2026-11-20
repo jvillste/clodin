@@ -56,14 +56,22 @@
   (to-f32 1.0e-9).
 
   (if condition then else) chooses between two same-typed value expressions
-  with an llvm.select, so both branches must be pure."
-  (:require [clodin.llvm-api :as llvm]
+  with an llvm.select, so both branches must be pure.
+
+  Top level mutable state is declared with (defvar name type literal), for
+  example (defvar running? :boolean true). In clodin source the name reads as
+  a value and (set name value) writes it. Access is atomic on both sides, so a
+  native loop that spins on a global sees a write from another thread. The
+  name is also bound in Clojure to a handle implementing clojure.lang.IDeref
+  and clojure.lang.IAtom2, so @running?, (reset! running? false) and
+  (swap! counter inc) work from the REPL."
+  (:require [clodin.globals :as globals]
+            [clodin.llvm-api :as llvm]
             [clodin.native-stdout :as native-stdout]
             [clojure.java.io :as io]
             [clojure.java.shell :as shell]
             [clojure.string :as string]
-            [clojure.test :refer [deftest is run-tests testing]]
-            [examples.standalone-lib])
+            [clojure.test :refer [deftest is run-tests testing]])
   (:import (java.lang.foreign Arena FunctionDescriptor Linker Linker$Option
                               MemorySegment SymbolLookup ValueLayout)))
 
@@ -160,7 +168,7 @@
 ;; is installed once and never recreated until a full reset.
 (defonce installed-stubs (atom {}))
 
-(declare define-proc! reemit-all-bodies! reset-module! set-build-mode!)
+(declare compile-module! define-proc! reemit-all-bodies! reset-module! set-build-mode!)
 
 ;;; The LLVM IR optimization level used when a module is built, one of
 ;;; :none (JIT the IR as emitted, the default) or :O0/:O1/:O2/:O3. The
@@ -268,17 +276,91 @@
           [state [] []]
           operand-forms))
 
+(defn- reference-global
+  "Returns the module-level global value for a clodin global name. The
+  procedure module only declares the symbol; the storage lives in the
+  global's own module, so a global is never duplicated into a procedure. The
+  symbol carries a revision suffix after a type change, so code emitted
+  before the change cannot read the new layout through the old type.
+
+  The declaration carries the storage alignment, because LLVM only lowers an
+  atomic access inline when it can prove the access is naturally aligned;
+  otherwise it emits a call to __atomic_load/__atomic_store, which the JIT
+  cannot resolve."
+  [state name]
+  (let [{:keys [symbol type]} (globals/entry name)
+        name-token (llvm/c-string (:arena state) symbol)
+        existing (llvm/named-global (:module state) name-token)]
+    (if (llvm/null? existing)
+      (llvm/global-declaration (:module state)
+                               (llvm/type-for (:context state)
+                                               (globals/storage-type type))
+                               name-token
+                               (globals/storage-size type))
+      existing)))
+
+(defn- record-global
+  "Records that the procedure being emitted reads or writes the named global,
+  so an offline link knows which storage modules to include."
+  [state name]
+  (update state :globals conj (:symbol (globals/entry name))))
+
+(defn- compile-global-reference
+  "Compiles a read of a clodin global as an atomic acquire load. The load is
+  atomic because another thread, native or JVM, may write the global, so the
+  optimizer must not cache the value across loop iterations. A :boolean
+  global is stored as :i32 and converted to i1 here."
+  [state name]
+  (let [state (record-global state name)
+        {:keys [context builder arena]} state
+        type (globals/global-type name)
+        storage (globals/storage-type type)
+        pointer (reference-global state name)
+        loaded (llvm/build-atomic-load builder (llvm/type-for context storage)
+                                       pointer arena (str name)
+                                       (globals/storage-size type))]
+    (if (= :boolean type)
+      (let [zero (llvm/const-int-of-type context :i32 0)
+            flag (llvm/build-icmp builder 'not= loaded zero arena)]
+        [state flag :boolean])
+      [state loaded type])))
+
+(defn- compile-global-store
+  "Compiles (set global value) as an atomic release store. A :boolean value
+  is zero extended to the :i32 storage slot."
+  [state name value]
+  (let [state (record-global state name)
+        {:keys [context builder arena]} state
+        type (globals/global-type name)
+        storage (globals/storage-type type)
+        pointer (reference-global state name)
+        stored (if (= :boolean type)
+                 (llvm/build-zext builder value
+                                  (llvm/type-for context storage) arena nil)
+                 value)]
+    (llvm/build-atomic-store builder stored pointer arena
+                             (globals/storage-size type))
+    [state nil nil]))
+
+(defn- global-name?
+  "True when name refers to a registered clodin global."
+  [name]
+  (some? (globals/global-type name)))
+
 (defn- compile-local-reference
+  "Compiles a symbol reference. A local or parameter shadows a global of the
+  same name; otherwise a registered clodin global is read atomically."
   [state environment name]
-  (let [local (get environment name)]
-    (when-not local
-      (throw (ex-info (str "Unknown symbol: " name) {:symbol name})))
+  (if-let [local (get environment name)]
     (if (= :param (:kind local))
       [state (:value local) (:type local)]
       (let [value (llvm/build-load (:builder state)
                                    (llvm/type-for (:context state) (:type local))
                                    (:value local) (:arena state) nil)]
-        [state value (:type local)]))))
+        [state value (:type local)]))
+    (if (global-name? name)
+      (compile-global-reference state name)
+      (throw (ex-info (str "Unknown symbol: " name) {:symbol name})))))
 
 (defn- float-type?
   [type]
@@ -793,29 +875,39 @@
         [inner (:result-value inner) (:return-type inner)]))))
 
 (defn- compile-set
-  "Compiles (set name value), storing the value into the stack slot of the
-  local. A set does not produce a value. Parameters are raw values and
-  cannot be set."
+  "Compiles (set name value). A local or parameter is written to its stack
+  slot; a global is written through an atomic release store. A set does not
+  produce a value. Parameters are raw values and cannot be set."
   [state environment expression]
   (when-not (= 3 (count expression))
     (throw (ex-info "set expects (set name value)" {:expression expression})))
-  (let [[name value-form] (rest expression)
-        local (get environment name)]
+  (let [[name value-form] (rest expression)]
     (when-not (symbol? name)
-      (throw (ex-info (str "set expects a local name, got " name) {:name name})))
-    (when-not local
-      (throw (ex-info (str "Cannot set unknown local: " name) {:symbol name})))
-    (when (= :param (:kind local))
-      (throw (ex-info (str "Cannot set the function parameter " name
-                           "; parameters are raw llvm values, not stack slots")
+      (throw (ex-info (str "set expects a local or global name, got " name)
                       {:name name})))
-    (let [[state value value-type] (compile-expression state environment value-form)]
-      (when-not (= (:type local) value-type)
-        (throw (ex-info (str "Cannot set " name " of type " (:type local)
-                             " to a value of type " value-type)
-                        {:name name :type (:type local) :value-type value-type})))
-      (llvm/build-store (:builder state) value (:value local))
-      [state nil nil])))
+    (if-let [local (get environment name)]
+      (do
+        (when (= :param (:kind local))
+          (throw (ex-info (str "Cannot set the function parameter " name
+                               "; parameters are raw llvm values, not stack slots")
+                          {:name name})))
+        (let [[state value value-type] (compile-expression state environment value-form)]
+          (when-not (= (:type local) value-type)
+            (throw (ex-info (str "Cannot set " name " of type " (:type local)
+                                 " to a value of type " value-type)
+                            {:name name :type (:type local) :value-type value-type})))
+          (llvm/build-store (:builder state) value (:value local))
+          [state nil nil]))
+      (if (global-name? name)
+        (let [global-type (globals/global-type name)
+              [state value value-type] (compile-expression state environment value-form)]
+          (when-not (= global-type value-type)
+            (throw (ex-info (str "Cannot set global " name " of type " global-type
+                                 " to a value of type " value-type)
+                            {:name name :type global-type :value-type value-type})))
+          (compile-global-store state name value))
+        (throw (ex-info (str "Cannot set unknown local or global: " name)
+                        {:symbol name}))))))
 
 (defn- compile-comparison
   "Compiles a binary comparison into an llvm icmp or fcmp instruction.
@@ -899,7 +991,7 @@
   [state environment expression]
   (cond
     (integer? expression) [state (llvm/const-int (:context state) expression) :i64]
-    (float? expression) [state (llvm/const-real (:context state) expression) :f64]
+    (float? expression) [state (llvm/const-real (:context state) :f64 expression) :f64]
     (boolean? expression) [state (llvm/const-int-of-type (:context state) :boolean
                                                          (if expression 1 0))
                            :boolean]
@@ -952,7 +1044,8 @@
     (float? expression) :f64
     (boolean? expression) :boolean
     (string? expression) :ptr
-    (symbol? expression) (:type (get environment expression))
+    (symbol? expression) (or (:type (get environment expression))
+                              (globals/global-type expression))
     (seq? expression)
     (let [operator (first expression)]
       (when (symbol? operator)
@@ -1009,7 +1102,7 @@
             state {:arena arena :context context :module module :builder builder
                    :function function :entry-block entry-block :current-block entry-block
                    :procedure-name emitted-name :string-counter 0
-                   :callees {}}
+                   :callees {} :globals #{}}
             environment (into {} (map (fn [param-name param-type index]
                                         [param-name {:type param-type
                                                      :value (llvm/get-param function index)
@@ -1018,6 +1111,15 @@
             state (compile-body state environment body-forms)
             result-value (:result-value state)
             effective-return-type (or return-type (:return-type state))]
+        (when (and effective-return-type return-type result-value
+                   (not= return-type (:return-type state)))
+          (throw (ex-info (str "Procedure " name " declares return type "
+                               return-type " but its body produces "
+                               (:return-type state))
+                          {:procedure name
+                           :return-type return-type
+                           :body-type (:return-type state)
+                           :ast body-forms})))
         (if effective-return-type
           (do (when-not result-value
                 (throw (ex-info (str "Procedure " name " has no value to return")
@@ -1030,7 +1132,8 @@
           {:bitcode bitcode
            :return-type effective-return-type
            :result-value result-value
-           :callees (:callees state)}))
+           :callees (:callees state)
+           :globals (:globals state)}))
       (finally
         (llvm/dispose-module module)
         (llvm/dispose-context context)
@@ -1061,6 +1164,109 @@
                 (finally
                   (.close arena))))))))
 
+(defn- global-storage-module
+  "Builds a module that defines one global variable per spec, with the
+  initial value as its initializer. The module owns the storage, so it is
+  added to the JIT exactly once per generation and procedure modules only
+  declare the symbol."
+  [context specs arena]
+  (let [module (llvm/new-module context "globals")]
+    (doseq [[symbol type initial-value] specs]
+      (let [storage (globals/storage-type type)
+            global (llvm/add-global module
+                                     (llvm/type-for context storage)
+                                     (llvm/c-string arena (str symbol)))]
+        (llvm/set-alignment global (globals/storage-size type))
+        (llvm/set-initializer
+         global
+         (globals/constant-value context type initial-value))))
+    module))
+
+(defn- record-global-address!
+  "Records the address of a global's storage in jit, given its native symbol.
+  The storage module (and therefore the symbol) must already be loaded."
+  [jit symbol]
+  (let [arena (Arena/ofConfined)]
+    (try
+      (let [address (llvm/lookup-address jit (llvm/c-string arena (str symbol)) arena)]
+        (when-not address
+          (throw (ex-info (str "JIT has no global storage for " symbol)
+                          {:global symbol})))
+        (let [name (some (fn [[name entry]]
+                           (when (= symbol (:symbol entry)) name))
+                         @globals/registry)]
+          (globals/install! name symbol address jit)))
+      (finally
+        (.close arena)))))
+
+(defn- record-global-addresses!
+  "Records the addresses of every global declared by the given symbols. Used
+  after a monolithic build, where the storage is linked into the procedure
+  module itself rather than installed separately."
+  [jit symbols]
+  (doseq [symbol symbols]
+    (record-global-address! jit symbol)))
+
+(defn- install-globals!
+  "Adds the storage module for every registered global whose symbol has no
+  storage in jit, then records each global's address. Globals that are
+  already installed in this JIT generation are left alone, so redefining a
+  procedure never reinitialises a global. Returns the set of installed native
+  symbols.
+
+  This is the reloadable-mode path, where the JIT is long lived and storage
+  needs its own stable module. A monolithic build links the storage into the
+  procedure module instead and only records the addresses."
+  [jit]
+  (locking compile-lock
+    (let [already (globals/installed-symbols jit)
+          pending (into []
+                        (remove (fn [[symbol _type _value]]
+                                  (contains? already symbol)))
+                        (globals/storage-specs))]
+      (when (seq pending)
+        (let [arena (Arena/ofConfined)]
+          (try
+            (let [context (llvm/new-context)
+                  module (global-storage-module context pending arena)
+                  added? (volatile! false)]
+              (try
+                (llvm/verify module arena)
+                (vreset! added? true)
+                (llvm/add-module-to-jit! jit module context)
+                ;; On success the JIT owns the module and its context, so
+                ;; neither may be disposed here.
+                (doseq [[symbol _type _initial-value] pending]
+                  (record-global-address! jit symbol))
+                (finally
+                  (when-not @added?
+                    (llvm/dispose-module module)
+                    (llvm/dispose-context context)))))
+            (finally
+              (.close arena))))))
+    (globals/installed-symbols jit)))
+
+(defn- ensure-global-storage!
+  "Makes sure the current JIT generation holds storage for every global. This
+  is the lazy hook the JVM side of a global calls before its first access, so
+  @running? works before any procedure has been invoked.
+
+  In monolithic mode the whole procedure module and the global storage modules
+  share one JIT that is replaced on every rebuild, so the build has to run
+  first; installing storage into a throwaway JIT would lose it on the next
+  compile. In reloadable mode the JIT is long lived, so only the storage
+  modules are missing."
+  []
+  (locking compile-lock
+    (if (= @build-mode :monolithic)
+      (do (compile-module!)
+          (when-let [jit @current-jit]
+            (install-globals! jit)))
+      (install-globals! (ensure-jit!)))
+    nil))
+
+(reset! globals/ensure-storage! ensure-global-storage!)
+
 (defn- downcall-handle
   "Builds a panama downcall handle for a JIT symbol address."
   [address return-type param-types]
@@ -1089,7 +1295,7 @@
             thunk (llvm/add-function module (llvm/c-string arena stub-symbol) thunk-type)
             builder (llvm/new-builder context)
             _ (llvm/append-entry-block thunk builder context arena "entry")
-            code (llvm/build-atomic-load builder pointer cell arena "code")
+            code (llvm/build-atomic-load builder pointer cell arena "code" 8)
             arguments (mapv #(llvm/get-param thunk %) (range (count param-types)))
             result (llvm/build-call builder thunk-type code arguments arena)
             _ (if return-type
@@ -1114,7 +1320,7 @@
             thunk (llvm/add-function module (llvm/c-string arena stub-symbol) thunk-type)
             builder (llvm/new-builder context)
             _ (llvm/append-entry-block thunk builder context arena "entry")
-            code (llvm/build-atomic-load builder pointer cell arena "code")
+            code (llvm/build-atomic-load builder pointer cell arena "code" 8)
             arguments (mapv #(llvm/get-param thunk %) (range (count param-types)))
             result (llvm/build-call builder thunk-type code arguments arena)
             _ (if return-type
@@ -1126,7 +1332,7 @@
                                       setter-type)
             setter-builder (llvm/new-builder context)
             _ (llvm/append-entry-block setter setter-builder context arena "entry")
-            _ (llvm/build-atomic-store setter-builder (llvm/get-param setter 0) cell arena)
+            _ (llvm/build-atomic-store setter-builder (llvm/get-param setter 0) cell arena 8)
             _ (llvm/build-ret-void setter-builder)
             _ (llvm/dispose-builder setter-builder)
             _ (llvm/verify module arena)
@@ -1250,7 +1456,7 @@
   (if (= @build-mode :monolithic)
     (do
       (doseq [[name entry] @procedure-registry]
-        (let [{:keys [bitcode callees]}
+        (let [{:keys [bitcode callees globals]}
               (binding [*call-target* :public]
                 (build-procedure! name name
                                   (:param-names entry) (:param-types entry)
@@ -1259,20 +1465,22 @@
                  (assoc entry
                         :bitcode bitcode
                         :callees callees
+                        :globals globals
                         :body-symbol name
                         :stub-symbol nil
                         :stub-signature nil
                         :stubs {}
                         :sig-counter 0))))
       (reset! module-dirty true))
-    (let [entries (into {} (map (fn [[name entry]]
+    (let [_ (install-globals! (ensure-jit!))
+          entries (into {} (map (fn [[name entry]]
                                   [name (ensure-stub-for-entry! name entry)])
                                 @procedure-registry))
           _ (swap! procedure-registry merge entries)
           pending (into {}
                         (map (fn [[name entry]]
                                (let [body-symbol (next-body-symbol name)
-                                     {:keys [bitcode callees]}
+                                     {:keys [bitcode callees globals]}
                                      (binding [*call-target* :stub]
                                        (build-procedure! name body-symbol
                                                          (:param-names entry)
@@ -1281,9 +1489,10 @@
                                                          (:ast entry)))]
                                  [name {:body-symbol body-symbol
                                         :bitcode bitcode
-                                        :callees callees}]))
+                                        :callees callees
+                                        :globals globals}]))
                              entries))]
-      (doseq [[name {:keys [body-symbol bitcode callees]}] pending]
+      (doseq [[name {:keys [body-symbol bitcode callees globals]}] pending]
         (let [entry (get @procedure-registry name)]
           (install-body! (:stub-symbol entry) body-symbol bitcode)
           (swap! procedure-registry assoc name
@@ -1291,8 +1500,45 @@
                         :body-symbol body-symbol
                         :bitcode bitcode
                         :callees callees
+                        :globals globals
                         :generation (inc (:generation entry 0))))))))
   nil)
+
+(defn define-var!
+  "Defines or redefines a global from already parsed parts. The defvar macro
+  calls this at macro expansion time; tests call it directly.
+
+  defvar always initialises: a first definition stores initial-value in fresh
+  storage. A redefinition with the same type keeps the live value, like
+  defonce, and only records the new source initial value. A redefinition with
+  a different type mints a new native symbol and reinstalls storage, then
+  re-emits every procedure so already-compiled code reads the new layout.
+
+  Returns the new global entry."
+  [namespace name type initial-value]
+  (locking compile-lock
+    (let [[entry type-changed?] (globals/register! namespace name type initial-value)]
+      (cond
+        type-changed?
+        (do
+          (when (= @build-mode :reloadable)
+            (let [jit (ensure-jit!)]
+              (install-globals! jit)
+              (reemit-all-bodies!)))
+          (when (= @build-mode :monolithic)
+            (reemit-all-bodies!))
+          entry)
+
+        (= @build-mode :monolithic)
+        (do
+          (reset! module-dirty true)
+          entry)
+
+        :else
+        (do
+          (when @current-jit
+            (install-globals! @current-jit))
+          entry)))))
 
 (defn define-proc!
   "Defines or redefines a procedure from already parsed parts. The defproc
@@ -1338,7 +1584,7 @@
                 (catch Throwable error
                   (reset! procedure-registry snapshot)
                   (throw error))))
-            (let [{:keys [bitcode callees]}
+            (let [{:keys [bitcode callees globals]}
                   (binding [*call-target* :public]
                     (build-procedure! name name (:param-names definition)
                                       (:param-types definition) return-type body-forms))]
@@ -1347,6 +1593,7 @@
                             :body-symbol name
                             :bitcode bitcode
                             :callees callees
+                            :globals globals
                             :stub-symbol nil
                             :stub-signature nil
                             :stubs {}
@@ -1369,7 +1616,7 @@
               (let [entry (ensure-stub-for-entry! name provisional)]
                 (swap! procedure-registry assoc name entry)
                 (let [body-symbol (next-body-symbol name)
-                      {:keys [bitcode callees]}
+                      {:keys [bitcode callees globals]}
                       (binding [*call-target* :stub]
                         (build-procedure! name body-symbol
                                           (:param-names entry) (:param-types entry)
@@ -1380,6 +1627,7 @@
                                 :body-symbol body-symbol
                                 :bitcode bitcode
                                 :callees callees
+                                :globals globals
                                 :generation 1))))
               (catch Throwable error
                 (swap! procedure-registry dissoc name)
@@ -1406,7 +1654,7 @@
                                          " has no stub in reloadable mode")
                                     {:procedure name})))
                 body-symbol (next-body-symbol name)
-                {:keys [bitcode callees]}
+                {:keys [bitcode callees globals]}
                 (binding [*call-target* :stub]
                   (build-procedure! name body-symbol (:param-names definition)
                                     (:param-types definition) return-type body-forms))]
@@ -1415,6 +1663,7 @@
                    (assoc (merge existing definition)
                           :body-symbol body-symbol
                           :bitcode bitcode
+                          :globals globals
                           :callees callees
                           :generation (inc (:generation existing 0)))))))))
   nil)
@@ -1431,6 +1680,7 @@
       (reset! procedure-handles {})
       (reset! installed-stubs {})
       (reset! module-dirty true)
+      (globals/reset-installations!)
       (when jit
         (llvm/dispose-jit jit))
       (reemit-all-bodies!)
@@ -1459,17 +1709,23 @@
 
 (defn- link-procedures
   "Parses the stored bitcode of the given procedures into a single linked
-  module in the given context."
+  module in the given context. A procedure module only declares the globals it
+  reads, so the storage modules for every global the procedures reference are
+  linked in too."
   [procedures context arena]
   (when (empty? procedures)
     (throw (ex-info "No clodin procedures to link" {})))
-  (reduce (fn [merged {:keys [bitcode]}]
-            (let [module (llvm/parse-bitcode context bitcode arena)]
-              (if (nil? merged)
-                module
-                (llvm/link-into! merged module))))
-          nil
-          (vals procedures)))
+  (let [used-globals (into #{} (mapcat :globals) (vals procedures))
+        specs (filter (fn [[symbol _type _value]] (contains? used-globals symbol))
+                      (globals/storage-specs))]
+    (reduce (fn [merged {:keys [bitcode]}]
+              (let [module (llvm/parse-bitcode context bitcode arena)]
+                (if (nil? merged)
+                  module
+                  (llvm/link-into! merged module))))
+            (when (seq specs)
+              (global-storage-module context specs arena))
+            (vals procedures))))
 
 (defn- link-module
   "Parses every registered procedure's stored bitcode into a single linked
@@ -1478,6 +1734,25 @@
   (when (empty? @procedure-registry)
     (throw (ex-info "No clodin procedures registered to compile" {})))
   (link-procedures @procedure-registry context arena))
+
+(defn- used-global-symbols
+  "The native symbols of the globals that the linked module defines. A
+  monolithic build links the storage modules into the procedure module, so
+  the addresses are recorded from the module that was just loaded instead of
+  installing a second copy."
+  [module]
+  (let [specs (globals/storage-specs)]
+    (into []
+          (keep (fn [[symbol _type _value]]
+                  (let [arena (Arena/ofConfined)]
+                    (try
+                      (when-not (llvm/null?
+                                 (llvm/named-global module
+                                                    (llvm/c-string arena (str symbol))))
+                        symbol)
+                      (finally
+                        (.close arena))))))
+          specs)))
 
 (defn- build-handles
   "Builds a panama downcall handle for every registered procedure from its
@@ -1513,6 +1788,7 @@
                 (llvm/optimize-module! module arena @optimization-level))
             jit (llvm/create-jit arena)
             _ (llvm/add-module-to-jit! jit module context)
+            _ (record-global-addresses! jit (used-global-symbols module))
             handles (build-handles jit arena)]
         (let [old-jit @current-jit]
           (reset! current-jit jit)
@@ -1628,13 +1904,14 @@
   (binding [*call-target* :public]
     (into {}
           (map (fn [[name entry]]
-                 (let [{:keys [bitcode callees]}
+                 (let [{:keys [bitcode callees globals]}
                        (build-procedure! name name
                                          (:param-names entry) (:param-types entry)
                                          (:return-type entry) (:ast entry))]
                    [name (assoc entry
                                 :bitcode bitcode
                                 :callees callees
+                                :globals globals
                                 :body-symbol name)])))
           procedures)))
 
@@ -1810,6 +2087,25 @@
 ;;; Compilation entry point (macro)
 ;;; ---------------------------------------------------------------------------
 
+(defn- defvar-form
+  "Parses a defvar form, registers the global through define-var! and returns
+  the clojure def that binds the name to the global's JVM handle. The handle
+  implements IDeref and IAtom2, so reset!, swap!, deref and
+  compare-and-set! work on it from Clojure.
+
+  The initial value must be a literal, because it is compiled into the
+  storage module as an LLVM constant at macroexpansion time."
+  [namespace name type initial-value]
+  (when-not (symbol? name)
+    (throw (ex-info "Global name must be a symbol" {:name name})))
+  (when-not (or (number? initial-value) (boolean? initial-value)
+                (nil? initial-value))
+    (throw (ex-info (str "defvar needs a literal initial value (a number, a"
+                         " boolean or nil), got " (pr-str initial-value))
+                    {:name name :initial-value initial-value})))
+  (define-var! namespace (str name) type initial-value)
+  `(def ~name (globals/global-variable ~(str name))))
+
 (defn- defproc-form
   "Parses a defproc form, defines the procedure through define-proc! and
   returns the clojure defn form that calls it. namespace is the namespace
@@ -1834,6 +2130,46 @@
     `(defn ~name [~@param-names]
        (native-stdout/capture-native-stdout
         (fn [] (invoke-procedure ~(str name) [~@param-names]))))))
+
+(defmacro defvar
+  "Defines a top level mutable variable that native code and Clojure share.
+
+  (defvar running? :boolean true)
+
+  In clodin source the name reads as a value and (set running? false) writes
+  it. Every read is an atomic acquire load and every write an atomic release
+  store, so a native loop that spins on the name sees a write from another
+  thread and the optimizer cannot hoist the load out of the loop:
+
+  (defproc spin-until-stopped [] :i64
+    (let [turns :i64 0]
+      (while running?
+        (set turns (+ turns 1)))
+      turns))
+
+  In Clojure the name is bound to a handle that implements
+  clojure.lang.IDeref and clojure.lang.IAtom2, so @running?, (reset!
+  running? false), (swap! counter inc), (compare-and-set! ...),
+  (reset-vals! ...) and (swap-vals! ...) all work.
+
+  defvar always initialises: the first definition stores the initial value in
+  the storage module. Re-evaluating a defvar with the same type keeps the live
+  value, like defonce, and only records the new source initial value for the
+  next reset. Changing the type is handled like a procedure signature change:
+  a new native symbol is minted, fresh storage is installed and every
+  procedure is re-emitted against the new layout, so existing native code
+  never reads the new storage through the old type.
+
+  Supported types are :boolean, :i64, :i32, :f64, :f32 and :ptr. A :boolean
+  global is stored as a 32 bit 0/1 slot, because LLVM can only perform atomic
+  accesses on byte-sized types. A :ptr global starts as nil and is given an
+  address later with reset!.
+
+  The value lives in JIT memory: a full reset or a monolithic rebuild
+  reinitialises every global from its source initial value, and globals do not
+  survive either."
+  [name type initial-value]
+  (defvar-form (str *ns*) name type initial-value))
 
 (defmacro defproc
   "Defines a native clodin procedure.
@@ -2467,6 +2803,257 @@
       (set-build-mode! :monolithic)
       (set-optimization-level! previous-level)
       (.close arena)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Globals
+;;;
+;;; The defvar macro expands to a Clojure def plus a registration at load
+;;; time, so a defvar inside deftest would register when the namespace loads.
+;;; These tests define the globals at load time and drive them from the test
+;;; bodies. Procedure definitions that read those globals are created at run
+;;; time with define-proc!, so a test does not depend on load order.
+;;; ---------------------------------------------------------------------------
+
+(defvar globals-test-boolean :boolean true)
+(defvar globals-test-counter :i64 7)
+(defvar globals-test-integer :i32 11)
+(defvar globals-test-float :f64 1.5)
+(defvar globals-test-float32 :f32 2.5)
+(defvar globals-test-pointer :ptr nil)
+
+(deftest test-globals-registry
+  (testing "defvar registers a typed global and binds a handle"
+    (is (= :boolean (globals/global-type "globals-test-boolean")))
+    (is (= :i64 (globals/global-type "globals-test-counter")))
+    (is (= :ptr (globals/global-type "globals-test-pointer")))
+    (is (instance? clodin.globals.Global globals-test-counter)))
+
+  (testing "the handle implements the interfaces reset! and swap! need"
+    (is (instance? clojure.lang.IDeref globals-test-counter))
+    (is (instance? clojure.lang.IAtom globals-test-counter))
+    (is (instance? clojure.lang.IAtom2 globals-test-counter)))
+
+  (testing ":boolean storage uses a byte-sized integer slot"
+    (is (= :i32 (globals/storage-type :boolean)))
+    (is (= :i64 (globals/storage-type :i64)))
+    (is (= 4 (globals/storage-size :boolean)))
+    (is (= 8 (globals/storage-size :i64))))
+
+  (testing "names with $ collide with generated symbols"
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (globals/register! "test" "bad$name" :i64 0))))
+
+  (testing "unknown types and bad initial values are rejected"
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (globals/register! "test" "bad-type" :i8 0)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (globals/register! "test" "bad-value" :i64 "nope")))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (globals/register! "test" "bad-pointer" :ptr 42)))))
+
+(deftest test-globals-jvm-access
+  (try
+    (reset! globals-test-counter 7)
+    (is (= 7 @globals-test-counter))
+
+    (testing "reset! returns the new value"
+      (is (= 100 (reset! globals-test-counter 100)))
+      (is (= 100 @globals-test-counter)))
+
+    (testing "swap! applies a function to the current value"
+      (is (= 105 (swap! globals-test-counter + 5)))
+      (is (= 210 (swap! globals-test-counter * 2)))
+      (is (= 210 @globals-test-counter)))
+
+    (testing "compare-and-set! compares the raw storage representation"
+      (is (true? (compare-and-set! globals-test-counter 210 300)))
+      (is (false? (compare-and-set! globals-test-counter 210 400)))
+      (is (= 300 @globals-test-counter)))
+
+    (testing "reset-vals! and swap-vals! return [old new]"
+      (is (= [300 1] (reset-vals! globals-test-counter 1)))
+      (is (= [1 2] (swap-vals! globals-test-counter inc)))
+      (is (= 2 @globals-test-counter)))
+
+    (testing "a :boolean global derefs to a Boolean and swaps with not"
+      (reset! globals-test-boolean true)
+      (is (true? @globals-test-boolean))
+      (is (false? (swap! globals-test-boolean not)))
+      (is (false? @globals-test-boolean))
+      (is (true? (compare-and-set! globals-test-boolean false true))))
+
+    (testing "float, i32 and pointer globals round-trip"
+      (reset! globals-test-float 2.25)
+      (is (= 2.25 @globals-test-float))
+      (reset! globals-test-float32 3.5)
+      (is (= 3.5 @globals-test-float32))
+      (reset! globals-test-integer 70000)
+      (is (= 70000 @globals-test-integer)))
+
+    (testing "a :ptr global accepts a segment and derefs back to one"
+      (let [arena (Arena/ofShared)
+            buffer (.allocate arena 8)]
+        (try
+          (reset! globals-test-pointer buffer)
+          (is (= (.address buffer) (.address ^MemorySegment @globals-test-pointer)))
+          (reset! globals-test-pointer nil)
+          (is (nil? @globals-test-pointer))
+          (finally
+            (.close arena)))))
+    (finally
+      (reset! globals-test-counter 7)
+      (reset! globals-test-boolean true))))
+
+(deftest test-globals-native-access
+  (try
+    (reset! globals-test-counter 7)
+    (reset! globals-test-boolean true)
+    (define-proc! "clodin.compiler" "globals-test-read-counter" [] []
+                  '[(+ globals-test-counter 1)] nil false)
+    (define-proc! "clodin.compiler" "globals-test-write-counter" ['value] [:i64]
+                  '[(set globals-test-counter value)] nil false)
+    (define-proc! "clodin.compiler" "globals-test-read-boolean" [] []
+                  '[globals-test-boolean] nil false)
+    (define-proc! "clodin.compiler" "globals-test-clear-boolean" [] []
+                  '[(set globals-test-boolean false)] nil false)
+
+    (testing "native code reads a global written by Clojure"
+      (is (= 8 (invoke-procedure "globals-test-read-counter" [])))
+      (reset! globals-test-counter 40)
+      (is (= 41 (invoke-procedure "globals-test-read-counter" []))))
+
+    (testing "a native set is visible to Clojure"
+      (invoke-procedure "globals-test-write-counter" [99])
+      (is (= 99 @globals-test-counter)))
+
+    (testing "a :boolean global crosses the boundary as a boolean"
+      (is (true? (invoke-procedure "globals-test-read-boolean" [])))
+      (invoke-procedure "globals-test-clear-boolean" [])
+      (is (false? @globals-test-boolean))
+      (is (false? (invoke-procedure "globals-test-read-boolean" []))))
+    (finally
+      (reset! globals-test-counter 7)
+      (reset! globals-test-boolean true))))
+
+(deftest test-globals-native-loop-sees-reset
+  (let [previous-level (current-optimization-level)]
+    (try
+      ;; Optimization is the point of this test: a plain, non-atomic load of a
+      ;; loop invariant is hoisted out of the loop at every level, so an
+      ;; optimized build only terminates because the load is atomic.
+      (set-optimization-level! :O3)
+      (reset! globals-test-boolean true)
+      (define-proc! "clodin.compiler" "globals-test-spin" [] []
+                    '[(let [turns :i64 0]
+                        (while globals-test-boolean
+                          (set turns (+ turns 1)))
+                        turns)]
+                    :i64 false)
+      (let [worker (future (invoke-procedure "globals-test-spin" []))]
+        (try
+          (Thread/sleep 100)
+          (is (not (realized? worker)))
+          (reset! globals-test-boolean false)
+          (is (integer? (deref worker 20000 ::timeout)))
+          (finally
+            (reset! globals-test-boolean true))))
+      (finally
+        (reset! globals-test-boolean true)
+        (set-optimization-level! previous-level)))))
+
+(deftest test-globals-reloadable-preserves-value
+  (try
+    (set-build-mode! :reloadable)
+    (reset! globals-test-counter 0)
+    (define-proc! "clodin.compiler" "globals-test-bump" [] []
+                  '[(let [next-value :i64 (+ globals-test-counter 1)]
+                      (set globals-test-counter next-value)
+                      next-value)]
+                  :i64 false)
+    (is (= 1 (invoke-procedure "globals-test-bump" [])))
+    (is (= 2 (invoke-procedure "globals-test-bump" [])))
+    (testing "a procedure redefinition keeps the live global value"
+      (define-proc! "clodin.compiler" "globals-test-bump" [] []
+                    '[(let [next-value :i64 (+ globals-test-counter 10)]
+                        (set globals-test-counter next-value)
+                        next-value)]
+                    :i64 false)
+      (is (= 12 (invoke-procedure "globals-test-bump" [])))
+      (is (= 12 @globals-test-counter)))
+    (finally
+      (reset! globals-test-counter 7)
+      (set-build-mode! :monolithic))))
+
+(deftest test-globals-reset-reinitialises
+  (try
+    (define-proc! "clodin.compiler" "globals-test-reading" [] []
+                  '[globals-test-counter] nil false)
+    ;; A monolithic build replaces the whole JIT and links fresh storage, so a
+    ;; global does not survive a rebuild in that mode. This is the documented
+    ;; trade-off: stateful programs use :reloadable mode.
+    (is (= 7 (invoke-procedure "globals-test-reading" [])))
+    (reset! globals-test-counter 10)
+    (reset! globals-test-boolean false)
+    (is (= 10 (invoke-procedure "globals-test-reading" [])))
+    (reset-module!)
+    (testing "a full reset restores the source initial values"
+      (is (= 7 @globals-test-counter))
+      (is (true? @globals-test-boolean)))
+    (testing "re-emitted native code reads the rebuilt storage"
+      (is (= 7 (invoke-procedure "globals-test-reading" []))))
+    (finally
+      (reset! globals-test-counter 7))))
+
+(deftest test-globals-type-change
+  (try
+    (set-build-mode! :reloadable)
+    (define-var! "clodin.compiler" "globals-test-retyped" :i64 5)
+    (define-proc! "clodin.compiler" "globals-test-retyped-reader" [] []
+                  '[globals-test-retyped] nil false)
+    (is (= 5 (invoke-procedure "globals-test-retyped-reader" [])))
+    (testing "a type change mints a new native symbol"
+      (let [[entry changed?] (globals/register! "clodin.compiler"
+                                                "globals-test-retyped" :f64 1.5)]
+        (is (true? changed?))
+        (is (= "globals-test-retyped$g1" (:symbol entry)))
+        (is (= :f64 (:type entry)))))
+    (testing "the re-emitted body reads the new layout"
+      (define-proc! "clodin.compiler" "globals-test-retyped-reader" [] []
+                    '[(+ globals-test-retyped 0.5)] nil false)
+      (is (= 2.0 (invoke-procedure "globals-test-retyped-reader" []))))
+    (finally
+      (swap! globals/registry dissoc "globals-test-retyped")
+      (swap! procedure-registry dissoc "globals-test-retyped-reader")
+      (swap! procedure-handles dissoc "globals-test-retyped-reader")
+      (set-build-mode! :monolithic))))
+
+(deftest test-globals-in-standalone-build
+  (let [output (str (System/getProperty "java.io.tmpdir")
+                    "/clodin-globals-test-" (System/nanoTime))
+        package "clodin_globals_aot_test"
+        file (java.io.File. (str (System/getProperty "java.io.tmpdir")
+                                 "/" package ".clj"))
+        source (str
+                "(ns " package "\n"
+                "  (:require [clodin.compiler :refer [defproc defvar extern]]))\n\n"
+                "(extern printf [:ptr] :i32 :varargs)\n\n"
+                "(defvar aot-counter :i64 41)\n\n"
+                "(defproc main [argc :i32 argv :ptr] :i32\n"
+                "  (printf \"counter = %ld\\n\" aot-counter)\n"
+                "  (set aot-counter (+ aot-counter 1))\n"
+                "  (printf \"counter = %ld\\n\" aot-counter)\n"
+                "  (to-i32 0))\n")]
+    (try
+      (spit file source)
+      (load-file (.getAbsolutePath file))
+      (build-executable! (symbol package) {:output output})
+      (testing "a standalone binary links the storage of the globals it uses"
+        (let [{:keys [out exit]} (shell/sh output)]
+          (is (zero? exit))
+          (is (= "counter = 41\ncounter = 42\n" out))))
+      (finally
+        (io/delete-file file true)
+        (io/delete-file output true)))))
 
 (defn -main
   [& _]

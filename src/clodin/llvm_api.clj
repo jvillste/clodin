@@ -160,9 +160,10 @@
                      0))
 
 (defn const-real
-  "A constant 64 bit floating point value."
-  ^MemorySegment [^MemorySegment context double-value]
-  (LLVM/LLVMConstReal (LLVM/LLVMDoubleTypeInContext context) (double double-value)))
+  "A constant floating point value of the given clodin type, so that a
+  32 bit global can be initialised without a separate truncation."
+  ^MemorySegment [^MemorySegment context type double-value]
+  (LLVM/LLVMConstReal (type-for context type) (double double-value)))
 
 (defn pointer-type
   "The opaque pointer type, used for cells and globals."
@@ -174,11 +175,41 @@
   ^MemorySegment [^MemorySegment type]
   (LLVM/LLVMConstNull type))
 
+(defn named-global
+  "Finds a global variable in the module by name, or nil when the module
+  does not declare it. A procedure module uses this to reference a global
+  that owns its storage elsewhere."
+  ^MemorySegment [^MemorySegment module ^MemorySegment name]
+  (LLVM/LLVMGetNamedGlobal module name))
+
 (defn add-global
-  "Adds an external-linkage global variable of the given type and name to
-  module and returns it. Its initializer is set separately."
+  "Adds a global variable of the given type and name to module and returns
+  it. Its initializer is set separately. The linkage defaults to external, so
+  a procedure module that names the same global references the storage owned
+  by the global's own module instead of defining a private copy."
   ^MemorySegment [^MemorySegment module ^MemorySegment type ^MemorySegment name]
   (LLVM/LLVMAddGlobal module type name))
+
+(defn set-alignment
+  "Sets the alignment of a global or alloca in bytes. LLVM needs an explicit
+  alignment on an external global declaration that is accessed atomically:
+  without one it cannot prove the access is naturally aligned and lowers it to
+  an out-of-line __atomic_load/__atomic_store call, which the JIT cannot
+  resolve."
+  [^MemorySegment value alignment]
+  (LLVM/LLVMSetAlignment value (int alignment)))
+
+(defn global-declaration
+  "Declares a global with the given type and name in module without
+  defining it, so the module can load and store through it. The definition
+  (and therefore the storage and initial value) lives in another module that
+  is added to the JIT separately. alignment is the declared alignment in
+  bytes; it must be given for atomic accesses to lower inline."
+  ^MemorySegment [^MemorySegment module ^MemorySegment type ^MemorySegment name
+                  ^long alignment]
+  (let [global (LLVM/LLVMAddGlobal module type name)]
+    (set-alignment global alignment)
+    global))
 
 (defn set-initializer
   "Sets the initializer of a global variable."
@@ -235,21 +266,32 @@
 
 (defn build-atomic-load
   "Builds an atomic load with acquire ordering. Setting the ordering also
-  marks the instruction atomic, so optimizers cannot hoist or remove it."
+  marks the instruction atomic, so optimizers cannot hoist or remove it.
+
+  alignment is the access alignment in bytes and must be the natural alignment
+  of element-type. A module without a data layout defaults i64 to ABI
+  alignment 4, so without an explicit alignment LLVM cannot prove the access
+  is naturally aligned and lowers it to an out-of-line __atomic_load call,
+  which the JIT cannot resolve."
   ^MemorySegment [^MemorySegment builder ^MemorySegment element-type
-                  ^MemorySegment pointer ^Arena arena ^String name]
+                  ^MemorySegment pointer ^Arena arena ^String name
+                  alignment]
   (let [instruction (LLVM/LLVMBuildLoad2 builder element-type pointer
                                         (name-token builder arena name))]
     (LLVM/LLVMSetOrdering instruction +atomic-acquire+)
+    (set-alignment instruction alignment)
     instruction))
 
 (defn build-atomic-store
   "Builds an atomic store with release ordering. Setting the ordering also
-  marks the instruction atomic."
+  marks the instruction atomic. alignment must be the natural alignment of the
+  stored value; see build-atomic-load."
   ^MemorySegment [^MemorySegment builder ^MemorySegment value
-                  ^MemorySegment pointer ^Arena arena]
+                  ^MemorySegment pointer ^Arena arena
+                  alignment]
   (let [instruction (LLVM/LLVMBuildStore builder value pointer)]
     (LLVM/LLVMSetOrdering instruction +atomic-release+)
+    (set-alignment instruction alignment)
     instruction))
 
 (defn- build-binary
