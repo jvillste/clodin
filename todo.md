@@ -606,7 +606,7 @@ Deferred deliberately; everything on this list is a separate iteration.
   form and the format-string lowering are missing.
 
 - [ ] Print an arbitrary byte range.
-  `clodin_print_bytes` exists but is only used for string literals. Expose it
+  `clodin$print$bytes` exists but is only used for string literals. Expose it
   as `(print-bytes pointer length)` for buffers that are not null terminated.
 
 - [ ] Print aggregate values.
@@ -615,6 +615,185 @@ Deferred deliberately; everything on this list is a separate iteration.
 - [ ] A `format` function returning a string.
   Useful for building a message before printing it, and for tests that want
   the formatted text without touching `*out*`.
+
+## Porting the print runtime to clodin
+
+`clodin.print` builds the runtime with the LLVM C API because it needs three
+things the language does not have yet. The goal is to write the runtime as
+ordinary `defproc`s in a `clodin.runtime` namespace and delete the hand-built
+runtime module, so the printing code is no longer a special case the compiler
+maintains.
+
+### What stays in Clojure
+
+`write-bytes!`, the upcall stub and `writer-address` create a Panama upcall
+stub and write to a `java.io.Writer`. Those cannot move: they are the JVM side
+of the boundary. Only the native half moves.
+
+### The three blockers
+
+1. `if` lowers to `llvm.select`, so both branches are evaluated and neither can
+   have a side effect. `clodin$write$bytes` needs "if the pointer is null call
+   `write`, else call the pointer", which must execute exactly one branch.
+2. There is no stack scratch buffer, so `snprintf` has nowhere to write. `let`
+   binds one scalar into a hoisted slot; it does not give an addressable block.
+   `malloc`/`free` would work but allocates per print and a shared global buffer
+   would race between threads.
+3. There is no indirect call, so a `:ptr` holding a function address cannot be
+   invoked from clodin source.
+
+### Mapping of runtime functions
+
+| runtime function | needs | after phases |
+| --- | --- | --- |
+| `clodin$print$bool` | Phase 1 | clodin |
+| `clodin$print$bytes` | none | clodin |
+| `clodin$print$newline` | none | clodin |
+| `clodin$print$cstr` | Phase 1 (null guard) | clodin |
+| `clodin$print$i64` / `i32` / `f64` / `f32` | Phases 1, 2 | clodin |
+| `clodin$write$bytes` | Phases 1, 2, 3 | clodin |
+| upcall stub, `write-bytes!` | JVM | stays Clojure |
+
+### Phase 1: branching `if`
+
+`if` becomes a real branch. Statement arms (arms with no value) are allowed, so
+`(if condition (do-side-effect) (other-side-effect))` is legal, and a value
+`if` still works. Options are recorded under "Branching `if` options" below.
+
+Today statement arms are not rejected, they crash: `(if flag (store ...)
+(store ...))` reaches `build-select` with a nil operand and throws a
+`NullPointerException` from inside the LLVM downcall. Phase 1 fixes that by
+construction, and the new `if` must report a clear error for arms of different
+types.
+
+Acceptance: `clodin$write$bytes`, `clodin$print$bool` and
+`clodin$print$cstr` can be written as `defproc`s and produce the same output as
+the current runtime; `(if condition (store ...) (store ...))` works; a plain
+value `if` still compiles to a single value; existing tests pass.
+
+### Phase 2: stack scratch buffer
+
+A form that yields a `:ptr` to an uninitialised stack block of a given byte
+size, hoisted to the entry block so a loop does not grow the stack:
+
+    (let [buffer :ptr (alloca 32)]
+      ...)
+
+Options:
+
+- `(alloca byte-count)`: one form, yields `:ptr`, composes with `let`.
+  Alignment is the natural maximum (16) so it can hold doubles.
+- `(with-scratch [name size] body...)`: scoped and non-escaping, but adds a
+  second binding form next to `let` and is redundant with a hoisted `alloca`.
+- Odin-style buffer type with a length header: deferred to the buffer feature.
+
+Recommendation: `(alloca byte-count)`, hoisted to the entry block. It composes
+with `let`, needs no new binding form, and the entry-block hoist gives the
+loop-safety that `with-scratch` would otherwise have to guarantee.
+
+Acceptance: the integer and float print helpers can be written as `defproc`s
+using `(alloca 32)` and `snprintf`, with no `malloc`, and a print inside a
+`while` does not grow the stack per iteration.
+
+### Phase 3: indirect call
+
+A form that calls a function pointer:
+
+    (call-pointer clodin-write :void [:ptr :i64] data length)
+
+Options:
+
+- `(call-pointer pointer return-type [param-types ...] args...)`: explicit and
+  small; the type is written at the call site.
+- A first class function-pointer type `:fn` so a `:ptr` can be called directly:
+  larger type-system change, and every place that handles `:ptr` would need to
+  distinguish the two.
+
+Recommendation: `call-pointer`. It is one compiler form and one `build-call`
+with a loaded pointer, and it does not touch the type system.
+
+Acceptance: `clodin$write$bytes` can be written as a `defproc`, including the
+null check that falls back to `write(1, ...)`.
+
+### Phase 4: move the runtime into clodin
+
+- New namespace `clodin.runtime` with the print helpers as `defproc`s.
+- The writer pointer becomes a global, `(defvar clodin-write :ptr nil)`, used by
+  `clodin$write$bytes` as `(call-pointer clodin-write ...)`. This reuses the
+  globals feature instead of a hand-built global.
+- The compiler loads `clodin.runtime` before any user namespace and, after
+  creating or resetting the JIT, `reset!`s `clodin-write` to
+  `(print/writer-address)`. A monolithic rebuild reinitialises globals, so the
+  reset has to happen on every build; an AOT build leaves it nil and the
+  fallback writes to file descriptor 1.
+- Delete `runtime-module`, the `build-*` helpers and the `install-runtime!`
+  module plumbing. `clodin.print` keeps only the upcall stub and the writer.
+
+Acceptance: `(println ...)` from a procedure, from `with-out-str`, from a
+`future`, and from a standalone binary all work with no runtime module built by
+the LLVM C API; the only remaining C-API-built module is the globals and
+procedure modules the compiler already produces.
+
+### Branching `if` options
+
+The shared shape is: compile the condition, `condbr` to a then block and an
+else block, compile each arm, join at a merge block. The options differ in how
+the arms' values are combined and in how the surface form is split.
+
+- **A. Add `when` only; keep `if` pure.** `(when condition body...)` is a real
+  branch with no value. Smallest change, no value plumbing, and `if` keeps its
+  documented select semantics.
+  - Pros: no phi, no result slot, no change to any existing `if`; about as small
+    as `compile-while`; low risk to the 44 existing tests.
+  - Cons: `if` stays surprising for anyone coming from Clojure; a value that
+    depends on a condition needs a `let` slot plus a `when`, and the slot has to
+    be initialised; the runtime port needs the two-arm null check written as two
+    `when`s or an early-return style.
+
+- **B. `if` branches, value combined with a `phi` node.**
+  - Pros: Clojure semantics; side effects allowed in either arm; one form.
+  - Cons: needs `LLVMBuildPhi`/`LLVMAddIncoming` wrappers (the C API has them,
+    the bindings generated them, but `clodin.llvm-api` does not wrap them yet);
+    a phi must be the first instruction in the merge block, so the merge block
+    must stay empty until the phi is built; an arm whose block already has a
+    terminator needs a check or the extra `br` is invalid IR.
+
+- **C. `if` branches, value combined through a hoisted stack slot.** Same control
+  flow as B, but each arm stores its value into an alloca and the merge block
+  loads it.
+  - Pros: no phi API surface; works when one arm's final block shape differs,
+    because the store is placed at the end of each arm's own block; reuses
+    `hoisted-alloca`, which `let` already uses; `mem2reg` turns it back into a
+    phi at `:O1` and above.
+  - Cons: at `:none` there is an extra alloca, store and load per value `if`;
+    a slot is allocated even when one arm is the only value-producing one.
+
+- **D. Unified `if`: branch always; combine a value only when both arms produce
+  one.** This is B or C plus the statement case, so `(if c (set x 1) (set x 2))`
+  and `(if c 1 2)` are both legal.
+  - Pros: one form covers both uses; matches Clojure; the runtime port needs
+    only this.
+  - Cons: the compiler must handle the "no value type" case, which means
+    `compile-if` has two paths; the merge block is entered with `:result-value
+    nil` and `:return-type nil`, and `compile-body` has to treat that as a
+    statement result instead of a missing value.
+
+- **E. Keep `if` as select and add `when` plus `when-else`.** Two statements
+  and no value form.
+  - Cons: `when-else` is close enough to `if` that two forms with subtly
+    different evaluation rules are a trap.
+
+- **F. Make `if` branching and require both arms to produce a value, adding
+  `when` for statements.**
+  - Pros: each form has one meaning.
+  - Cons: `(if c (store ...) (store ...))` is rejected, so the runtime's null
+    check still needs `when`, and users hit the rejection often.
+
+Recommendation: **D with C's value plumbing**. It makes `if` mean what it means
+in Clojure, gives the runtime everything it needs from one form, and avoids new
+LLVM API surface. If the extra load and store at `:none` measurement matters
+later, switching the value case to a phi is a local change behind the same
+surface form.
 
 ## Unimplemented speedups
 
