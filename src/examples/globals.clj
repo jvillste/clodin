@@ -8,15 +8,18 @@
   (reset! running? false) and (swap! counter inc) work.
 
   A native loop blocks the JVM thread that entered it, so the write that stops
-  it has to come from another thread. Run the loop in a future:
+  it has to come from another thread. Run the loop on its own thread:
 
     (def worker (future (spin-until-stopped)))
     (Thread/sleep 100)
     (reset! running? false)
-    @worker"
-  (:require [clodin.compiler :refer [defproc defvar extern]]))
+    @worker
 
-(extern printf [:ptr] :i32 :varargs)
+  Printing uses (println ...) and (print ...), which call back into the JVM on
+  the calling thread. A future conveys *out*, so a background loop prints to
+  the REPL without any capture lock, and report below can run while the loop
+  spins."
+  (:require [clodin.compiler :refer [defproc defvar]]))
 
 (defvar running? :boolean true)
 (defvar turns :i64 0)
@@ -25,8 +28,9 @@
 (defproc spin-until-stopped [] :i64
   (let [count :i64 0]
     (while running?
-      (set count (+ count 1)))
-    (set turns count)
+      (set count (+ count 1))
+      ;; publish progress so Clojure can read it while the loop runs
+      (set turns count))
     count))
 
 (defproc bump-turns [amount :i64] :i64
@@ -38,15 +42,19 @@
   (* (to-float turns) scale))
 
 (defproc report []
-  (printf "turns = %ld, scaled = %.2f\n" turns (scaled-turns)))
+  (println "turns = " turns ", scaled = " (scaled-turns)))
 
 (comment
-  (.start (Thread. (fn []
-                     (spin-until-stopped)
-                     (println! "spinning stopped"))))
+  ;; Run the loop on its own thread, then read the shared state while it spins.
+  (def worker (future (spin-until-stopped)))
+  (Thread/sleep 100)
   (report)
-  @running?
   (reset! running? false)
+  (reset! running? true)
+  @turns
+  @worker
+
+  ;; Ordinary globals: native writes are visible to Clojure and vice versa.
   (bump-turns 10)
   (report)
   (reset! scale 2.0)

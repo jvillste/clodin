@@ -175,6 +175,17 @@
   ^MemorySegment [^MemorySegment type]
   (LLVM/LLVMConstNull type))
 
+(defn const-int-to-ptr
+  "A constant pointer with the given integer address."
+  ^MemorySegment [^MemorySegment context ^long address]
+  (LLVM/LLVMConstIntToPtr (const-int context address)
+                          (pointer-type context)))
+
+(defn array-type
+  "An LLVM array type of count elements of the given LLVM element type."
+  ^MemorySegment [^MemorySegment element-type ^long count]
+  (LLVM/LLVMArrayType2 element-type (long count)))
+
 (defn named-global
   "Finds a global variable in the module by name, or nil when the module
   does not declare it. A procedure module uses this to reference a global

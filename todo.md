@@ -254,6 +254,55 @@ supersede the earlier `def` sketch.
   automatically and the pointer is lost on a reset.
 - A native loop blocks the JVM thread that entered it, so a `reset!` that is
   meant to stop it must come from another thread (for example a `future`).
+- Printing is a language feature, not a stdout capture: see "Printing" below.
+  A background loop can print to the REPL through a `future`, because the
+  print runtime calls back into the JVM on the calling thread and `future`
+  conveys `*out*`.
+
+### Printing
+
+`(print ...)` and `(println ...)` are clodin forms, not `extern printf`.
+Operands are concatenated without separators, so spaces are written
+explicitly; `(println)` with no operands prints just a newline. Each operand
+is lowered according to its static type:
+
+- a string literal is written with its known UTF-8 byte length;
+- `:ptr` is treated as a null terminated C string and written with `strlen`;
+  a null pointer prints nothing instead of trapping;
+- `:i64` / `:i32` are formatted with `snprintf` and `%ld` / `%d`;
+- `:f64` / `:f32` are formatted with `%g` (an `f32` is extended to `double`
+  first);
+- `:boolean` writes `true` or `false`;
+- `println` appends a newline.
+
+The runtime lives in `clodin.print` as an LLVM module with
+`clodin$write$bytes(ptr, i64)` and one formatting helper per type. The compiler only
+emits calls to those helpers, so a procedure module is small and the
+formatting code exists once.
+
+`clodin$write$bytes` loads a function pointer, `@clodin$write`. In a JIT build the
+pointer is a JVM upcall stub that writes the bytes to the calling thread's
+`*out*`. The upcall runs on the thread that entered the native procedure, so
+the dynamic binding is the caller's: `with-out-str`, CIDER and a `future` that
+conveys `*out*` all work. There is no capture lock and no global redirect, so
+a long-running procedure never blocks another procedure's output.
+
+In an offline build there is no JVM, so `@clodin$write` is null and
+`clodin$write$bytes` falls back to `write(1, ...)`, which is what a standalone
+binary wants. The same lowering therefore works in both modes.
+
+`extern printf` remains raw libc output and goes to the process stdout, not
+`*out*`. That is the deliberate split: use `println` for REPL-visible output,
+and `printf` only when you specifically want C formatting or are writing a
+standalone binary.
+
+A native thread that the JVM has never attached is attached for the upcall,
+but it has no Clojure binding frame, so it sees the root `*out*`. JVM-created
+threads (`future`, `Thread`) carry the binding they were created with.
+
+Formatting is `%g` for floats, so `1.5` prints as `1.5` and large values use
+exponent notation. A width/precision form is deferred; see "Future print
+features".
 
 ### Redefinition
 
@@ -547,6 +596,25 @@ Deferred deliberately; everything on this list is a separate iteration.
   Requires implementing `IRef`. A native write can never notify a JVM
   watch, so this is only meaningful for a global that native code never
   writes. Validators would apply to JVM writes only.
+
+## Future print features
+
+- [ ] Width, precision and padding.
+  Floats currently use `%g`. A format option, for example
+  `(println (format "%.2f" value))`, would allow fixed decimals and column
+  alignment. The runtime already has the formatting helpers; only the surface
+  form and the format-string lowering are missing.
+
+- [ ] Print an arbitrary byte range.
+  `clodin_print_bytes` exists but is only used for string literals. Expose it
+  as `(print-bytes pointer length)` for buffers that are not null terminated.
+
+- [ ] Print aggregate values.
+  Structs, arrays and the Odin-style buffer type, once those types exist.
+
+- [ ] A `format` function returning a string.
+  Useful for building a message before printing it, and for tests that want
+  the formatted text without touching `*out*`.
 
 ## Unimplemented speedups
 

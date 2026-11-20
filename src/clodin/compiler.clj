@@ -64,10 +64,17 @@
   native loop that spins on a global sees a write from another thread. The
   name is also bound in Clojure to a handle implementing clojure.lang.IDeref
   and clojure.lang.IAtom2, so @running?, (reset! running? false) and
-  (swap! counter inc) work from the REPL."
+  (swap! counter inc) work from the REPL.
+
+  (print ...) and (println ...) write to *out* through a JVM upcall on the
+  calling thread, so with-out-str and CIDER capture them. Operands are
+  concatenated without separators; add spaces explicitly. A string literal
+  and a :ptr are written as text, numbers are formatted with snprintf, and a
+  :boolean writes true or false. (println) appends a newline. extern printf
+  stays raw libc output and goes to the process stdout."
   (:require [clodin.globals :as globals]
             [clodin.llvm-api :as llvm]
-            [clodin.native-stdout :as native-stdout]
+            [clodin.print :as print]
             [clojure.java.io :as io]
             [clojure.java.shell :as shell]
             [clojure.string :as string]
@@ -909,6 +916,53 @@
         (throw (ex-info (str "Cannot set unknown local or global: " name)
                         {:symbol name}))))))
 
+(defn- call-print-runtime
+  "Calls one of the print runtime functions. The runtime module defines them;
+  a procedure module only declares them."
+  [state name param-types argument-values]
+  (let [{:keys [context module builder arena]} state
+        function-type (llvm/function-type context arena nil param-types)
+        callee (llvm/get-or-add-function module (llvm/c-string arena name) function-type)]
+    (llvm/build-call builder function-type callee argument-values arena)
+    state))
+
+(defn- compile-print-operand
+  "Lowers one print operand according to its clodin type. A string literal is
+  written with its known byte length; a :ptr is treated as a null terminated C
+  string."
+  [state environment operand]
+  (if (string? operand)
+    (let [[state value _type] (compile-expression state environment operand)
+          length (alength (.getBytes ^String operand
+                                     java.nio.charset.StandardCharsets/UTF_8))]
+      (call-print-runtime state "clodin$print$bytes" [:ptr :i64]
+                          [value (llvm/const-int-of-type (:context state) :i64 length)]))
+    (let [[state value type] (compile-expression state environment operand)]
+      (case type
+        :i64 (call-print-runtime state "clodin$print$i64" [:i64] [value])
+        :i32 (call-print-runtime state "clodin$print$i32" [:i32] [value])
+        :f64 (call-print-runtime state "clodin$print$f64" [:f64] [value])
+        :f32 (call-print-runtime state "clodin$print$f32" [:f32] [value])
+        :boolean (call-print-runtime state "clodin$print$bool" [:boolean] [value])
+        :ptr (call-print-runtime state "clodin$print$cstr" [:ptr] [value])
+        (throw (ex-info (str "Cannot print a value of type " type)
+                        {:type type :operand operand}))))))
+
+(defn- compile-print
+  "Compiles (print ...) and (println ...). Each operand is formatted by the
+  native print runtime, which writes to the calling thread's *out* through a
+  JVM upcall, or to file descriptor 1 in an offline build. A print does not
+  produce a value."
+  [state environment expression println?]
+  (let [state (reduce (fn [state operand]
+                        (compile-print-operand state environment operand))
+                      state
+                      (rest expression))
+        state (if println?
+                (call-print-runtime state "clodin$print$newline" [] [])
+                state)]
+    [state nil nil]))
+
 (defn- compile-comparison
   "Compiles a binary comparison into an llvm icmp or fcmp instruction.
   The result is a :boolean."
@@ -1018,6 +1072,8 @@
         (= operator 'to-pointer) (compile-to-pointer state environment expression)
         (= operator 'let) (compile-let state environment expression)
         (= operator 'set) (compile-set state environment expression)
+        (= operator 'print) (compile-print state environment expression false)
+        (= operator 'println) (compile-print state environment expression true)
         (= operator 'if) (compile-if state environment expression)
         (= operator 'while) (compile-while state environment expression)
         :else (compile-call state environment operator (rest expression))))
@@ -1072,6 +1128,7 @@
                                     (partition 3 bindings))]
             (expression-type environment (last inner-body)))
           (= operator 'set) nil
+          (#{'print 'println} operator) nil
           (= operator 'if) (expression-type environment (nth expression 2))
           (= operator 'while) nil
           :else (let [procedure (get @procedure-registry (str operator))
@@ -1148,6 +1205,27 @@
 ;;; keep calling the same symbol and running native loops see the new body.
 ;;; ---------------------------------------------------------------------------
 
+(defn- install-runtime!
+  "Adds the print runtime module to jit. Reloadable mode keeps one JIT, so the
+  runtime is added once when the JIT is created. A monolithic build links the
+  runtime into the procedure module instead."
+  [jit]
+  (let [arena (Arena/ofConfined)]
+    (try
+      (let [context (llvm/new-context)
+            module (print/runtime-module context arena (print/writer-address))
+            added? (volatile! false)]
+        (try
+          (llvm/verify module arena)
+          (vreset! added? true)
+          (llvm/add-module-to-jit! jit module context)
+          (finally
+            (when-not @added?
+              (llvm/dispose-module module)
+              (llvm/dispose-context context)))))
+      (finally
+        (.close arena)))))
+
 (defn- ensure-jit!
   "Returns the long-lived LLJIT, creating it on first use. Reloadable mode
   keeps one JIT for the session; reset-module! disposes it."
@@ -1160,6 +1238,7 @@
                 (llvm/init-targets!)
                 (let [jit (llvm/create-jit arena)]
                   (reset! current-jit jit)
+                  (install-runtime! jit)
                   jit)
                 (finally
                   (.close arena))))))))
@@ -1710,21 +1789,22 @@
 (defn- link-procedures
   "Parses the stored bitcode of the given procedures into a single linked
   module in the given context. A procedure module only declares the globals it
-  reads, so the storage modules for every global the procedures reference are
-  linked in too."
-  [procedures context arena]
+  reads and the print runtime, so the storage modules and the runtime module
+  are linked in too. writer-address is the JVM print upcall for a monolithic
+  JIT build, or nil for an offline build."
+  [procedures context arena writer-address]
   (when (empty? procedures)
     (throw (ex-info "No clodin procedures to link" {})))
   (let [used-globals (into #{} (mapcat :globals) (vals procedures))
         specs (filter (fn [[symbol _type _value]] (contains? used-globals symbol))
-                      (globals/storage-specs))]
+                      (globals/storage-specs))
+        base (print/runtime-module context arena writer-address)
+        base (if (seq specs)
+               (llvm/link-into! base (global-storage-module context specs arena))
+               base)]
     (reduce (fn [merged {:keys [bitcode]}]
-              (let [module (llvm/parse-bitcode context bitcode arena)]
-                (if (nil? merged)
-                  module
-                  (llvm/link-into! merged module))))
-            (when (seq specs)
-              (global-storage-module context specs arena))
+              (llvm/link-into! merged (llvm/parse-bitcode context bitcode arena)))
+            base
             (vals procedures))))
 
 (defn- link-module
@@ -1733,7 +1813,7 @@
   [context arena]
   (when (empty? @procedure-registry)
     (throw (ex-info "No clodin procedures registered to compile" {})))
-  (link-procedures @procedure-registry context arena))
+  (link-procedures @procedure-registry context arena (print/writer-address)))
 
 (defn- used-global-symbols
   "The native symbols of the globals that the linked module defines. A
@@ -1924,7 +2004,7 @@
     (let [arena (Arena/ofConfined)]
       (try
         (let [context (llvm/new-context)
-              module (link-procedures procedures context arena)]
+              module (link-procedures procedures context arena nil)]
           (try
             (f module arena)
             (finally
@@ -1982,7 +2062,7 @@
      (let [arena (Arena/ofConfined)]
        (try
          (let [context (llvm/new-context)
-               module (link-procedures (procedures-for-linking procedures) context arena)
+               module (link-procedures (procedures-for-linking procedures) context arena nil)
                target-machine (llvm/create-target-machine arena)]
            (try
              (llvm/set-module-target! module target-machine arena)
@@ -2054,7 +2134,7 @@
      (let [arena (Arena/ofConfined)]
        (try
          (let [context (llvm/new-context)
-               module (link-procedures (procedures-for-linking procedures) context arena)
+               module (link-procedures (procedures-for-linking procedures) context arena nil)
                target-machine (llvm/create-target-machine arena {:pic? true})]
            (try
              (llvm/set-module-target! module target-machine arena)
@@ -2087,6 +2167,10 @@
 ;;; Compilation entry point (macro)
 ;;; ---------------------------------------------------------------------------
 
+(def ^:private reserved-names
+  "Names the compiler lowers itself, so a user definition would be shadowed."
+  #{"print" "println"})
+
 (defn- defvar-form
   "Parses a defvar form, registers the global through define-var! and returns
   the clojure def that binds the name to the global's JVM handle. The handle
@@ -2098,6 +2182,9 @@
   [namespace name type initial-value]
   (when-not (symbol? name)
     (throw (ex-info "Global name must be a symbol" {:name name})))
+  (when (contains? reserved-names (str name))
+    (throw (ex-info (str name " is a built in form and cannot be a global")
+                    {:name name})))
   (when-not (or (number? initial-value) (boolean? initial-value)
                 (nil? initial-value))
     (throw (ex-info (str "defvar needs a literal initial value (a number, a"
@@ -2114,6 +2201,9 @@
   [namespace name params body]
   (when-not (symbol? name)
     (throw (ex-info "Procedure name must be a symbol" {:name name})))
+  (when (contains? reserved-names (str name))
+    (throw (ex-info (str name " is a built in form and cannot be a procedure")
+                    {:name name})))
   (when-not (vector? params)
     (throw (ex-info "Procedure parameters must be a vector" {:params params})))
   (when-not (even? (count params))
@@ -2128,8 +2218,7 @@
                   explicit-return-type
                   (boolean (:static (meta name))))
     `(defn ~name [~@param-names]
-       (native-stdout/capture-native-stdout
-        (fn [] (invoke-procedure ~(str name) [~@param-names]))))))
+       (invoke-procedure ~(str name) [~@param-names]))))
 
 (defmacro defvar
   "Defines a top level mutable variable that native code and Clojure share.
@@ -2183,9 +2272,11 @@
   :reloadable mode the stub is installed and the body is loaded eagerly,
   so a redefinition takes effect in native callers on their next call.
 
-  The generated Clojure wrapper captures the C stdout stream and writes it
-  to *out*, so printf output from the procedure appears in the REPL. Call
-  invoke-procedure directly to bypass the capture.
+  The generated Clojure wrapper calls the procedure through
+  invoke-procedure. Use (println ...) and (print ...) inside the body to write
+  to *out*: the print runtime calls back into the JVM on the calling thread,
+  so with-out-str and CIDER work. extern printf stays raw libc output and
+  goes to the process stdout.
 
   An explicit return type can be given by putting a type keyword before
   the body forms; without it the return type is inferred from the last
@@ -2516,7 +2607,13 @@
   (sprintf buffer "%.1f" value))
 
 (defproc print-value [value :i64]
-  (printf "value = %ld\n" value))
+  (println "value = " value))
+
+(defproc print-without-newline [value :i64]
+  (print "value = " value))
+
+(defproc print-mixed [flag :boolean ratio :f64 label :ptr]
+  (println label " " flag " " ratio))
 
 (defproc truncate-to-i32 [value :i64]
   (to-i32 value))
@@ -2561,10 +2658,24 @@
   (testing "printf is callable and returns the number of bytes written"
     (is (= 0 (print-nothing)))))
 
-(deftest test-defproc-captures-native-stdout
-  (testing "the clojure wrapper writes native stdout to *out*"
-    (is (= "value = 42\n"
-           (with-out-str (print-value 42))))))
+(deftest test-println-writes-to-out
+  (testing "println writes to the calling thread's *out*"
+    (is (= "value = 42\n" (with-out-str (print-value 42)))))
+
+  (testing "print does not append a newline"
+    (is (= "value = 42" (with-out-str (print-without-newline 42)))))
+
+  (testing "println formats booleans, floats and C strings"
+    (let [arena (Arena/ofShared)
+          label (.allocateFrom arena "label")]
+      (try
+        (is (= "label true 1.5\n" (with-out-str (print-mixed true 1.5 label))))
+        (finally
+          (.close arena)))))
+
+  (testing "a procedure called from a future prints to the conveyed *out*"
+    (let [output (deref (future (with-out-str (print-value 7))) 5000 ::timeout)]
+      (is (= "value = 7\n" output)))))
 
 (deftest test-build-library
   (let [output (str (System/getProperty "java.io.tmpdir")
@@ -2576,18 +2687,17 @@
       (let [arena (Arena/ofConfined)]
         (try
           (let [lookup (SymbolLookup/libraryLookup output arena)
-                greet (.orElseThrow (.find lookup "greet"))
+                greet-length (.orElseThrow (.find lookup "greet-length"))
                 descriptor (FunctionDescriptor/of
-                            ValueLayout/JAVA_INT
+                            ValueLayout/JAVA_LONG
                             (into-array java.lang.foreign.MemoryLayout
                                         [ValueLayout/ADDRESS]))
-                handle (.downcallHandle (Linker/nativeLinker) greet descriptor
+                handle (.downcallHandle (Linker/nativeLinker) greet-length descriptor
                                         (make-array Linker$Option 0))
                 text (.allocateFrom arena "library")]
-            (is (= "hello, library\n"
-                   (with-out-str
-                     (native-stdout/with-native-stdout
-                       (.invokeWithArguments handle (object-array [text])))))))
+            ;; greet-length calls extern strlen, so the test exercises the
+            ;; linked library without writing to the process stdout.
+            (is (= 7 (long (.invokeWithArguments handle (object-array [text]))))))
           (finally
             (.close arena))))
       (finally
@@ -2821,6 +2931,14 @@
 (defvar globals-test-float32 :f32 2.5)
 (defvar globals-test-pointer :ptr nil)
 
+;; A defproc wrapper for the print-from-a-background-thread test.
+(defproc globals-test-background-printer [] :i64
+  (let [turns :i64 0]
+    (while globals-test-boolean
+      (set turns (+ turns 1)))
+    (println "background turns = " turns)
+    turns))
+
 (deftest test-globals-registry
   (testing "defvar registers a typed global and binds a handle"
     (is (= :boolean (globals/global-type "globals-test-boolean")))
@@ -2934,6 +3052,21 @@
     (finally
       (reset! globals-test-counter 7)
       (reset! globals-test-boolean true))))
+
+(deftest test-background-print-goes-to-conveyed-out
+  (testing "a loop started in a future prints to the future's *out*"
+    (reset! globals-test-boolean true)
+    (let [output (java.io.StringWriter.)
+          worker (binding [*out* output]
+                   (future (globals-test-background-printer)))]
+      (try
+        (Thread/sleep 100)
+        (is (not (realized? worker)))
+        (reset! globals-test-boolean false)
+        (is (integer? (deref worker 20000 ::timeout)))
+        (is (re-find #"background turns = [0-9]+" (str output)))
+        (finally
+          (reset! globals-test-boolean false))))))
 
 (deftest test-globals-native-loop-sees-reset
   (let [previous-level (current-optimization-level)]
