@@ -654,22 +654,38 @@ of the boundary. Only the native half moves.
 | `clodin$write$bytes` | Phases 1, 2, 3 | clodin |
 | upcall stub, `write-bytes!` | JVM | stays Clojure |
 
-### Phase 1: branching `if`
+### Phase 1: branching `if` (done)
 
-`if` becomes a real branch. Statement arms (arms with no value) are allowed, so
-`(if condition (do-side-effect) (other-side-effect))` is legal, and a value
-`if` still works. Options are recorded under "Branching `if` options" below.
+`if` is a real branch with Clojure's semantics: only the taken arm runs, so an
+arm may have side effects. Both arms producing a value of the same type gives a
+value `if`, merged with a phi in the join block. Both arms being statements
+gives a statement `if`. Mixing them is a clear compile error.
 
-Today statement arms are not rejected, they crash: `(if flag (store ...)
-(store ...))` reaches `build-select` with a nil operand and throws a
-`NullPointerException` from inside the LLVM downcall. Phase 1 fixes that by
-construction, and the new `if` must report a clear error for arms of different
-types.
+`(when condition body...)` is added as a statement branch with no else arm. It
+produces no value, because clodin has no nil to return when the condition is
+false.
 
-Acceptance: `clodin$write$bytes`, `clodin$print$bool` and
-`clodin$print$cstr` can be written as `defproc`s and produce the same output as
-the current runtime; `(if condition (store ...) (store ...))` works; a plain
-value `if` still compiles to a single value; existing tests pass.
+Design notes:
+
+- The phi is built in the join block before anything else is emitted there, as
+  LLVM requires a phi to be the block's first instruction.
+- Each arm is branched from its own final block, because a nested branching
+  form inside an arm can move the builder past the arm's first block.
+- An arm that already ends in a terminator is treated as diverging: it
+  contributes no phi incoming and its type is compatible with the other arm's.
+  If both arms diverge, the join block gets `unreachable` and the form itself
+  diverges.
+- `compile-body` stops emitting after a form that sets `:terminated?`, and
+  `build-procedure!` skips its implicit `ret` for a terminated body. Nothing
+  sets `:terminated?` yet; this is the groundwork for `return`.
+- New wrappers in `clodin.llvm-api`: `block-terminator`, `block-terminated?`,
+  `build-phi`, `add-incoming`.
+
+Acceptance met: statement `if` writes through a pointer, the untaken arm does
+not run, nested and loop-hosted `if` work, a value `if` compiles to a phi,
+arm-type mismatches are reported clearly, and `when` runs its body only on the
+true path. Covered by `test-if`, `test-if-value-uses-a-phi`,
+`test-if-arm-mismatch` and `test-when`.
 
 #### Early termination stays out of scope
 
@@ -861,11 +877,10 @@ the arms' values are combined and in how the surface form is split.
   - Cons: `(if c (store ...) (store ...))` is rejected, so the runtime's null
     check still needs `when`, and users hit the rejection often.
 
-Recommendation: **D with C's value plumbing**. It makes `if` mean what it means
-in Clojure, gives the runtime everything it needs from one form, and avoids new
-LLVM API surface. If the extra load and store at `:none` measurement matters
-later, switching the value case to a phi is a local change behind the same
-surface form.
+Decision: **D, with the phi plumbing from B.** `if` means what it means in
+Clojure, and the value case uses a phi so there is no stack slot per value
+branch. `nil` arm types mean "statement", and mixing a value arm with a
+statement arm is an error. `when` was added as a statement branch.
 
 ## Vectorization
 
@@ -989,6 +1004,70 @@ vectorizer can often pack and which at worst still overlaps the add latency.
   Lazy compilation currently blocks the first call while LLVM compiles
   the module. A background compile could be started after registration
   and joined only when a procedure is actually called.
+
+## Early return
+
+Deferred as a feature, prepared for structurally. "Early termination stays out
+of scope" above records why it is ergonomics rather than a performance need;
+this section records the plan and the groundwork that already landed.
+
+- [ ] Add a `return` statement.
+
+  `(return value)` and `(return)` emit `ret` (or `ret void`) in the current
+  block and mark the rest of the body unreachable. Clojure has no return, so
+  the form is clodin-specific and has to be a real statement, not a value.
+
+  The groundwork is already in Phase 1 of "Porting the print runtime to
+  clodin". `compile-body` stops emitting after a form sets `:terminated?`,
+  `build-procedure!` skips its implicit `ret` for a terminated body, and
+  `compile-if` already handles an arm that ends in a terminator: the arm
+  contributes no phi incoming, its type is compatible with the other arm's, and
+  if both arms terminate the join block is marked `unreachable`.
+
+  Remaining work is therefore small:
+
+  - `compile-return` compiles the value, checks it against the procedure's
+    return type, emits `ret`, and returns a state with `:terminated? true`.
+  - A procedure whose declared return type is absent must reject `(return
+    value)` and accept `(return)`.
+  - A return inside `while` must be allowed: the loop's end block simply loses
+    that predecessor, and the back edge is not emitted from a terminated body
+    block.
+  - Diagnostics: `(return ...)` at the top level of the module, outside any
+    procedure, is an error.
+
+  Interaction with inference: a body whose last form is `(return x)` leaves
+  `:result-value` nil. Inference already uses `expression-type`, which must
+  report nil for `return`, and the explicit type check must be skipped for a
+  terminated body, otherwise a valid early-returning procedure looks like it
+  has no value to return.
+
+## Values and absence
+
+Clodin has no runtime nil for scalar types, and that is deliberate.
+
+- In the compiler, a nil type means "this form produces no value". `when`,
+  `while`, `set`, `store` and `print` are like that. It is a compile-time
+  property, not a value.
+- The only runtime null is a `:ptr` holding address zero. `(defvar p :ptr nil)`
+  starts there, and printing a null `:ptr` writes nothing.
+- `(let [x :i64 (when false 42)] ...)` is a compile error:
+  "let binding x is declared as :i64 but its value is no value". It does not
+  become 0. Defaulting to 0 would make "absent" indistinguishable from a real
+  zero, so a default must be written explicitly: `(if condition 42 0)`.
+- For reference: Odin's `nil` is assignable only to nillable types
+  (`type_has_nil` in `src/types.cpp`: pointer, rawptr, cstring, slice, proc,
+  map, dynamic array, union, enum, bit_set, `any`, `typeid`), and variables are
+  zero-initialized unless marked `---`. Zig has no null at all outside optional
+  types `?T`. C has null only as a pointer constant. None of the three gives an
+  integer a null value.
+
+- [ ] Optional values, if they are ever wanted.
+  A real option type, for example `(option :i64)` or Zig-style `?i64`, plus
+  `some`/`none` (or `nil` restricted to optionals), `orelse`, and an explicit
+  unwrap that traps on absence. This is the only way to make absence
+  representable without making every scalar nullable. Do not add a bare `nil`
+  literal before this exists: it would have no type to inhabit.
 
 ## Next features
 

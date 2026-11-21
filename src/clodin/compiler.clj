@@ -55,8 +55,13 @@
   integer to 64 bits. Float literals are 64 bit, so f32 constants are written
   (to-f32 1.0e-9).
 
-  (if condition then else) chooses between two same-typed value expressions
-  with an llvm.select, so both branches must be pure.
+  (if condition then else) is a real branch, like Clojure's if: only the taken
+  arm runs, so an arm may have side effects. When both arms produce a value of
+  the same type the if produces that value, merged with a phi node; when
+  neither arm produces a value it is a statement. Mixing the two is an error.
+
+  (when condition body...) runs its body only when the condition is true and
+  produces no value; use if when a value is needed.
 
   Top level mutable state is declared with (defvar name type literal), for
   example (defvar running? :boolean true). In clodin source the name reads as
@@ -842,6 +847,11 @@
                                       (:arena state) nil)]
       [state result :ptr])))
 
+(defn- type-name
+  "A readable name for a clodin type. nil means the form produced no value."
+  [type]
+  (or type "no value"))
+
 (defn- compile-let
   "Compiles (let [name type value ...] body...). Every binding gets its
   own stack slot, so a later binding may shadow an earlier one and the
@@ -867,7 +877,7 @@
                           (compile-expression state environment value-form)]
                       (when-not (= type value-type)
                         (throw (ex-info (str "let binding " name " is declared as " type
-                                             " but its value is " value-type)
+                                             " but its value is " (type-name value-type))
                                         {:name name :type type :value-type value-type})))
                       (let [alloca (llvm/hoisted-alloca
                                     (:builder state) (:context state) (:arena state)
@@ -901,7 +911,7 @@
         (let [[state value value-type] (compile-expression state environment value-form)]
           (when-not (= (:type local) value-type)
             (throw (ex-info (str "Cannot set " name " of type " (:type local)
-                                 " to a value of type " value-type)
+                                 " to a value of type " (type-name value-type))
                             {:name name :type (:type local) :value-type value-type})))
           (llvm/build-store (:builder state) value (:value local))
           [state nil nil]))
@@ -910,7 +920,7 @@
               [state value value-type] (compile-expression state environment value-form)]
           (when-not (= global-type value-type)
             (throw (ex-info (str "Cannot set global " name " of type " global-type
-                                 " to a value of type " value-type)
+                                 " to a value of type " (type-name value-type))
                             {:name name :type global-type :value-type value-type})))
           (compile-global-store state name value))
         (throw (ex-info (str "Cannot set unknown local or global: " name)
@@ -984,28 +994,178 @@
                    (llvm/build-icmp builder operator (first values) (second values) arena))]
       [state result :boolean])))
 
+(defn- compile-boolean-condition
+  "Compiles a branching form's condition and checks that it is a :boolean."
+  [state environment condition-form form-name]
+  (let [[state value type] (compile-expression state environment condition-form)]
+    (when-not (= :boolean type)
+      (throw (ex-info (str form-name " condition must be a :boolean, got " type)
+                      {:form form-name :type type})))
+    [state value]))
+
+(defn- arm-diverges?
+  "True when a branched arm ended in a terminator, such as an early return, so
+  it never falls through to the block after the branch."
+  [arm-state]
+  (llvm/block-terminated? (:current-block arm-state)))
+
+(defn- merge-branch-state
+  "The emitter state after a branch, given the state before it and the states
+  the arms were compiled into.
+
+  The arms are compiled as separate continuations, so the bookkeeping that
+  accumulates while emitting has to be unioned instead of taken from one arm.
+  The callees and globals a body references decide which namespaces and storage
+  modules an AOT link includes, so a callee called only inside an arm would
+  otherwise be dropped. The string counter is advanced to the highest value the
+  arms reached, so a literal after the branch does not reuse an arm's index.
+  Two arms can still mint the same index, which is harmless: the names are
+  private constants and LLVM renames the second one."
+  [state arm-states]
+  (reduce (fn [state arm-state]
+            (-> state
+                (update :callees merge (:callees arm-state))
+                (update :globals into (:globals arm-state))
+                (update :string-counter max (:string-counter arm-state))))
+          state
+          arm-states))
+
+(defn- branch-result-type
+  "The type a branched form produces, given the two arm types and whether each
+  arm diverges. A diverging arm is compatible with any type because it never
+  reaches the join block. Two value arms must agree, and mixing a value arm
+  with a statement arm is an error."
+  [form-name then-type else-type then-diverges? else-diverges?]
+  (cond
+    (and then-diverges? else-diverges?) nil
+    then-diverges? else-type
+    else-diverges? then-type
+    (= then-type else-type) then-type
+    :else
+    (throw (ex-info (str form-name " arms must both produce a value of the"
+                         " same type, or both be statements; got "
+                         (or then-type "no value") " and "
+                         (or else-type "no value"))
+                    {:form form-name
+                     :then-type then-type
+                     :else-type else-type}))))
+
 (defn- compile-if
-  "Compiles (if condition then else) with an llvm.select instruction, so it
-  is a value-producing expression. Both branches are compiled as values of
-  the same type and select evaluates both operands, so the branches must be
-  pure expressions without side effects."
+  "Compiles (if condition then else) as a real branch, with Clojure's
+  semantics: only the taken arm runs, so either arm may have side effects.
+
+  When both arms produce a value of the same type the form produces that value,
+  merged with a phi node in the join block. When neither arm produces a value
+  the form is a statement. Mixing the two is an error.
+
+  An arm that ends in a terminator, such as an early return, never reaches the
+  join block. It contributes no incoming phi value, and its type is compatible
+  with the other arm's. If both arms terminate, the whole form diverges and the
+  join block is marked unreachable."
   [state environment expression]
   (when-not (= 4 (count expression))
     (throw (ex-info "if expects (if condition then else)" {:expression expression})))
   (let [[condition-form then-form else-form] (rest expression)
-        [state condition-value condition-type]
-        (compile-expression state environment condition-form)]
-    (when-not (= :boolean condition-type)
-      (throw (ex-info (str "if condition must be a comparison, got " condition-type)
-                      {:type condition-type})))
-    (let [[state then-value then-type] (compile-expression state environment then-form)
-          [state else-value else-type] (compile-expression state environment else-form)]
-      (when-not (= then-type else-type)
-        (throw (ex-info (str "if branches must have the same type, got " then-type " and " else-type)
-                        {:then-type then-type :else-type else-type})))
-      (let [result (llvm/build-select (:builder state) condition-value
-                                      then-value else-value (:arena state))]
-        [state result then-type]))))
+        [state condition-value]
+        (compile-boolean-condition state environment condition-form "if")
+        {:keys [context function builder arena]} state
+        then-block (llvm/new-block context arena "if.then")
+        else-block (llvm/new-block context arena "if.else")
+        join-block (llvm/new-block context arena "if.join")]
+    (llvm/append-block function then-block)
+    (llvm/append-block function else-block)
+    (llvm/append-block function join-block)
+    (llvm/build-cond-br builder condition-value then-block else-block)
+    (llvm/position-at-end builder then-block)
+    (let [[then-state then-value then-type]
+          (compile-expression (assoc state :current-block then-block) environment then-form)
+          _ (llvm/position-at-end builder else-block)
+          [else-state else-value else-type]
+          (compile-expression (assoc state :current-block else-block) environment else-form)
+          then-diverges? (arm-diverges? then-state)
+          else-diverges? (arm-diverges? else-state)
+          result-type (branch-result-type "if" then-type else-type
+                                          then-diverges? else-diverges?)
+          join-state (-> (merge-branch-state state [then-state else-state])
+                         (assoc :current-block join-block
+                                :terminated? false))]
+      (cond
+        (and then-diverges? else-diverges?)
+        (do
+          ;; Neither arm reaches the join block. A block still has to end in a
+          ;; terminator, so mark the join unreachable and make the form
+          ;; diverge. This is the shape (if c (return 1) (return 2)).
+          (llvm/position-at-end builder join-block)
+          (llvm/build-unreachable builder)
+          [(assoc join-state :terminated? true :result-value nil :return-type nil)
+           nil nil])
+
+        else-diverges?
+        (do
+          ;; Only the then arm falls through, so the join has one predecessor
+          ;; and its value can be used directly: dominance already guarantees
+          ;; this arm ran.
+          (llvm/position-at-end builder (:current-block then-state))
+          (llvm/build-br builder join-block)
+          (llvm/position-at-end builder join-block)
+          [join-state then-value result-type])
+
+        then-diverges?
+        (do
+          (llvm/position-at-end builder (:current-block else-state))
+          (llvm/build-br builder join-block)
+          (llvm/position-at-end builder join-block)
+          [join-state else-value result-type])
+
+        :else
+        (do
+          ;; Branch from each arm's own final block: a nested branching form
+          ;; inside an arm may have moved the builder past its first block.
+          (llvm/position-at-end builder (:current-block else-state))
+          (llvm/build-br builder join-block)
+          (llvm/position-at-end builder (:current-block then-state))
+          (llvm/build-br builder join-block)
+          (llvm/position-at-end builder join-block)
+          (if result-type
+            (let [phi (llvm/build-phi builder (llvm/type-for context result-type) arena)]
+              (llvm/add-incoming phi arena [then-value else-value]
+                                 [(:current-block then-state) (:current-block else-state)])
+              [join-state phi result-type])
+            [join-state nil nil]))))))
+
+(defn- compile-when
+  "Compiles (when condition body...) as a real branch with no else arm: the
+  body runs only when the condition is true, and only then.
+
+  Unlike Clojure's when, the form produces no value. Clodin has no nil value to
+  return when the condition is false, so use if when a value is needed."
+  [state environment expression]
+  (let [condition-form (second expression)
+        body-forms (drop 2 expression)]
+    ;; Check arity, not truthiness: the literal condition false is valid.
+    (when (< (count expression) 2)
+      (throw (ex-info "when expects a condition" {:expression expression})))
+    (let [[state condition-value]
+          (compile-boolean-condition state environment condition-form "when")
+          {:keys [context function builder arena]} state
+          body-block (llvm/new-block context arena "when.body")
+          join-block (llvm/new-block context arena "when.end")]
+      (llvm/append-block function body-block)
+      (llvm/append-block function join-block)
+      (llvm/build-cond-br builder condition-value body-block join-block)
+      (llvm/position-at-end builder body-block)
+      (let [body-state (compile-body (assoc state :current-block body-block)
+                                     environment body-forms)]
+        (when-not (arm-diverges? body-state)
+          (llvm/position-at-end builder (:current-block body-state))
+          (llvm/build-br builder join-block))
+        (llvm/position-at-end builder join-block)
+        [(-> (merge-branch-state state [body-state])
+             (assoc :current-block join-block
+                    :terminated? false
+                    :result-value nil
+                    :return-type nil))
+         nil nil]))))
 
 (defn- compile-while
   "Compiles (while condition body...) into a condition block, a body block
@@ -1013,7 +1173,8 @@
   [state environment expression]
   (let [condition-form (second expression)
         body-forms (drop 2 expression)]
-    (when-not condition-form
+    ;; Check arity, not truthiness: the literal condition false is valid.
+    (when (< (count expression) 2)
       (throw (ex-info "while expects a condition" {:expression expression})))
     (let [{:keys [context function builder arena] :as state} state
           condition-block (llvm/new-block context arena "while.cond")
@@ -1075,6 +1236,7 @@
         (= operator 'print) (compile-print state environment expression false)
         (= operator 'println) (compile-print state environment expression true)
         (= operator 'if) (compile-if state environment expression)
+        (= operator 'when) (compile-when state environment expression)
         (= operator 'while) (compile-while state environment expression)
         :else (compile-call state environment operator (rest expression))))
     :else (throw (ex-info (str "Unsupported clodin expression: " expression)
@@ -1087,9 +1249,14 @@
   result value nil."
   [state environment body-forms]
   (reduce (fn [state body-form]
-            (let [[state value type] (compile-expression state environment body-form)]
-              (assoc state :result-value value :return-type type)))
-          (assoc state :result-value nil :return-type nil)
+            ;; Once a form has terminated the block, later forms are
+            ;; unreachable and must not append to it. Early return relies on
+            ;; this; a branch whose arms both terminate also sets the flag.
+            (if (:terminated? state)
+              state
+              (let [[state value type] (compile-expression state environment body-form)]
+                (assoc state :result-value value :return-type type))))
+          (assoc state :result-value nil :return-type nil :terminated? false)
           body-forms))
 
 (defn- expression-type
@@ -1130,6 +1297,7 @@
           (= operator 'set) nil
           (#{'print 'println} operator) nil
           (= operator 'if) (expression-type environment (nth expression 2))
+          (= operator 'when) nil
           (= operator 'while) nil
           :else (let [procedure (get @procedure-registry (str operator))
                       external (get @external-registry (str operator))]
@@ -1168,7 +1336,8 @@
             state (compile-body state environment body-forms)
             result-value (:result-value state)
             effective-return-type (or return-type (:return-type state))]
-        (when (and effective-return-type return-type result-value
+        (when (and (not (:terminated? state))
+                   effective-return-type return-type result-value
                    (not= return-type (:return-type state)))
           (throw (ex-info (str "Procedure " name " declares return type "
                                return-type " but its body produces "
@@ -1177,12 +1346,15 @@
                            :return-type return-type
                            :body-type (:return-type state)
                            :ast body-forms})))
-        (if effective-return-type
-          (do (when-not result-value
-                (throw (ex-info (str "Procedure " name " has no value to return")
-                                {:procedure name :return-type effective-return-type})))
-              (llvm/build-ret builder result-value))
-          (llvm/build-ret-void builder))
+        ;; A terminated body already ended every path in a terminator, so there
+        ;; is nothing left to return from.
+        (when-not (:terminated? state)
+          (if effective-return-type
+            (do (when-not result-value
+                  (throw (ex-info (str "Procedure " name " has no value to return")
+                                  {:procedure name :return-type effective-return-type})))
+                (llvm/build-ret builder result-value))
+            (llvm/build-ret-void builder)))
         (llvm/dispose-builder builder)
         (llvm/verify module arena)
         (let [bitcode (llvm/write-bitcode module)]
@@ -2557,6 +2729,58 @@
 (defproc if-choose [a :i64 b :i64]
   (if (< a b) a b))
 
+;; if branches for real, so an arm may have a side effect.
+(defproc if-store [pointer :ptr flag :boolean]
+  (if flag
+    (store :i64 pointer 1)
+    (store :i64 pointer 2)))
+
+;; Only the taken arm runs, so the untaken arm cannot touch the local.
+(defproc if-arms-are-exclusive [flag :boolean]
+  (let [turns :i64 0]
+    (if flag
+      (set turns (+ turns 1))
+      (set turns (+ turns 10)))
+    turns))
+
+(defproc if-nested [a :i64 b :i64] :i64
+  (if (< a b)
+    (if (= a 0) 100 200)
+    300))
+
+(defproc if-inside-loop [limit :i64] :i64
+  (let [sum :i64 0
+        index :i64 0]
+    (while (< index limit)
+      (set sum (+ sum (if (= index 0) 10 1)))
+      (set index (+ index 1)))
+    sum))
+
+(defproc when-store [pointer :ptr flag :boolean]
+  (store :i64 pointer 0)
+  (when flag
+    (store :i64 pointer 7))
+  (load :i64 pointer))
+
+(defproc when-runs-one-side-effect [flag :boolean]
+  (let [turns :i64 0]
+    (when flag
+      (set turns (+ turns 5)))
+    turns))
+
+;; A literal false condition must compile, not be mistaken for a missing one.
+(defproc when-literal-false []
+  (let [turns :i64 0]
+    (when false
+      (set turns (+ turns 5)))
+    turns))
+
+(defproc while-literal-false []
+  (let [turns :i64 0]
+    (while false
+      (set turns (+ turns 5)))
+    turns))
+
 (defproc choice-abs [x :f64]
   (if (< x 0.0) (abs x) x))
 
@@ -2570,10 +2794,80 @@
   (to-f32 x))
 
 (deftest test-if
-  (is (= 2 (if-choose 2 5)))
-  (is (= 2 (if-choose 5 2)))
-  (is (= 3.0 (choice-abs -3.0)))
-  (is (= 3.0 (choice-abs 3.0))))
+  (testing "a value if produces the taken arm's value"
+    (is (= 2 (if-choose 2 5)))
+    (is (= 2 (if-choose 5 2)))
+    (is (= 3.0 (choice-abs -3.0)))
+    (is (= 3.0 (choice-abs 3.0))))
+
+  (testing "a statement if runs exactly one arm"
+    (let [arena (Arena/ofShared)
+          buffer (.allocate arena 8)]
+      (try
+        (if-store buffer true)
+        (is (= 1 (.get buffer ValueLayout/JAVA_LONG 0)))
+        (if-store buffer false)
+        (is (= 2 (.get buffer ValueLayout/JAVA_LONG 0)))
+        (finally
+          (.close arena)))))
+
+  (testing "the untaken arm does not run"
+    (is (= 1 (if-arms-are-exclusive true)))
+    (is (= 10 (if-arms-are-exclusive false))))
+
+  (testing "nested and loop-hosted ifs"
+    (is (= 100 (if-nested 0 5)))
+    (is (= 200 (if-nested 1 5)))
+    (is (= 300 (if-nested 9 5)))
+    (is (= 12 (if-inside-loop 3)))))
+
+(deftest test-branch-bookkeeping
+  (testing "a callee referenced only inside a branch is still recorded"
+    (define-proc! "clodin.compiler" "branch-test-leaf" [] [] [5] nil false)
+    (define-proc! "clodin.compiler" "branch-test-caller" ['flag] [:boolean]
+                  '[(if flag (branch-test-leaf) 1)] :i64 false)
+    (is (contains? (:callees (get @procedure-registry "branch-test-caller"))
+                   "branch-test-leaf")))
+
+  (testing "a global referenced only inside a branch is still recorded"
+    (define-proc! "clodin.compiler" "branch-test-global-reader" ['flag] [:boolean]
+                  '[(if flag globals-test-counter 0)] :i64 false)
+    (is (contains? (:globals (get @procedure-registry "branch-test-global-reader"))
+                   "globals-test-counter"))))
+
+(deftest test-if-value-uses-a-phi
+  (testing "the join block merges both arms with a phi node"
+    (let [ir (requiring-resolve 'clodin.inspect/llvm-ir)]
+      (is (string/includes? (ir "if-choose") "phi i64")))))
+
+(deftest test-if-arm-mismatch
+  (testing "mixing a value arm with a statement arm is a clear error"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"arms must both produce a value of the same type"
+         (define-proc! "clodin.compiler" "if-arm-mismatch" ['pointer] [:ptr]
+                       '[(if true 1 (store :i64 pointer 0))] :i64 false)))))
+
+(deftest test-when
+  (testing "when runs its body only when the condition is true"
+    (let [arena (Arena/ofShared)
+          buffer (.allocate arena 8)]
+      (try
+        (is (= 7 (when-store buffer true)))
+        (is (= 0 (when-store buffer false)))
+        (finally
+          (.close arena)))))
+
+  (testing "a literal false condition is a condition, not a missing one"
+    (is (= 0 (when-literal-false)))
+    (is (= 0 (while-literal-false))))
+
+  (testing "when has no value, so it cannot be used where one is needed"
+    (is (= 5 (when-runs-one-side-effect true)))
+    (is (= 0 (when-runs-one-side-effect false)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (define-proc! "clodin.compiler" "when-as-value" [] []
+                               '[(let [value :i64 (when true 1)] value)] :i64 false)))))
 
 (deftest test-to-f32
   (is (= 2.5 (halve-f32 5.0)))

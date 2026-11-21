@@ -438,6 +438,41 @@
   ^MemorySegment [^MemorySegment builder]
   (LLVM/LLVMBuildUnreachable builder))
 
+(defn block-terminator
+  "The terminating instruction of a basic block, or nil when the block has no
+  terminator yet. A block must end in exactly one terminator, so anything that
+  appends to a block has to check this first."
+  ^MemorySegment [^MemorySegment block]
+  (LLVM/LLVMGetBasicBlockTerminator block))
+
+(defn block-terminated?
+  "True when the basic block already ends in a terminator, such as ret, br or
+  unreachable. A branched arm that returns early is terminated, so the code
+  joining the arms must not append another branch to it."
+  [^MemorySegment block]
+  (not (null? (block-terminator block))))
+
+(defn build-phi
+  "Builds a phi node of the given LLVM type. A phi must be the first
+  instruction of its block, so the block has to be empty when this is called."
+  ^MemorySegment [^MemorySegment builder ^MemorySegment value-type ^Arena arena]
+  (LLVM/LLVMBuildPhi builder value-type (name-token builder arena "")))
+
+(defn add-incoming
+  "Adds one incoming value and its predecessor block to a phi node. Values and
+  blocks are parallel sequences: the value at index i arrives from the block at
+  index i."
+  [^MemorySegment phi ^Arena arena values blocks]
+  (when-not (= (count values) (count blocks))
+    (throw (ex-info "Phi incoming values and blocks must have the same length"
+                    {:values (count values) :blocks (count blocks)})))
+  (when (pos? (count values))
+    (LLVM/LLVMAddIncoming phi
+                          (pointer-array arena values)
+                          (pointer-array arena blocks)
+                          (int (count values))))
+  phi)
+
 (defn position-at-end
   [^MemorySegment builder ^MemorySegment block]
   (LLVM/LLVMPositionBuilderAtEnd builder block))
