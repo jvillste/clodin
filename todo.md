@@ -671,6 +671,78 @@ Acceptance: `clodin$write$bytes`, `clodin$print$bool` and
 the current runtime; `(if condition (store ...) (store ...))` works; a plain
 value `if` still compiles to a single value; existing tests pass.
 
+#### Early termination stays out of scope
+
+Phase 1 deliberately does not add `return`, `break`, `continue` or labelled
+loops. None of them is needed for the runtime port, and Clojure has no early
+termination, so there is no habit to preserve. The terminator guard described
+under "Branching `if` options" is specified now precisely so that they can be
+added later without revisiting `if`.
+
+For the record, what the two reference languages provide:
+
+- Odin: `return`, `break [label]`, `continue [label]`, `fallthrough`,
+  `defer`, `errdefer`, `or_return`, `#must_tail`, `panic`, `#panic`,
+  `unreachable()` (a `-> !` procedure), and the per-procedure attributes
+  `#no_bounds_check` / `#bounds_check`. See `odin.ebnf` ("Branch & Defer":
+  `BranchStmt = "break" [ IDENT ] | "continue" [ IDENT ] | "fallthrough"`) and
+  `base/builtin/builtin.odin`, which declares `unreachable :: proc() -> !`.
+- Zig: `return`, `break :label value`, `continue :label`, labelled blocks and
+  loops, `while` with a continue expression and an `else` clause, `defer`,
+  `errdefer`, `try`/`catch`/`orelse`, `unreachable`, the `noreturn` type, and
+  `@panic`/`@trap`/`@compileError`, all of which return `noreturn`. See
+  `doc/langref.html.in` ("noreturn" lists `break`, `continue`, `return`,
+  `unreachable` and `while (true) {}` as its values) and
+  `doc/langref/test_labeled_break.zig`.
+
+Neither language has `goto`.
+
+#### Is early termination needed for peak performance?
+
+In two specific shapes, neither of which is reachable in clodin yet. A third
+shape, searching for a match, was claimed here earlier and is corrected below.
+
+1. Hand-unrolled or vectorized scans: the correction case. Both standard
+   libraries implement "find the first match" as a per-block SIMD compare:
+   Odin's `bytes.index_byte` (`core/bytes/bytes.odin`) does `return i + ...`
+   from inside the block loop after `simd.reduce_or`, and Zig's
+   `mem.findScalarPos` (`lib/std/mem.zig`) does
+   `return i + std.simd.firstTrue(matches).?` inside `while (true)`.
+
+   This was claimed here earlier as an early-termination win. It is not.
+   Measured:
+
+   - clodin's `find-i64`, written with a `found` flag because there is no
+     `return`, compiles at `:O3` to `ldr / cmp / b.eq` with no stack traffic:
+     LLVM turns the flag test into a direct loop exit, so the flag costs one
+     `add` and nothing more.
+   - GCC 15.2 vectorizes a search loop *with* the early exit, and does it for
+     both spellings: `find_return` and the flag equivalent both contain
+     `cmeq v31.2d, v31.2d, v29.2d` + `umaxp` + `cbz`. So "the vectorizer
+     refuses an exit in the middle" is an LLVM 21 limitation, not a law.
+   - LLVM 21 does not vectorize either spelling: clodin's `find-i64` has 0
+     vector operations. That is what the explicit SIMD rewrite fixes, and it
+     fixes it regardless of how the exit is spelled.
+
+   So for a search loop, early termination is ergonomics, not performance. It
+   saves one live variable and the two-`set` flag dance, and that is the whole
+   argument.
+2. Assertions that remove checks rather than control flow: Odin's
+   `#no_bounds_check` and Zig's `unreachable`/`@setRuntimeSafety(false)`.
+   These are the same family as the terminator guard in that they let the
+   optimizer assume a branch is impossible.
+3. Guaranteed tail calls. Odin's `#must_tail` lowers to LLVM
+   `musttail` (`src/llvm_backend_proc.cpp`), which is a stronger guarantee
+   than a `while` loop gives for mutual recursion and is load bearing in
+   interpreter dispatch loops. A clodin `while` state machine covers the
+   same ground for now.
+
+For ordinary scalar code the optimizer normalizes `if (c) return a; ...` into
+the same control flow as a flag-based loop, and LLVM handles multi-exit loops
+fine. So early termination is ergonomics, plus the two assertion and tail call
+shapes above. It is not a prerequisite for the vectorized search and it is not
+a prerequisite for the SIMD design under "Vectorization".
+
 ### Phase 2: stack scratch buffer
 
 A form that yields a `:ptr` to an uninitialised stack block of a given byte
@@ -794,6 +866,90 @@ in Clojure, gives the runtime everything it needs from one form, and avoids new
 LLVM API surface. If the extra load and store at `:none` measurement matters
 later, switching the value case to a phi is a local change behind the same
 surface form.
+
+## Vectorization
+
+No action needed. Measured on linux-aarch64 with LLVM 21 at `:O3`:
+
+- `sum-i64` (a `while` over `(load :i64 (pointer-add ...))` into a `let`
+  accumulator) vectorizes without help: `movi v0.2d` / `movi v1.2d`, two
+  128-bit accumulators, `ldp q2, q3, [x8, #-16]`, `add v0.2d, v2.2d, v0.2d`,
+  two-way unrolled, with a scalar tail and a final `addp d0, v0.2d`.
+- `scale-f64` (two independent pointers) also vectorizes. Because the pointers
+  could alias, LLVM emits its own runtime guard, `sub x9, x0, x1; cmp x9, #32;
+  b.lo <scalar>`, and vectorizes the non-overlapping path.
+
+So the optimizer already has what it needs: `optimize-module!` runs
+`default<O3>` through `LLVMRunPasses` with a host `TargetMachine`, which is what
+supplies the vector width and cost model.
+
+The one thing that blocks it is reading a global inside a hot loop. An atomic
+acquire load may not be hoisted or reordered, and a loop containing one is not
+vectorizable:
+
+- `scale-loop-live`, multiplying by an `f64` global each iteration: 0 vector
+  operations, one `ldar` per iteration.
+- `scale-loop-hoisted`, copying the global into a `let` first: 2 vector
+  operations, one `ldar` before the loop.
+
+Guidance for now: hoist a global into a `let` before a hot loop. That is the
+ordinary loop-invariant move and it costs no language feature.
+
+There is a second asymmetry, and it is semantic rather than structural. Integer
+reduction vectorizes; float reduction does not:
+
+| procedure | vector ops at `:O3` |
+| --- | --- |
+| `sum-array-i64` | 3 |
+| `sum-buffer-f64` | 0 |
+
+Integer addition is associative, so the vectorizer may reorder it freely. Float
+addition is not, and `optimize-module!` deliberately keeps IEEE semantics
+("the pipeline only optimizes, never changes IEEE floating point results"), so
+there is no fast-math permission to reassociate. Summing `f64` therefore stays
+scalar. The portable workaround is manual instruction level parallelism: four
+independent `let` accumulators over a four-way unrolled loop, which the SLP
+vectorizer can often pack and which at worst still overlaps the add latency.
+
+### Deferred
+
+- [ ] A `noalias` marker for pointer parameters.
+  Removes LLVM's runtime alias guard on two-pointer loops. A small, opt-in win;
+  it is an assertion the caller must keep, so it belongs behind an explicit
+  marker rather than being the default.
+
+- [ ] Explicit SIMD.
+  Vector types are a library-level feature, not compiler assistance, and they
+  earn their keep in five shapes the auto-vectorizer will not cover:
+
+  1. No loop at all. Zig's `acosBinary32Vec` is a branch-free polynomial over a
+     vector, and the scalar `acos` simply calls it with one lane, so a caller
+     can evaluate eight `acos` values with one dependency chain.
+  2. Semantics barriers. The `f64` reduction above: LLVM may only reassociate
+     when the language grants permission, so a library that wants a vector
+     reduction must ask for it explicitly.
+  3. Loops with data dependent exits, such as `find first match`
+     (`core/bytes/bytes.odin`, `lib/std/mem.zig`).
+  4. Operations with no scalar counterpart: horizontal reductions
+     (`simd.reduce_or`, `simd.reduce_min`, `std.simd.firstTrue`), lane-mask
+     `select`, unaligned vector loads, pack/unpack and byte shuffles. Crypto
+     rounds are the clearest case (`core/crypto/_chacha20/simd128`,
+     `lib/std/crypto/ghash_polyval.zig`).
+  5. Width and feature policy chosen by the library, not the cost model.
+     `std.simd.suggestVectorLength` and Odin's
+     `when ODIN_ARCH == .amd64 && intrinsics.has_target_feature("avx2")` pick
+     the width; `core/bytes/bytes.odin` explains skipping AVX512 because of
+     downclocking, which no compiler will decide for you.
+
+  Even so it is a scalpel: about 41 files in Zig's `lib/std` and 26 in Odin's
+  `core` use it, concentrated in math, crypto, `mem` and strings. clodin has no
+  workload that needs it yet; audio DSP would be the first real candidate.
+
+- [ ] A non-atomic global variant.
+  Atomic access is the right default, but it forbids the optimizations above.
+  A `^:relaxed` (or single-threaded) global would let a hot loop read a global
+  directly. Measure before adding: the `let` hoist already covers the common
+  case.
 
 ## Unimplemented speedups
 
