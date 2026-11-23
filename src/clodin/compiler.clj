@@ -847,6 +847,85 @@
                                       (:arena state) nil)]
       [state result :ptr])))
 
+(def ^:private maximum-stack-alignment
+  "The largest stack-allocate alignment in bytes. LLVM allows up to 2^32, but
+  LLVMSetAlignment takes the alignment as a 32 bit unsigned integer and no real
+  stack block needs more than this."
+  65536)
+
+(defn- stack-allocate-literal
+  "Returns one compile time argument of stack-allocate as a long. The block is
+  a single alloca, so neither its size nor its alignment may depend on a runtime
+  value, and both must fit in a long."
+  [argument-name form]
+  (if (and (integer? form) (<= 0 form Long/MAX_VALUE))
+    (long form)
+    (throw (ex-info (str "stack-allocate expects a literal non-negative integer "
+                         argument-name ", got " (pr-str form))
+                    {:argument argument-name :value form}))))
+
+(deftest test-stack-allocate-literal
+  (testing "integer literals are accepted"
+    (is (= 32 (stack-allocate-literal "byte-count" 32)))
+    (is (= 0 (stack-allocate-literal "alignment" 0))))
+  (testing "a runtime value or a non-integer is rejected"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"literal non-negative integer byte-count"
+                          (stack-allocate-literal "byte-count" 'byte-count)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (stack-allocate-literal "byte-count" -8)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (stack-allocate-literal "alignment" 1.5)))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (stack-allocate-literal "byte-count" 18446744073709551616N)))))
+
+(defn- power-of-two?
+  "True when value is a positive power of two, which is what LLVM accepts as an
+  alloca alignment."
+  [value]
+  (and (pos? value) (zero? (bit-and value (dec value)))))
+
+(deftest test-power-of-two
+  (is (every? power-of-two? [1 2 4 8 16 32 1024]))
+  (is (not-any? power-of-two? [0 3 6 12 24 -16])))
+
+(defn- compile-stack-allocate
+  "Compiles (stack-allocate byte-count alignment), which reserves an
+  uninitialised block of byte-count bytes aligned to alignment bytes on the
+  stack and yields a :ptr to it. Both arguments are compile time integer
+  literals and alignment is a power of two.
+
+  The block is hoisted to the entry block, so one inside a while is the same
+  bytes on every iteration instead of growing the stack, and a loop has to
+  initialise what it reads. Each call of the procedure gets its own block, so
+  the pointer is per-call scratch that dies with the call and must not be
+  returned or stored into longer lived memory."
+  [state _environment expression]
+  (when-not (= 3 (count expression))
+    (throw (ex-info "stack-allocate expects (stack-allocate byte-count alignment)"
+                    {:expression expression})))
+  (let [[byte-count-form alignment-form] (rest expression)
+        byte-count (stack-allocate-literal "byte-count" byte-count-form)
+        alignment (stack-allocate-literal "alignment" alignment-form)]
+    (when (zero? byte-count)
+      (throw (ex-info "stack-allocate needs at least one byte"
+                      {:byte-count byte-count})))
+    (when-not (power-of-two? alignment)
+      (throw (ex-info (str "stack-allocate alignment must be a power of two, got "
+                           alignment)
+                      {:alignment alignment})))
+    (when (> alignment maximum-stack-alignment)
+      (throw (ex-info (str "stack-allocate alignment must be at most "
+                           maximum-stack-alignment ", got " alignment)
+                      {:alignment alignment})))
+    (let [context (:context state)
+          block (llvm/hoisted-alloca
+                 (:builder state) context (:arena state)
+                 (:entry-block state) (:current-block state)
+                 (llvm/array-type (llvm/i8-type context) byte-count)
+                 alignment)]
+      [state block :ptr])))
+
 (defn- type-name
   "A readable name for a clodin type. nil means the form produced no value."
   [type]
@@ -1231,6 +1310,7 @@
         (= operator 'buffer-get) (compile-buffer-get state environment expression)
         (= operator 'buffer-set) (compile-buffer-set state environment expression)
         (= operator 'to-pointer) (compile-to-pointer state environment expression)
+        (= operator 'stack-allocate) (compile-stack-allocate state environment expression)
         (= operator 'let) (compile-let state environment expression)
         (= operator 'set) (compile-set state environment expression)
         (= operator 'print) (compile-print state environment expression false)
@@ -1287,6 +1367,7 @@
           (= operator 'buffer-get) (nth expression 2)
           (= operator 'buffer-set) nil
           (= operator 'to-pointer) :ptr
+          (= operator 'stack-allocate) :ptr
           (= operator 'let)
           (let [[_ bindings & inner-body] expression
                 environment (reduce (fn [env [name declared-type _]]
@@ -2341,7 +2422,7 @@
 
 (def ^:private reserved-names
   "Names the compiler lowers itself, so a user definition would be shadowed."
-  #{"print" "println"})
+  #{"print" "println" "stack-allocate"})
 
 (defn- defvar-form
   "Parses a defvar form, registers the global through define-var! and returns
@@ -3481,6 +3562,105 @@
       (finally
         (io/delete-file file true)
         (io/delete-file output true)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Stack scratch allocation tests
+;;; ---------------------------------------------------------------------------
+
+(defproc stack-scratch-round-trip [value :i64]
+  (let [scratch :ptr (stack-allocate 8 8)]
+    (store :i64 scratch value)
+    (load :i64 scratch)))
+
+;; 5 bytes at alignment 16, so the byte count and the alignment differ. The
+;; address is handed back through caller owned memory because the block itself
+;; dies with the call.
+(defproc stack-scratch-record-address [addresses :ptr]
+  (buffer-set addresses :ptr 0 (stack-allocate 5 16)))
+
+;; A stack-allocate inside a loop is hoisted to the entry block, so it is one
+;; block reused on every iteration instead of a new one per iteration.
+(defproc stack-scratch-record-addresses [addresses :ptr count :i64]
+  (let [index :i64 0]
+    (while (< index count)
+      (buffer-set addresses :ptr index (stack-allocate 32 16))
+      (set index (+ index 1)))))
+
+;; The print helper shape: a stack block instead of malloc.
+(defproc stack-scratch-format [value :i64]
+  (let [scratch :ptr (stack-allocate 32 16)]
+    (sprintf scratch "value=%ld" value)))
+
+;; No declared return type, so the :ptr comes from expression-type. The block
+;; itself is dead once the call returns, so only its type is checked.
+(defproc stack-scratch-returned-address []
+  (stack-allocate 8 8))
+
+(deftest test-stack-allocate
+  (testing "the block is a :ptr that load and store accept"
+    (is (= 42 (stack-scratch-round-trip 42)))
+    (is (= -1 (stack-scratch-round-trip -1))))
+
+  (testing "the alloca carries the requested byte count and alignment"
+    (let [ir (requiring-resolve 'clodin.inspect/llvm-ir)]
+      (is (string/includes? (ir "stack-scratch-record-address")
+                            "alloca [5 x i8], align 16"))))
+
+  (testing "the returned address is aligned to the requested boundary"
+    (let [arena (Arena/ofShared)
+          addresses (.allocate arena 8)]
+      (try
+        (stack-scratch-record-address addresses)
+        (is (zero? (mod (.address ^MemorySegment
+                                   (.getAtIndex addresses ValueLayout/ADDRESS 0))
+                          16)))
+        (finally
+          (.close arena)))))
+
+  (testing "a stack-allocate inside a while is one block, not one per iteration"
+    (let [arena (Arena/ofShared)
+          address-count 4
+          addresses (.allocate arena (* 8 address-count))]
+      (try
+        (stack-scratch-record-addresses addresses address-count)
+        (let [collected (mapv (fn [index]
+                                (.address ^MemorySegment
+                                          (.getAtIndex addresses ValueLayout/ADDRESS index)))
+                              (range address-count))]
+          (is (apply = collected)))
+        (finally
+          (.close arena)))))
+
+  (testing "formatting into stack scratch needs no malloc"
+    (is (= 11 (stack-scratch-format 12345))))
+
+  (testing "the form has type :ptr, so it drives return type inference"
+    (is (instance? MemorySegment (stack-scratch-returned-address))))
+
+  (testing "both arguments are validated at compile time"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"at least one byte"
+                          (define-proc! "clodin.compiler" "stack-allocate-empty" [] []
+                                        '[(stack-allocate 0 16)] nil false)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"power of two"
+                          (define-proc! "clodin.compiler" "stack-allocate-odd-alignment" [] []
+                                        '[(stack-allocate 16 3)] nil false)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"literal non-negative integer byte-count"
+                          (define-proc! "clodin.compiler" "stack-allocate-runtime-size"
+                                        ['byte-count] [:i64]
+                                        '[(stack-allocate byte-count 16)] nil false)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"at most 65536"
+                          (define-proc! "clodin.compiler" "stack-allocate-huge-alignment"
+                                        [] []
+                                        '[(stack-allocate 16 131072)] nil false)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"expects .stack-allocate byte-count"
+                          (define-proc! "clodin.compiler" "stack-allocate-arity" [] []
+                                        '[(stack-allocate 16)] nil false))))
+
+  (testing "stack-allocate is a reserved name, so a procedure cannot shadow it"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"built in form"
+                          (defproc-form "clodin.compiler" 'stack-allocate []
+                                        '[(to-i32 0)])))))
 
 (defn -main
   [& _]

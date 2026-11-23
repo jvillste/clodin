@@ -638,7 +638,8 @@ of the boundary. Only the native half moves.
 2. There is no stack scratch buffer, so `snprintf` has nowhere to write. `let`
    binds one scalar into a hoisted slot; it does not give an addressable block.
    `malloc`/`free` would work but allocates per print and a shared global buffer
-   would race between threads.
+   would race between threads. Resolved by Phase 2, `(stack-allocate size
+   alignment)`.
 3. There is no indirect call, so a `:ptr` holding a function address cannot be
    invoked from clodin source.
 
@@ -759,29 +760,61 @@ fine. So early termination is ergonomics, plus the two assertion and tail call
 shapes above. It is not a prerequisite for the vectorized search and it is not
 a prerequisite for the SIMD design under "Vectorization".
 
-### Phase 2: stack scratch buffer
+### Phase 2: stack scratch buffer (done)
 
-A form that yields a `:ptr` to an uninitialised stack block of a given byte
-size, hoisted to the entry block so a loop does not grow the stack:
+A form that reserves an uninitialised stack block of a given byte size and
+alignment and yields a `:ptr` to it, hoisted to the entry block so a loop does
+not grow the stack:
 
-    (let [buffer :ptr (alloca 32)]
-      ...)
+    (let [scratch :ptr (stack-allocate 32 16)]
+      (sprintf scratch "value = %ld" value))
 
-Options:
+Decisions:
 
-- `(alloca byte-count)`: one form, yields `:ptr`, composes with `let`.
-  Alignment is the natural maximum (16) so it can hold doubles.
-- `(with-scratch [name size] body...)`: scoped and non-escaping, but adds a
-  second binding form next to `let` and is redundant with a hoisted `alloca`.
-- Odin-style buffer type with a length header: deferred to the buffer feature.
+- The form is `(stack-allocate byte-count alignment)`. Both arguments are
+  compile time integer literals, because the block is a single `alloca`:
+  neither its size nor its alignment can depend on a runtime value.
+- There is no default alignment. This is a low level feature, so the caller
+  states both numbers. `byte-count` must be at least 1, `alignment` must be a
+  power of two no greater than 65536, and both must fit in a long.
+- The name is `stack-allocate`, not `alloca`. `alloca` is the C/LLVM jargon
+  abbreviation, and C's `alloca` promises different semantics: a runtime size
+  and a fresh block per execution, so it grows the stack inside a loop. The
+  verb form also matches the existing object-first operator names
+  (`pointer-add`, `buffer-get`, `buffer-set`), where the noun names the source
+  or target and the preposition stays implicit.
+- The form names the operation and yields a plain `:ptr`, so `buffer` and
+  `array` stay free for the aggregate types. See "Next features".
+- The alloca is `[byte-count x i8]` with an explicit alignment, so the caller
+  can hold a `double` (alignment 8), a SIMD value, or nothing in particular
+  (alignment 1). LLVM only guarantees that the returned pointer is aligned to
+  at least that boundary; it does not promise the block is padded to it, so
+  writing past `byte-count` is out of bounds even when the frame pads the slot.
+- Hoisting is what makes it loop safe: one block per call, the same address on
+  every iteration. A `with-scratch` form would be redundant, and a point-of-use
+  alloca would grow the stack per iteration and need `stacksave`/`stackrestore`.
+  The flip side is that a loop reusing the block must reinitialise what it
+  reads, because the previous iteration's bytes are still there.
+- The block is uninitialised. Nothing zeroes it, matching LLVM and C.
+- The block dies with the call, so a `:ptr` returned from a procedure, stored
+  into a global, or kept past the call is dangling. Per-call scratch that has
+  to outlive the call belongs in caller-owned memory passed in as a `:ptr`.
+- Diagnostics are compile time: a non-literal, a zero byte count, a
+  non-power-of-two alignment, an alignment above 65536, and a wrong arity each
+  name the offending argument.
 
-Recommendation: `(alloca byte-count)`, hoisted to the entry block. It composes
-with `let`, needs no new binding form, and the entry-block hoist gives the
-loop-safety that `with-scratch` would otherwise have to guarantee.
+Implementation: `compile-stack-allocate` in `clodin.compiler`, plus an
+alignment argument on `llvm/hoisted-alloca`, which `let` still calls without
+one and therefore keeps the type's ABI alignment.
 
-Acceptance: the integer and float print helpers can be written as `defproc`s
-using `(alloca 32)` and `snprintf`, with no `malloc`, and a print inside a
-`while` does not grow the stack per iteration.
+Acceptance met: the integer and float print helpers can be written as
+`defproc`s using `(stack-allocate 32 16)` and `snprintf`, with no `malloc`; a
+`stack-allocate` inside a `while` compiles to one alloca in the entry block, so
+the loop stores the same address every iteration and the stack does not grow.
+At `:O3` on linux-aarch64, `stack-scratch-record-addresses` emits one
+`sub sp, sp, #0x20` and the vectorizer broadcasts that single `sp` value.
+Covered by `test-stack-allocate`, `test-stack-allocate-literal` and
+`test-power-of-two` in `clodin.compiler`.
 
 ### Phase 3: indirect call
 
@@ -1071,6 +1104,15 @@ Clodin has no runtime nil for scalar types, and that is deliberate.
 
 ## Next features
 
-- [ ] Add the Odin-style buffer/array type with a length stored in the first
-  memory slot.
+- [ ] Add an aggregate array type. `stack-allocate` names the operation and
+  yields a plain `:ptr`, so both words are still free: `array` for an
+  element-typed block and `buffer` for a region of memory. Note that the
+  earlier wording "Odin-style buffer/array with a length stored in the first
+  memory slot" is not Odin's design. Odin has fixed arrays `[N]T` (length in
+  the type), slices `[]T` (a pointer and a length passed as a fat value) and
+  dynamic arrays `[dynamic]T` (a separate `{data, len, cap, allocator}` header
+  in `base/runtime/core.odin`); `Buffer` is only a `core:bytes` struct. So
+  decide separately whether a block carries a length header at all, and
+  whether it earns its keep once the element count is a compile time
+  literal.
 - [ ] Add `for` as a macro that lowers to `let` + `while`.

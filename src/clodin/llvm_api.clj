@@ -554,22 +554,28 @@
 
 (defn hoisted-alloca
   "Builds an alloca of element-type at the front of the entry block, then restores the
-  builder to the current block and returns the alloca value; hoisting means a let inside
-  a loop does not grow the stack on every iteration."
-  [^MemorySegment builder ^MemorySegment context ^Arena arena
-   ^MemorySegment entry-block ^MemorySegment current-block ^MemorySegment element-type]
-  (let [first-instruction (first-instruction entry-block)]
-    (if (null? first-instruction)
-      (do (position-at-end builder entry-block)
-          (let [alloca (LLVM/LLVMBuildAlloca builder element-type
-                                             (name-token builder arena nil))]
-            (position-at-end builder current-block)
-            alloca))
-      (do (position-before builder first-instruction)
-          (let [alloca (LLVM/LLVMBuildAlloca builder element-type
-                                             (name-token builder arena nil))]
-            (position-at-end builder current-block)
-            alloca)))))
+  builder to the current block and returns the alloca value; hoisting means an alloca
+  inside a loop does not grow the stack on every iteration. alignment is the required
+  alignment in bytes as a power of two, or nil to keep the type's ABI alignment; LLVM
+  only guarantees that the returned pointer is aligned to at least that boundary, not
+  that the block is sized to it."
+  ([^MemorySegment builder ^MemorySegment context ^Arena arena
+    ^MemorySegment entry-block ^MemorySegment current-block
+    ^MemorySegment element-type]
+   (hoisted-alloca builder context arena entry-block current-block element-type nil))
+  ([^MemorySegment builder ^MemorySegment context ^Arena arena
+    ^MemorySegment entry-block ^MemorySegment current-block
+    ^MemorySegment element-type alignment]
+   (let [first-instruction (first-instruction entry-block)]
+     (if (null? first-instruction)
+       (position-at-end builder entry-block)
+       (position-before builder first-instruction))
+     (let [alloca (LLVM/LLVMBuildAlloca builder element-type
+                                        (name-token builder arena nil))]
+       (when alignment
+         (set-alignment alloca (long alignment)))
+       (position-at-end builder current-block)
+       alloca))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Serialisation : module -> bitcode
