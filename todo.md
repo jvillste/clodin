@@ -897,45 +897,28 @@ resolved C symbols only. See "Next features".
 - Delete `runtime-module`, the `build-*` helpers and the `install-runtime!`
   module plumbing. `clodin.print` keeps only the upcall stub and the writer.
 
-Phases 1 to 3 unblock both functions, but they are not writable in the
-obvious shape. The natural spelling is rejected, because one arm produces a
-value and the other does not:
+Both functions are now writable in the obvious shape, because statement
+position and `:void` landed:
 
-    (if (is-null clodin-write)
-      (write (to-i32 1) data length)                  ; :i64
-      (pointer-call clodin-write [:ptr :i64] :void data length))   ; no value
+    (defproc write-bytes [data :ptr length :i64] :void
+      (if (is-null clodin-write)
+        (write (to-i32 1) data length)
+        (pointer-call clodin-write [:ptr :i64] :void data length)))
 
-    ;; if arms must both produce a value of the same type, or both be
-    ;; statements; got :i64 and no value
+    (defproc print-i64 [value :i64] :void
+      (let [scratch :ptr (stack-allocate 32 16)]
+        (snprintf scratch 32 "%ld" value)
+        (print-bytes scratch (strlen scratch))))
 
-Two shapes do compile, and choosing between them (or adding a form) is the
-first Phase 4 decision:
+Two smaller gaps remain, neither blocking:
 
-1. Two complementary `when`s. `when` discards its body's value, so no dummy
-   binding is needed, at the cost of testing the pointer twice and spelling the
-   negation as `(= ... false)` because there is no `not`:
-
-       (when (is-null clodin-write)
-         (write (to-i32 1) data length))
-       (when (= (is-null clodin-write) false)
-         (pointer-call clodin-write [:ptr :i64] :void data length))
-
-2. A `let`-bound dummy, so both arms are statements:
-
-       (let [ignored :i64 0]
-         (if (is-null clodin-write)
-           (set ignored (write (to-i32 1) data length))
-           (pointer-call clodin-write [:ptr :i64] :void data length)))
-
-Neither belongs in a runtime, so the real gap to close is: there is no way to
-discard a value in one arm of a branching form. The options are a statement
-wrapper such as `(discard form...)`, a `not` (and so a `when-not`), or relaxing
-`if` so a value arm is dropped when the other arm is a statement. Note that
-`(write (to-i32 1) ...)` is needed because a Clojure integer literal is `:i64`
-and `write` takes an `:i32` descriptor.
-
-The rest of the shape is plain: a `:ptr` scratch block from `stack-allocate`,
-`snprintf`, and `strlen` over it.
+- `(write (to-i32 1) ...)` is needed because a Clojure integer literal is
+  `:i64` and `write` takes an `:i32`. An integer literal that adapts to the
+  parameter type would remove the cast; that is a typing change, not a
+  runtime one.
+- `snprintf` returns the length it *would* have written, so a truncated format
+  would make `print-bytes` read past the scratch block. `%ld` and `%g` cannot
+  reach 32 bytes, but the port should clamp: `(min length (to-i64 32))`.
 
 Acceptance: `(println ...)` from a procedure, from `with-out-str`, from a
 `future`, and from a standalone binary all work with no runtime module built by
@@ -999,8 +982,61 @@ the arms' values are combined and in how the surface form is split.
 
 Decision: **D, with the phi plumbing from B.** `if` means what it means in
 Clojure, and the value case uses a phi so there is no stack slot per value
-branch. `nil` arm types mean "statement", and mixing a value arm with a
-statement arm is an error. `when` was added as a statement branch.
+branch. `nil` arm types mean "statement". `when` was added as a statement
+branch.
+
+### Statement position and `:void` (done)
+
+Amends the rule above: mixing a value arm with a statement arm is an error **in
+value position only**. In statement position both arms are compiled as
+statements, so their values are discarded and the arms need not agree in type.
+That is what the print runtime needs, because `write` returns `:i64` while
+`clodin$write$bytes` returns nothing:
+
+    (defproc write-bytes [data :ptr length :i64] :void
+      (if (is-null clodin-write)
+        (write (to-i32 1) data length)
+        (pointer-call clodin-write [:ptr :i64] :void data length)))
+
+Decisions:
+
+- A form is in statement position when its value is discarded. That is every
+  body form but the last, the body of `when` and `while`, the body of a `let`
+  in statement position, and the body of a procedure declared `:void`.
+- Statement position propagates only through the forms that forward their
+  value: `if` (both arms) and `let` (its last body form). Everything else is
+  compiled in value position and its value dropped, so `set`, `store`, a `let`
+  initializer, a call argument and a `print` operand always need a value.
+- The two arms need not agree in type in statement position. Each arm is run
+  for its side effects, and the return value that is useful in one case need
+  not be the same as in another. No phi is built and the form produces no
+  value.
+- `:void` is a declarable return type: `(defproc f [...] :void body...)`. It is
+  stored as `:explicit-return-type :void` with `:return-type nil`, so the ABI,
+  the stub, the downcall descriptor and AOT all see a void procedure while the
+  declaration stays visible. `settle-signatures!` already skips any entry with
+  an explicit return type, so a declared void procedure is never re-inferred.
+- Declaring `:void` makes the body a statement, so a value the last form
+  produces is discarded. That is the same rule as a non-final body form, and it
+  is what lets one arm return `:i64` and the other return nothing.
+- Without a declaration the return type is still inferred from the last form,
+  so a procedure whose last form is a statement `if` must declare `:void`;
+  otherwise inference reads the taken arm's type and codegen then fails with
+  "has no value to return".
+- `:void` is rejected as a parameter type.
+
+Implementation: `compile-statement` is a separate entry point next to
+`compile-expression`, so value position is the default and no flag is threaded
+through the emitter state. `compile-body`, `compile-if` and `compile-let` take
+an explicit `value-needed?` argument, and the six call sites that discard a
+value choose it there: `build-procedure!` (false when `:void` was declared),
+`compile-let` (inherited), `compile-if` arms (true), statement `if` arms
+(false), `compile-when` (false) and `compile-while` (false). Because the flag
+never enters the state, no subexpression can inherit it, which is why no
+value-consuming site needs to reset anything.
+
+Covered by `test-statement-position` and `test-void-return-type` in
+`clodin.compiler`.
 
 ## Vectorization
 

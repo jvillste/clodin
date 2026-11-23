@@ -56,9 +56,13 @@
   (to-f32 1.0e-9).
 
   (if condition then else) is a real branch, like Clojure's if: only the taken
-  arm runs, so an arm may have side effects. When both arms produce a value of
-  the same type the if produces that value, merged with a phi node; when
-  neither arm produces a value it is a statement. Mixing the two is an error.
+  arm runs, so an arm may have side effects. In value position both arms must
+  produce a value of the same type, which the if produces, merged with a phi
+  node; mixing a value arm with a statement arm is an error. In statement
+  position, where the if's own value is discarded, both arms are compiled as
+  statements, so their values are dropped and the arms need not agree in type.
+  A body form that is not the last one is in statement position, as are the
+  bodies of when and while, and the body of a procedure declared :void.
 
   (when condition body...) runs its body only when the condition is true and
   produces no value; use if when a value is needed.
@@ -97,7 +101,7 @@
                               MemoryLayout MemorySegment SymbolLookup ValueLayout)
            (java.lang.invoke MethodHandles MethodType)))
 
-(declare compile-expression compile-body)
+(declare compile-expression compile-body compile-statement)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Module state
@@ -436,6 +440,13 @@
   [entry]
   {:param-types (vec (:param-types entry))
    :return-type (:return-type entry)})
+
+(defn- void-declared?
+  "True when a procedure entry declared :void as its return type. The registry
+  keeps :void in :explicit-return-type and nil in :return-type, so the ABI is
+  void while the declaration is still visible here and to settle-signatures!."
+  [entry]
+  (= :void (:explicit-return-type entry)))
 
 (defn- next-body-symbol
   "A fresh body symbol for name. Body symbols are never reused."
@@ -1035,8 +1046,11 @@
   "Compiles (let [name type value ...] body...). Every binding gets its
   own stack slot, so a later binding may shadow an earlier one and the
   initial value of a binding is evaluated in the environment of the
-  bindings before it."
-  [state environment expression]
+  bindings before it.
+
+  value-needed? false compiles the body in statement position, which a let in
+  statement position forwards to its own last body form."
+  [state environment expression value-needed?]
   (let [bindings (second expression)
         body-forms (drop 2 expression)]
     (when-not (vector? bindings)
@@ -1067,7 +1081,7 @@
                                       {:type type :value alloca :kind :local})])))
                   [state environment]
                   (partition 3 bindings))]
-      (let [inner (compile-body state environment body-forms)]
+      (let [inner (compile-body state environment body-forms value-needed?)]
         [inner (:result-value inner) (:return-type inner)]))))
 
 (defn- compile-set
@@ -1249,15 +1263,21 @@
   "Compiles (if condition then else) as a real branch, with Clojure's
   semantics: only the taken arm runs, so either arm may have side effects.
 
-  When both arms produce a value of the same type the form produces that value,
-  merged with a phi node in the join block. When neither arm produces a value
-  the form is a statement. Mixing the two is an error.
+  In value position both arms must produce a value of the same type, which the
+  form produces, merged with a phi node in the join block. Mixing a value arm
+  with a statement arm is an error.
+
+  In statement position (value-needed? false) both arms are compiled as
+  statements, so their values are discarded and the arms need not agree in
+  type: each arm is run for its side effects, and the return value that is
+  useful in one case need not be the same as in another. No phi is built and
+  the form produces no value.
 
   An arm that ends in a terminator, such as an early return, never reaches the
   join block. It contributes no incoming phi value, and its type is compatible
   with the other arm's. If both arms terminate, the whole form diverges and the
   join block is marked unreachable."
-  [state environment expression]
+  [state environment expression value-needed?]
   (when-not (= 4 (count expression))
     (throw (ex-info "if expects (if condition then else)" {:expression expression})))
   (let [[condition-form then-form else-form] (rest expression)
@@ -1272,15 +1292,19 @@
     (llvm/append-block function join-block)
     (llvm/build-cond-br builder condition-value then-block else-block)
     (llvm/position-at-end builder then-block)
-    (let [[then-state then-value then-type]
-          (compile-expression (assoc state :current-block then-block) environment then-form)
+    (let [compile-arm (if value-needed? compile-expression compile-statement)
+          [then-state then-value then-type]
+          (compile-arm (assoc state :current-block then-block) environment then-form)
           _ (llvm/position-at-end builder else-block)
           [else-state else-value else-type]
-          (compile-expression (assoc state :current-block else-block) environment else-form)
+          (compile-arm (assoc state :current-block else-block) environment else-form)
           then-diverges? (arm-diverges? then-state)
           else-diverges? (arm-diverges? else-state)
-          result-type (branch-result-type "if" then-type else-type
-                                          then-diverges? else-diverges?)
+          ;; A statement if discards both arm values, so their types are
+          ;; irrelevant and there is nothing to merge.
+          result-type (when value-needed?
+                        (branch-result-type "if" then-type else-type
+                                            then-diverges? else-diverges?))
           join-state (-> (merge-branch-state state [then-state else-state])
                          (assoc :current-block join-block
                                 :terminated? false))]
@@ -1350,7 +1374,7 @@
       (llvm/build-cond-br builder condition-value body-block join-block)
       (llvm/position-at-end builder body-block)
       (let [body-state (compile-body (assoc state :current-block body-block)
-                                     environment body-forms)]
+                                     environment body-forms false)]
         (when-not (arm-diverges? body-state)
           (llvm/position-at-end builder (:current-block body-state))
           (llvm/build-br builder join-block))
@@ -1390,7 +1414,7 @@
         (llvm/build-cond-br builder condition-value body-block end-block)
         (llvm/position-at-end builder body-block)
         (let [state (assoc state :current-block body-block)
-              state (compile-body state environment body-forms)]
+              state (compile-body state environment body-forms false)]
           (llvm/build-br builder condition-block)
           (llvm/position-at-end builder end-block)
           (let [state (assoc state :current-block end-block
@@ -1429,11 +1453,11 @@
         (= operator 'is-null) (compile-is-null state environment expression)
         (= operator 'pointer-call) (compile-pointer-call state environment expression)
         (= operator 'stack-allocate) (compile-stack-allocate state environment expression)
-        (= operator 'let) (compile-let state environment expression)
+        (= operator 'let) (compile-let state environment expression true)
         (= operator 'set) (compile-set state environment expression)
         (= operator 'print) (compile-print state environment expression false)
         (= operator 'println) (compile-print state environment expression true)
-        (= operator 'if) (compile-if state environment expression)
+        (= operator 'if) (compile-if state environment expression true)
         (= operator 'when) (compile-when state environment expression)
         (= operator 'while) (compile-while state environment expression)
         :else (compile-call state environment operator (rest expression))))
@@ -1444,18 +1468,48 @@
   "Compiles the body expressions in order and returns the emitter state
   extended with the result value and return type of the last expression.
   A body form that produces no value, such as set or while, leaves the
-  result value nil."
-  [state environment body-forms]
-  (reduce (fn [state body-form]
-            ;; Once a form has terminated the block, later forms are
-            ;; unreachable and must not append to it. Early return relies on
-            ;; this; a branch whose arms both terminate also sets the flag.
-            (if (:terminated? state)
-              state
-              (let [[state value type] (compile-expression state environment body-form)]
-                (assoc state :result-value value :return-type type))))
-          (assoc state :result-value nil :return-type nil :terminated? false)
-          body-forms))
+  result value nil.
+
+  Every form but the last is compiled in statement position, because its value
+  is discarded. value-needed? false does the same for the last form, for a body
+  whose value is discarded too: a when or while body, or the body of a
+  procedure declared :void."
+  ([state environment body-forms]
+   (compile-body state environment body-forms true))
+  ([state environment body-forms value-needed?]
+   (let [last-index (dec (count body-forms))]
+     (reduce (fn [state index]
+               ;; Once a form has terminated the block, later forms are
+               ;; unreachable and must not append to it. Early return relies on
+               ;; this; a branch whose arms both terminate also sets the flag.
+               (if (:terminated? state)
+                 state
+                 (let [body-form (nth body-forms index)
+                       [state value type]
+                       (if (and value-needed? (= index last-index))
+                         (compile-expression state environment body-form)
+                         (compile-statement state environment body-form))]
+                   (assoc state :result-value value :return-type type))))
+             (assoc state :result-value nil :return-type nil :terminated? false)
+             (range (count body-forms))))))
+
+(defn- compile-statement
+  "Compiles a form for its side effects only: any value it produces is
+  discarded and the form may produce none at all.
+
+  Statement position propagates into the forms that forward their value, so an
+  if compiles both arms as statements and a let compiles its body the same way.
+  Every other form is compiled in value position and its value dropped, which
+  keeps the rule in one place: a form's subexpressions are always value
+  position unless the form itself is a branching or binding form that discards
+  its result."
+  [state environment expression]
+  (let [operator (when (seq? expression) (first expression))]
+    (cond
+      (= operator 'if) (compile-if state environment expression false)
+      (= operator 'let) (compile-let state environment expression false)
+      :else (let [[state _value _type] (compile-expression state environment expression)]
+              [state nil nil]))))
 
 (defn- expression-type
   "Returns the clodin type a form produces, or nil when there is none."
@@ -1519,8 +1573,11 @@
   {:bitcode byte[] :return-type ... :result-value ... :callees {...}}.
   name is the public procedure name used in error messages and string
   symbol names; emitted-name is the function and module symbol. In
-  reloadable mode emitted-name is foo$N, in monolithic mode it is foo."
-  [name emitted-name param-names param-types return-type body-forms]
+  reloadable mode emitted-name is foo$N, in monolithic mode it is foo.
+
+  statement-body? means the procedure declared :void, so its body is compiled
+  in statement position and whatever the last form produces is discarded."
+  [name emitted-name param-names param-types return-type body-forms statement-body?]
   (let [arena (Arena/ofConfined)
         context (llvm/new-context)
         module (llvm/new-module context (str emitted-name))
@@ -1539,7 +1596,7 @@
                                                      :value (llvm/get-param function index)
                                                      :kind :param}])
                                       param-names param-types (range)))
-            state (compile-body state environment body-forms)
+            state (compile-body state environment body-forms (not statement-body?))
             result-value (:result-value state)
             effective-return-type (or return-type (:return-type state))]
         (when (and (not (:terminated? state))
@@ -1917,7 +1974,8 @@
               (binding [*call-target* :public]
                 (build-procedure! name name
                                   (:param-names entry) (:param-types entry)
-                                  (:return-type entry) (:ast entry)))]
+                                  (:return-type entry) (:ast entry)
+                                  (void-declared? entry)))]
           (swap! procedure-registry assoc name
                  (assoc entry
                         :bitcode bitcode
@@ -1943,7 +2001,8 @@
                                                          (:param-names entry)
                                                          (:param-types entry)
                                                          (:return-type entry)
-                                                         (:ast entry)))]
+                                                         (:ast entry)
+                                                         (void-declared? entry)))]
                                  [name {:body-symbol body-symbol
                                         :bitcode bitcode
                                         :callees callees
@@ -2014,11 +2073,25 @@
   (when (and static? (= @build-mode :reloadable))
     (throw (ex-info "Static procedures are not implemented yet"
                     {:procedure name})))
+  (when (some #{:void} param-types)
+    (throw (ex-info (str "Procedure " name " cannot take a :void parameter")
+                    {:procedure name :param-types (vec param-types)})))
+  (when (and explicit-return-type
+             (not= :void explicit-return-type)
+             (not (contains? scalar-types explicit-return-type)))
+    (throw (ex-info (str "Procedure " name " declares an unsupported return type "
+                         (pr-str explicit-return-type))
+                    {:procedure name :return-type explicit-return-type})))
   (let [environment (into {} (map (fn [param-name param-type]
                                     [param-name {:type param-type}])
                                   param-names param-types))
-        inferred (expression-type environment (last body-forms))
-        return-type (or explicit-return-type inferred)
+        ;; A declared return type is never inferred, and :void means the body
+        ;; is a statement, so there is no value to infer from.
+        inferred (when-not explicit-return-type
+                   (expression-type environment (last body-forms)))
+        return-type (if (= :void explicit-return-type)
+                      nil
+                      (or explicit-return-type inferred))
         definition {:namespace namespace
                     :param-names (vec param-names)
                     :param-types (vec param-types)
@@ -2044,7 +2117,8 @@
             (let [{:keys [bitcode callees globals]}
                   (binding [*call-target* :public]
                     (build-procedure! name name (:param-names definition)
-                                      (:param-types definition) return-type body-forms))]
+                                      (:param-types definition) return-type body-forms
+                                      (void-declared? definition)))]
               (swap! procedure-registry assoc name
                      (assoc (merge existing definition)
                             :body-symbol name
@@ -2077,7 +2151,8 @@
                       (binding [*call-target* :stub]
                         (build-procedure! name body-symbol
                                           (:param-names entry) (:param-types entry)
-                                          (:return-type entry) body-forms))]
+                                          (:return-type entry) body-forms
+                                          (void-declared? entry)))]
                   (install-body! (:stub-symbol entry) body-symbol bitcode)
                   (swap! procedure-registry assoc name
                          (assoc entry
@@ -2114,7 +2189,8 @@
                 {:keys [bitcode callees globals]}
                 (binding [*call-target* :stub]
                   (build-procedure! name body-symbol (:param-names definition)
-                                    (:param-types definition) return-type body-forms))]
+                                    (:param-types definition) return-type body-forms
+                                    (void-declared? definition)))]
             (install-body! stub-symbol body-symbol bitcode)
             (swap! procedure-registry assoc name
                    (assoc (merge existing definition)
@@ -2365,7 +2441,8 @@
                  (let [{:keys [bitcode callees globals]}
                        (build-procedure! name name
                                          (:param-names entry) (:param-types entry)
-                                         (:return-type entry) (:ast entry))]
+                                         (:return-type entry) (:ast entry)
+                                         (void-declared? entry))]
                    [name (assoc entry
                                 :bitcode bitcode
                                 :callees callees
@@ -2658,7 +2735,13 @@
 
   An explicit return type can be given by putting a type keyword before
   the body forms; without it the return type is inferred from the last
-  body expression.
+  body expression. Declaring :void makes the body a statement, so whatever the
+  last form produces is discarded:
+
+  (defproc write-bytes [data :ptr length :i64] :void
+    (if (is-null clodin-write)
+      (write (to-i32 1) data length)
+      (pointer-call clodin-write [:ptr :i64] :void data length)))
 
   Pointers are declared as :ptr. Memory can be read and written with
   (load :i64 pointer) and (store :i64 pointer value).
@@ -3934,6 +4017,158 @@
                                         '[(let [value :i64 (pointer-call callback [] :void)]
                                             value)]
                                         nil false)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Statement position and :void return types
+;;; ---------------------------------------------------------------------------
+
+;; A value producing procedure, so an arm can have both a side effect and a
+;; return value that differs from the other arm's.
+(defproc store-and-return [pointer :ptr value :i64]
+  (store :i64 pointer value)
+  value)
+
+(defproc store-only [pointer :ptr value :i64] :void
+  (store :i64 pointer value))
+
+;; The print runtime shape: one arm returns :i64, the other returns nothing.
+;; In value position this is an error; as a statement it is legal.
+(defproc statement-if-mixed-arms [pointer :ptr flag :boolean] :void
+  (if flag
+    (store-only pointer 1)
+    (store-and-return pointer 2)))
+
+;; The same mismatch in a non-final body form, where the value is discarded.
+(defproc statement-if-nonfinal [pointer :ptr flag :boolean]
+  (if flag
+    (store-only pointer 3)
+    (store-and-return pointer 4))
+  (load :i64 pointer))
+
+;; A let in statement position forwards statement position to its last form.
+(defproc statement-let [pointer :ptr flag :boolean]
+  (let [ignored :i64 0]
+    (if flag
+      (store-only pointer 5)
+      (store-and-return pointer 6)))
+  (load :i64 pointer))
+
+;; A when body discards its last form's value too.
+(defproc statement-when [pointer :ptr flag :boolean]
+  (when flag
+    (if flag
+      (store-only pointer 7)
+      (store-and-return pointer 8)))
+  (load :i64 pointer))
+
+;; A while body discards its last form's value on every iteration.
+(defproc statement-while [pointer :ptr count :i64]
+  (let [index :i64 0]
+    (while (< index count)
+      (set index (+ index 1))
+      (if (= index 0)
+        (store-only pointer 9)
+        (store-and-return pointer 10)))
+    (load :i64 pointer)))
+
+;; A declared :void discards whatever the body produces.
+(defproc void-value-body [] :void
+  42)
+
+(deftest test-statement-position
+  (testing "a statement if runs one arm and discards both values"
+    (let [arena (Arena/ofShared)
+          pointer (.allocate arena 8)]
+      (try
+        (is (nil? (statement-if-mixed-arms pointer true)))
+        (is (= 1 (.getAtIndex pointer ValueLayout/JAVA_LONG 0)))
+        (statement-if-mixed-arms pointer false)
+        (is (= 2 (.getAtIndex pointer ValueLayout/JAVA_LONG 0)))
+        (finally
+          (.close arena)))))
+
+  (testing "the same mismatch is legal as a non-final body form"
+    (let [arena (Arena/ofShared)
+          pointer (.allocate arena 8)]
+      (try
+        (is (= 3 (statement-if-nonfinal pointer true)))
+        (is (= 4 (statement-if-nonfinal pointer false)))
+        (finally
+          (.close arena)))))
+
+  (testing "statement position reaches a let body's last form"
+    (let [arena (Arena/ofShared)
+          pointer (.allocate arena 8)]
+      (try
+        (is (= 5 (statement-let pointer true)))
+        (is (= 6 (statement-let pointer false)))
+        (finally
+          (.close arena)))))
+
+  (testing "statement position reaches a when body's last form"
+    (let [arena (Arena/ofShared)
+          pointer (.allocate arena 8)]
+      (try
+        (is (= 7 (statement-when pointer true)))
+        ;; The untaken body must not write, so a sentinel survives.
+        (.set pointer ValueLayout/JAVA_LONG 0 0)
+        (is (= 0 (statement-when pointer false)))
+        (finally
+          (.close arena)))))
+
+  (testing "statement position reaches a while body's last form"
+    (let [arena (Arena/ofShared)
+          pointer (.allocate arena 8)]
+      (try
+        (is (= 10 (statement-while pointer 3)))
+        (.set pointer ValueLayout/JAVA_LONG 0 0)
+        (is (= 0 (statement-while pointer 0)))
+        (finally
+          (.close arena)))))
+
+  (testing "a statement if builds no phi"
+    (let [ir (requiring-resolve 'clodin.inspect/llvm-ir)]
+      (is (not (string/includes? (ir "statement-if-mixed-arms") "phi")))))
+
+  (testing "value position still requires both arms to agree"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"arms must both produce a value of the same type"
+         (define-proc! "clodin.compiler" "statement-if-value-position" ['pointer] [:ptr]
+                       '[(if true 1 (store :i64 pointer 0))] :i64 false)))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"arms must both produce a value of the same type"
+         (define-proc! "clodin.compiler" "statement-if-let-value" ['pointer] [:ptr]
+                       '[(let [value :i64 (if true 1 (store :i64 pointer 0))] value)]
+                       nil false)))))
+
+(deftest test-void-return-type
+  (testing ":void is a declarable return type and the call produces no value"
+    (is (nil? (void-value-body)))
+    (is (nil? (store-only (.allocate (Arena/ofShared) 8) 1))))
+
+  (testing "the registry keeps the declaration but reports a void ABI"
+    (let [entry (get @procedure-registry "void-value-body")]
+      (is (nil? (:return-type entry)))
+      (is (= :void (:explicit-return-type entry)))))
+
+  (testing "a declared :void body is a statement, so it has no value to return"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"has no value to return"
+                          (define-proc! "clodin.compiler" "void-declared-i64" ['pointer] [:ptr]
+                                        '[(if true (store :i64 pointer 1)
+                                           (store :i64 pointer 2))]
+                                        :i64 false))))
+
+  (testing ":void is rejected as a parameter type"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"cannot take a :void parameter"
+                          (define-proc! "clodin.compiler" "void-parameter" ['value] [:void]
+                                        '[1] nil false))))
+
+  (testing "an unsupported declared return type is a clear error"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unsupported return type"
+                          (define-proc! "clodin.compiler" "unsupported-return" [] []
+                                        '[1] :i8 false)))))
 
 (defn -main
   [& _]
