@@ -44,6 +44,21 @@
   and mutated with (set name value). Loops are written with
   (while condition body...).
 
+  Every procedure and global is registered under a qualified name,
+  namespace/name, and its native symbol carries the namespace too, as
+  namespace.name. A reference resolves to the namespace the procedure is
+  defined in first, then to clodin.core, so only core names are visible
+  without a namespace. A procedure that lives elsewhere is called by its
+  qualified name:
+
+  (defproc my.ns/report [value :i64] :void
+    (clodin.runtime/print-i64 value))
+
+  There is no require, refer or alias form yet. A definition may shadow a
+  built in form such as print or stack-allocate, but an unqualified reference
+  always means the form, so the procedure is then reachable only by its
+  qualified name; defproc and defvar warn when that happens.
+
   Math helpers: (sqrt x), (abs x), (min a b ...) and (max a b ...). sqrt
   and abs take floats; abs also accepts integers. min and max accept floats
   or integers, all operands sharing one type. They lower to the llvm.sqrt,
@@ -92,6 +107,7 @@
   stays raw libc output and goes to the process stdout."
   (:require [clodin.globals :as globals]
             [clodin.llvm-api :as llvm]
+            [clodin.names :as names]
             [clodin.print :as print]
             [clojure.java.io :as io]
             [clojure.java.shell :as shell]
@@ -286,6 +302,9 @@
 ;;; returns [state value type] where value is an LLVMValueRef (or nil for
 ;;; a form that produces no value such as store, set or while).
 ;;;
+;;; :namespace is the namespace the procedure is defined in, which unqualified
+;;; procedure and global references resolve against.
+;;;
 ;;; The environment maps a local name to {:type ... :value ... :kind ...}.
 ;;; Parameters are raw LLVM values (:kind :param); let bindings live in
 ;;; stack slots (:kind :local) so a set inside a loop is visible in the
@@ -368,10 +387,11 @@
                              (globals/storage-size type))
     [state nil nil]))
 
-(defn- global-name?
-  "True when name refers to a registered clodin global."
-  [name]
-  (some? (globals/global-type name)))
+(defn- resolve-global-name
+  "The qualified name of the global a source symbol refers to in the given
+  namespace, or nil when there is none."
+  [referring-namespace name]
+  (names/resolve-name referring-namespace name globals/entry))
 
 (defn- compile-local-reference
   "Compiles a symbol reference. A local or parameter shadows a global of the
@@ -384,9 +404,13 @@
                                    (llvm/type-for (:context state) (:type local))
                                    (:value local) (:arena state) nil)]
         [state value (:type local)]))
-    (if (global-name? name)
-      (compile-global-reference state name)
-      (throw (ex-info (str "Unknown symbol: " name) {:symbol name})))))
+    (if-let [qualified (resolve-global-name (:namespace state) name)]
+      (compile-global-reference state qualified)
+      (throw (ex-info (str "Unknown symbol: " name
+                           " (not a local, and not a global of "
+                           (:namespace state) " or " names/core-namespace ")")
+                      {:symbol name
+                       :namespace (:namespace state)})))))
 
 (defn- float-type?
   [type]
@@ -423,17 +447,32 @@
           result (reduce step (first values) (rest values))]
       [state result type])))
 
+(def ^:dynamic *symbol-style*
+  "How native procedure and global symbols are named. :qualified keeps the
+  namespace in the symbol, which a JIT build needs so two namespaces can
+  define the same short name. An offline build binds :plain, because the
+  system linker exports the plain names and the entry point has to be exactly
+  main."
+  :qualified)
+
+(defn- procedure-symbol
+  "The native symbol for a procedure entry in the current symbol style."
+  [entry]
+  (names/symbol-name (:namespace entry) (:name entry) *symbol-style*))
+
 (def ^:dynamic *call-target*
   "How a call site names its callee: :stub in reloadable mode and :public for
   monolithic builds and AOT output."
   :stub)
 
 (defn- call-target-symbol
-  "The symbol a call site should reference for the given procedure."
-  [procedure name]
+  "The symbol a call site should reference for the given procedure. In
+  monolithic and offline builds that is the procedure's own symbol; in
+  reloadable mode it is the stub, which every caller shares."
+  [procedure]
   (if (= *call-target* :public)
-    name
-    (or (:stub-symbol procedure) name)))
+    (procedure-symbol procedure)
+    (or (:stub-symbol procedure) (procedure-symbol procedure))))
 
 (defn- procedure-signature
   "The ABI signature of a procedure registry entry."
@@ -453,45 +492,37 @@
   [name]
   (str name "$" (swap! body-counter inc)))
 
-(defn- valid-procedure-name!
-  "Generated symbols use $ suffixes, so user names must not contain one."
-  [name]
-  (when (string/includes? (str name) "$")
-    (throw (ex-info "Procedure and global names must not contain '$'"
-                    {:name name}))))
-
 (defn- compile-procedure-call
-  "Compiles a call to another clodin procedure. The call is emitted as a
-  direct llvm call inside the JIT module, so the jvm is not involved when
-  native procedures call each other."
-  [state environment procedure-symbol argument-forms]
-  (let [name (str procedure-symbol)
-        procedure (get @procedure-registry name)]
+  "Compiles a call to another clodin procedure by its qualified name. The call
+  is emitted as a direct llvm call inside the JIT module, so the jvm is not
+  involved when native procedures call each other."
+  [state environment qualified-name argument-forms]
+  (let [procedure (get @procedure-registry qualified-name)]
     (when-not procedure
-      (throw (ex-info (str "Unknown clodin procedure: " procedure-symbol)
-                      {:procedure procedure-symbol})))
+      (throw (ex-info (str "Unknown clodin procedure: " qualified-name)
+                      {:procedure qualified-name})))
     (when-not (= (count argument-forms) (count (:param-types procedure)))
-      (throw (ex-info (str "Procedure " name " expects "
+      (throw (ex-info (str "Procedure " qualified-name " expects "
                            (count (:param-types procedure))
                            " arguments, got " (count argument-forms))
-                      {:procedure procedure-symbol})))
+                      {:procedure qualified-name})))
     (let [[state argument-values argument-types]
           (compile-operands state environment argument-forms)]
       (when-not (= argument-types (vec (:param-types procedure)))
         (throw (ex-info (str "Argument types " (vec argument-types)
                              " do not match parameters " (:param-types procedure)
-                             " for procedure " name)
-                        {:procedure procedure-symbol
+                             " for procedure " qualified-name)
+                        {:procedure qualified-name
                          :argument-types (vec argument-types)})))
       (let [{:keys [module context builder arena]} state
-            target-name (call-target-symbol procedure name)
+            target-name (call-target-symbol procedure)
             name-token (llvm/c-string arena target-name)
             callee-type (llvm/function-type context arena (:return-type procedure)
                                             (:param-types procedure))
             callee (llvm/get-or-add-function module name-token callee-type)
             result (llvm/build-call builder callee-type callee argument-values arena)
             state (assoc state :callees
-                         (assoc (:callees state) name
+                         (assoc (:callees state) qualified-name
                                 {:param-types (vec (:param-types procedure))
                                  :return-type (:return-type procedure)}))]
         (if (:return-type procedure)
@@ -562,20 +593,30 @@
           [state nil nil])))))
 
 (defn- compile-call
-  "Dispatches a call to either a clodin procedure or an external C function."
-  [state environment procedure-symbol argument-forms]
-  (let [name (str procedure-symbol)]
-    (cond
-      (contains? @procedure-registry name)
-      (compile-procedure-call state environment procedure-symbol argument-forms)
+  "Dispatches a call to a clodin procedure or to an external C function.
 
-      (contains? @external-registry name)
+  A procedure reference resolves like a global reference: the referring
+  namespace first, then clodin.core, or the qualified name as written. An
+  external C function is a bare name with no namespace, so it is considered
+  only when no procedure matches."
+  [state environment procedure-symbol argument-forms]
+  (let [qualified (names/resolve-name (:namespace state) procedure-symbol
+                                      #(get @procedure-registry %))]
+    (cond
+      qualified
+      (compile-procedure-call state environment qualified argument-forms)
+
+      (contains? @external-registry (str procedure-symbol))
       (compile-external-call state environment procedure-symbol
-                             (get @external-registry name) argument-forms)
+                             (get @external-registry (str procedure-symbol))
+                             argument-forms)
 
       :else
-      (throw (ex-info (str "Unknown clodin procedure: " procedure-symbol)
-                      {:procedure procedure-symbol})))))
+      (throw (ex-info (str "Unknown clodin procedure: " procedure-symbol
+                           " (not in " (:namespace state) ", not in "
+                           names/core-namespace ", and not an external function)")
+                      {:procedure procedure-symbol
+                       :namespace (:namespace state)})))))
 
 (defn- compile-sqrt
   "Compiles (sqrt x), the square root of a floating point value, lowered to
@@ -1108,14 +1149,14 @@
                             {:name name :type (:type local) :value-type value-type})))
           (llvm/build-store (:builder state) value (:value local))
           [state nil nil]))
-      (if (global-name? name)
-        (let [global-type (globals/global-type name)
+      (if-let [qualified (resolve-global-name (:namespace state) name)]
+        (let [global-type (globals/global-type qualified)
               [state value value-type] (compile-expression state environment value-form)]
           (when-not (= global-type value-type)
             (throw (ex-info (str "Cannot set global " name " of type " global-type
                                  " to a value of type " (type-name value-type))
                             {:name name :type global-type :value-type value-type})))
-          (compile-global-store state name value))
+          (compile-global-store state qualified value))
         (throw (ex-info (str "Cannot set unknown local or global: " name)
                         {:symbol name}))))))
 
@@ -1520,7 +1561,9 @@
     (boolean? expression) :boolean
     (string? expression) :ptr
     (symbol? expression) (or (:type (get environment expression))
-                              (globals/global-type expression))
+                              (some-> (resolve-global-name (get environment ::namespace)
+                                                           expression)
+                                      globals/global-type))
     (seq? expression)
     (let [operator (first expression)]
       (when (symbol? operator)
@@ -1559,10 +1602,14 @@
           (= operator 'if) (expression-type environment (nth expression 2))
           (= operator 'when) nil
           (= operator 'while) nil
-          :else (let [procedure (get @procedure-registry (str operator))
+          :else (let [referring-namespace (get environment ::namespace)
+                      qualified (names/resolve-name
+                                 referring-namespace operator
+                                 #(get @procedure-registry %))
                       external (get @external-registry (str operator))]
-                  (or (:return-type procedure)
-                      (:return-type external))))))
+                  (if qualified
+                    (:return-type (get @procedure-registry qualified))
+                    (:return-type external))))))
     :else nil))
 
 ;;; Procedure -> bitcode
@@ -1577,7 +1624,8 @@
 
   statement-body? means the procedure declared :void, so its body is compiled
   in statement position and whatever the last form produces is discarded."
-  [name emitted-name param-names param-types return-type body-forms statement-body?]
+  [referring-namespace name emitted-name param-names param-types return-type
+   body-forms statement-body?]
   (let [arena (Arena/ofConfined)
         context (llvm/new-context)
         module (llvm/new-module context (str emitted-name))
@@ -1590,6 +1638,7 @@
             state {:arena arena :context context :module module :builder builder
                    :function function :entry-block entry-block :current-block entry-block
                    :procedure-name emitted-name :string-counter 0
+                   :namespace referring-namespace
                    :callees {} :globals #{}}
             environment (into {} (map (fn [param-name param-type index]
                                         [param-name {:type param-type
@@ -1902,15 +1951,18 @@
 
 (defn- ensure-stub-for-entry!
   "Gives entry a stub symbol for its signature, minting and installing one
-  if needed, and keeps the JVM thunk handle in step with the current stub."
+  if needed, and keeps the JVM thunk handle in step with the current stub.
+  name is the entry's qualified name; the stub symbol is minted from the
+  native symbol, so the namespace is part of it."
   [name entry]
   (let [signature (procedure-signature entry)
         stubs (:stubs entry {})
         revision (inc (:sig-counter entry 0))
+        base-symbol (procedure-symbol entry)
         stub-symbol (or (get stubs signature)
                         (if (= revision 1)
-                          name
-                          (str name "$sig" revision)))
+                          base-symbol
+                          (str base-symbol "$sig" revision)))
         entry (assoc entry
                      :stubs (assoc stubs signature stub-symbol)
                      :sig-counter revision
@@ -1929,13 +1981,22 @@
                                          (:param-types entry))})))
     entry))
 
+(defn- inference-environment
+  "The environment expression-type resolves names in: the parameters plus the
+  namespace the body is written in, which unqualified calls and global
+  references resolve against."
+  [referring-namespace param-names param-types]
+  (into {::namespace referring-namespace}
+        (map (fn [param-name param-type] [param-name {:type param-type}])
+             param-names param-types)))
+
 (defn- infer-return-type
   "The return type inferred from an entry's AST, or nil for a void body."
   [entry]
-  (let [environment (into {} (map (fn [param-name param-type]
-                                    [param-name {:type param-type}])
-                                  (:param-names entry) (:param-types entry)))]
-    (expression-type environment (last (:ast entry)))))
+  (expression-type (inference-environment (:namespace entry)
+                                          (:param-names entry)
+                                          (:param-types entry))
+                   (last (:ast entry))))
 
 (defn- settle-signatures!
   "Recomputes every inferred return type until the registry is consistent.
@@ -1972,7 +2033,8 @@
       (doseq [[name entry] @procedure-registry]
         (let [{:keys [bitcode callees globals]}
               (binding [*call-target* :public]
-                (build-procedure! name name
+                (build-procedure! (:namespace entry) (:name entry)
+                                  (procedure-symbol entry)
                                   (:param-names entry) (:param-types entry)
                                   (:return-type entry) (:ast entry)
                                   (void-declared? entry)))]
@@ -1981,7 +2043,7 @@
                         :bitcode bitcode
                         :callees callees
                         :globals globals
-                        :body-symbol name
+                        :body-symbol (procedure-symbol entry)
                         :stub-symbol nil
                         :stub-signature nil
                         :stubs {}
@@ -1997,7 +2059,9 @@
                                (let [body-symbol (next-body-symbol name)
                                      {:keys [bitcode callees globals]}
                                      (binding [*call-target* :stub]
-                                       (build-procedure! name body-symbol
+                                       (build-procedure! (:namespace entry)
+                                                         (:name entry)
+                                                         body-symbol
                                                          (:param-names entry)
                                                          (:param-types entry)
                                                          (:return-type entry)
@@ -2056,6 +2120,15 @@
             (install-globals! @current-jit))
           entry)))))
 
+(defn- warn!
+  "Writes a definition-time warning to *err*. A definition that shadows an
+  existing name is allowed, so a warning is the only signal that the compiler
+  will still prefer the extern or the built in form."
+  [message]
+  (binding [*out* *err*]
+    (println (str "WARNING: " message)))
+  nil)
+
 (defn define-proc!
   "Defines or redefines a procedure from already parsed parts. The defproc
   macro calls this at macro expansion time; tests call it directly.
@@ -2065,11 +2138,12 @@
   body. A signature change re-emits every body because inferred return
   types must settle across the whole call graph."
   [namespace name param-names param-types body-forms explicit-return-type static?]
-  (valid-procedure-name! name)
+  (names/valid-short-name! "Procedure" name)
   (when (contains? @external-registry name)
-    (throw (ex-info (str "Procedure " name
-                         " conflicts with an external function of the same name")
-                    {:procedure name})))
+    (warn! (str "procedure " (names/qualified-name namespace name)
+                " has the same name as the external function " name
+                "; an unqualified call from another namespace reaches the"
+                " extern")))
   (when (and static? (= @build-mode :reloadable))
     (throw (ex-info "Static procedures are not implemented yet"
                     {:procedure name})))
@@ -2082,9 +2156,7 @@
     (throw (ex-info (str "Procedure " name " declares an unsupported return type "
                          (pr-str explicit-return-type))
                     {:procedure name :return-type explicit-return-type})))
-  (let [environment (into {} (map (fn [param-name param-type]
-                                    [param-name {:type param-type}])
-                                  param-names param-types))
+  (let [environment (inference-environment namespace param-names param-types)
         ;; A declared return type is never inferred, and :void means the body
         ;; is a statement, so there is no value to infer from.
         inferred (when-not explicit-return-type
@@ -2093,6 +2165,7 @@
                       nil
                       (or explicit-return-type inferred))
         definition {:namespace namespace
+                    :name name
                     :param-names (vec param-names)
                     :param-types (vec param-types)
                     :return-type return-type
@@ -2100,7 +2173,8 @@
                     :ast body-forms
                     :kind (if static? :static :reloadable)}]
     (locking compile-lock
-      (let [existing (get @procedure-registry name)
+      (let [qualified (names/qualified-name namespace name)
+            existing (get @procedure-registry qualified)
             signature (procedure-signature definition)
             signature-changed? (and existing
                                     (not= signature (procedure-signature existing)))]
@@ -2108,20 +2182,22 @@
           (= @build-mode :monolithic)
           (if signature-changed?
             (let [snapshot @procedure-registry]
-              (swap! procedure-registry assoc name (merge existing definition))
+              (swap! procedure-registry assoc qualified (merge existing definition))
               (try
                 (reemit-all-bodies!)
                 (catch Throwable error
                   (reset! procedure-registry snapshot)
                   (throw error))))
-            (let [{:keys [bitcode callees globals]}
+            (let [emitted-name (procedure-symbol definition)
+                  {:keys [bitcode callees globals]}
                   (binding [*call-target* :public]
-                    (build-procedure! name name (:param-names definition)
+                    (build-procedure! namespace name emitted-name
+                                      (:param-names definition)
                                       (:param-types definition) return-type body-forms
                                       (void-declared? definition)))]
-              (swap! procedure-registry assoc name
+              (swap! procedure-registry assoc qualified
                      (assoc (merge existing definition)
-                            :body-symbol name
+                            :body-symbol emitted-name
                             :bitcode bitcode
                             :callees callees
                             :globals globals
@@ -2142,19 +2218,19 @@
                                  :stubs {}
                                  :sig-counter 0
                                  :generation 1)]
-            (swap! procedure-registry assoc name provisional)
+            (swap! procedure-registry assoc qualified provisional)
             (try
-              (let [entry (ensure-stub-for-entry! name provisional)]
-                (swap! procedure-registry assoc name entry)
-                (let [body-symbol (next-body-symbol name)
+              (let [entry (ensure-stub-for-entry! qualified provisional)]
+                (swap! procedure-registry assoc qualified entry)
+                (let [body-symbol (next-body-symbol (procedure-symbol entry))
                       {:keys [bitcode callees globals]}
                       (binding [*call-target* :stub]
-                        (build-procedure! name body-symbol
+                        (build-procedure! namespace name body-symbol
                                           (:param-names entry) (:param-types entry)
                                           (:return-type entry) body-forms
                                           (void-declared? entry)))]
                   (install-body! (:stub-symbol entry) body-symbol bitcode)
-                  (swap! procedure-registry assoc name
+                  (swap! procedure-registry assoc qualified
                          (assoc entry
                                 :body-symbol body-symbol
                                 :bitcode bitcode
@@ -2162,14 +2238,14 @@
                                 :globals globals
                                 :generation 1))))
               (catch Throwable error
-                (swap! procedure-registry dissoc name)
-                (swap! procedure-handles dissoc name)
+                (swap! procedure-registry dissoc qualified)
+                (swap! procedure-handles dissoc qualified)
                 (throw error))))
 
           signature-changed?
           (let [snapshot @procedure-registry
                 handles-snapshot @procedure-handles]
-            (swap! procedure-registry assoc name
+            (swap! procedure-registry assoc qualified
                    (assoc (merge existing definition)
                           :generation (inc (:generation existing 0))))
             (try
@@ -2182,17 +2258,18 @@
           :else
           (let [stub-symbol (:stub-symbol existing)
                 _ (when-not stub-symbol
-                    (throw (ex-info (str "Procedure " name
+                    (throw (ex-info (str "Procedure " qualified
                                          " has no stub in reloadable mode")
-                                    {:procedure name})))
-                body-symbol (next-body-symbol name)
+                                    {:procedure qualified})))
+                body-symbol (next-body-symbol (procedure-symbol definition))
                 {:keys [bitcode callees globals]}
                 (binding [*call-target* :stub]
-                  (build-procedure! name body-symbol (:param-names definition)
+                  (build-procedure! namespace name body-symbol
+                                    (:param-names definition)
                                     (:param-types definition) return-type body-forms
                                     (void-declared? definition)))]
             (install-body! stub-symbol body-symbol bitcode)
-            (swap! procedure-registry assoc name
+            (swap! procedure-registry assoc qualified
                    (assoc (merge existing definition)
                           :body-symbol body-symbol
                           :bitcode bitcode
@@ -2294,11 +2371,14 @@
   their public names, so the handle points straight at the body."
   [jit arena]
   (into {}
-        (map (fn [[name {:keys [param-types return-type]}]]
-               (let [address (llvm/lookup-address jit (llvm/c-string arena (str name)) arena)]
+        (map (fn [[name {:keys [param-types return-type body-symbol]}]]
+               (let [address (llvm/lookup-address jit
+                                                  (llvm/c-string arena body-symbol)
+                                                  arena)]
                  (when-not address
-                   (throw (ex-info (str "JIT has no symbol for procedure " name)
-                                   {:procedure name})))
+                   (throw (ex-info (str "JIT has no symbol " body-symbol
+                                        " for procedure " name)
+                                   {:procedure name :symbol body-symbol})))
                  [name {:stub-symbol nil
                         :handle (downcall-handle address return-type param-types)}])))
         @procedure-registry))
@@ -2343,15 +2423,39 @@
       (reset! module-dirty false))
     nil))
 
+(defn procedure-entry
+  "The registry entry for a procedure reference, as [qualified-name entry], or
+  nil when there is none.
+
+  A qualified name is used as written. A short name is accepted when exactly
+  one registered procedure has it, which is what a REPL user types at
+  invoke-procedure or and at the inspection helpers; the language itself
+  always resolves a name through the defining namespace and clodin.core."
+  [procedure-name]
+  (let [reference (str procedure-name)]
+    (or (when-let [entry (get @procedure-registry reference)]
+          [reference entry])
+        (let [matches (filter (fn [[_name entry]] (= reference (:name entry)))
+                              @procedure-registry)]
+          (cond
+            (= 1 (count matches)) (first matches)
+            (empty? matches) nil
+            :else
+            (throw (ex-info (str "Ambiguous procedure name " reference
+                                 "; it names " (string/join ", " (map first matches)))
+                            {:procedure reference
+                             :candidates (mapv first matches)})))))))
+
 (defn invoke-procedure
   "Calls a native procedure through its panama downcall handle, coercing
   the clojure arguments to the declared types. If procedures have been
   registered since the last compile, the module is compiled and loaded
   first."
-  [name arguments]
-  (let [procedure (get @procedure-registry name)]
-    (when-not procedure
-      (throw (ex-info (str "Unknown clodin procedure: " name) {:procedure name})))
+  [procedure-name arguments]
+  (let [[name procedure] (or (procedure-entry procedure-name)
+                             (throw (ex-info (str "Unknown clodin procedure: "
+                                                  procedure-name)
+                                             {:procedure procedure-name})))]
     (compile-module!)
     (let [handle-entry (get @procedure-handles name)
           handle (:handle handle-entry)]
@@ -2398,10 +2502,17 @@
                   (contains? namespaces (:namespace procedure))))
         @procedure-registry))
 
+(defn- main-procedure-name
+  "The qualified name of the registered procedure whose short name is main,
+  or nil."
+  [procedures]
+  (some (fn [[name entry]] (when (= "main" (:name entry)) name)) procedures))
+
 (defn- main-namespace
   "The namespace that defines the procedure named main, or nil."
   []
-  (:namespace (get @procedure-registry "main")))
+  (some-> (main-procedure-name @procedure-registry)
+          (#(:namespace (get @procedure-registry %)))))
 
 (defn- namespace-closure-from
   "The union of the call-graph closures of root-namespace and
@@ -2431,15 +2542,21 @@
       (namespace-closure-from root-namespace extra-namespaces)))))
 
 (defn- procedures-for-linking
-  "Re-emits the chosen procedures from their AST for an offline link: public
-  names, direct calls and no stubs. Returns registry entries with fresh
-  bitcode."
+  "Re-emits the chosen procedures from their AST for an offline link: plain
+  symbols, direct calls and no stubs. Returns registry entries with fresh
+  bitcode.
+
+  The offline symbols drop the namespace, because the system linker exports
+  them and the entry point has to be exactly main. Procedure short names must
+  therefore be unique across the linked set."
   [procedures]
-  (binding [*call-target* :public]
+  (binding [*call-target* :public
+            *symbol-style* :plain]
     (into {}
           (map (fn [[name entry]]
                  (let [{:keys [bitcode callees globals]}
-                       (build-procedure! name name
+                       (build-procedure! (:namespace entry) (:name entry)
+                                         (:name entry)
                                          (:param-names entry) (:param-types entry)
                                          (:return-type entry) (:ast entry)
                                          (void-declared? entry))]
@@ -2447,7 +2564,7 @@
                                 :bitcode bitcode
                                 :callees callees
                                 :globals globals
-                                :body-symbol name)])))
+                                :body-symbol (:name entry))])))
           procedures)))
 
 (defn with-linked-module
@@ -2500,15 +2617,15 @@
          procedures (procedures-for-namespace root-namespace
                                               {:extra-namespaces extra-namespaces})
          entry-namespace (main-namespace)
-         procedures (if (and entry-namespace
-                             (not (contains? procedures "main")))
+         has-main? (some? (main-procedure-name procedures))
+         procedures (if (and entry-namespace (not has-main?))
                       (merge procedures (procedures-for-namespace entry-namespace))
                       procedures)]
      (when (empty? procedures)
        (throw (ex-info (str "No clodin procedures found in " root-namespace
                             " or the namespaces it calls")
                        {:namespace root-namespace})))
-     (when-not (contains? procedures "main")
+     (when-not (some? (main-procedure-name procedures))
        (throw (ex-info (str "No procedure named main in " root-namespace
                             " or the namespaces it calls")
                        {:namespace root-namespace
@@ -2622,9 +2739,13 @@
 ;;; Compilation entry point (macro)
 ;;; ---------------------------------------------------------------------------
 
-(def ^:private reserved-names
-  "Names the compiler lowers itself, so a user definition would be shadowed."
-  #{"print" "println" "stack-allocate" "is-null" "pointer-call"})
+(def ^:private compiler-forms
+  "The names the compiler lowers itself. A definition may shadow one, because
+  an unqualified reference always means the form, so a procedure or global
+  with one of these names is reachable only by its qualified name."
+  '#{+ - * / < <= > >= = not= if when while let set load store pointer-add
+     buffer-get buffer-set to-pointer to-float to-f32 to-i32 to-i64 sqrt abs
+     min max print println stack-allocate is-null pointer-call})
 
 (defn- defvar-form
   "Parses a defvar form, registers the global through define-var! and returns
@@ -2637,16 +2758,17 @@
   [namespace name type initial-value]
   (when-not (symbol? name)
     (throw (ex-info "Global name must be a symbol" {:name name})))
-  (when (contains? reserved-names (str name))
-    (throw (ex-info (str name " is a built in form and cannot be a global")
-                    {:name name})))
+  (when (contains? compiler-forms name)
+    (warn! (str "global " (names/qualified-name namespace name)
+                " shadows the compiler form " name
+                "; an unqualified reference means the form")))
   (when-not (or (number? initial-value) (boolean? initial-value)
                 (nil? initial-value))
     (throw (ex-info (str "defvar needs a literal initial value (a number, a"
                          " boolean or nil), got " (pr-str initial-value))
                     {:name name :initial-value initial-value})))
   (define-var! namespace (str name) type initial-value)
-  `(def ~name (globals/global-variable ~(str name))))
+  `(def ~name (globals/global-variable ~(names/qualified-name namespace (str name)))))
 
 (defn- defproc-form
   "Parses a defproc form, defines the procedure through define-proc! and
@@ -2656,9 +2778,11 @@
   [namespace name params body]
   (when-not (symbol? name)
     (throw (ex-info "Procedure name must be a symbol" {:name name})))
-  (when (contains? reserved-names (str name))
-    (throw (ex-info (str name " is a built in form and cannot be a procedure")
-                    {:name name})))
+  (when (contains? compiler-forms name)
+    (warn! (str "procedure " (names/qualified-name namespace name)
+                " shadows the compiler form " name
+                "; an unqualified reference means the form, so call it as "
+                (names/qualified-name namespace name))))
   (when-not (vector? params)
     (throw (ex-info "Procedure parameters must be a vector" {:params params})))
   (when-not (even? (count params))
@@ -2673,7 +2797,8 @@
                   explicit-return-type
                   (boolean (:static (meta name))))
     `(defn ~name [~@param-names]
-       (invoke-procedure ~(str name) [~@param-names]))))
+       (invoke-procedure ~(names/qualified-name namespace (str name))
+                         [~@param-names]))))
 
 (defmacro defvar
   "Defines a top level mutable variable that native code and Clojure share.
@@ -2695,6 +2820,9 @@
   clojure.lang.IDeref and clojure.lang.IAtom2, so @running?, (reset!
   running? false), (swap! counter inc), (compare-and-set! ...),
   (reset-vals! ...) and (swap-vals! ...) all work.
+
+  The global is registered as namespace/name with the native symbol
+  namespace.name, so two namespaces can both define counter.
 
   defvar always initialises: the first definition stores the initial value in
   the storage module. Re-evaluating a defvar with the same type keeps the live
@@ -2719,6 +2847,11 @@
   "Defines a native clodin procedure.
 
   (defproc twice [number :i64] (* number 2))
+
+  The procedure is registered as namespace/name, where the namespace is the
+  namespace the form is evaluated in, and its native symbol is
+  namespace.name. Calls from the same namespace and from clodin.core may use
+  the short name; a call from anywhere else must be written qualified.
 
   At macroexpansion time the body is type checked (untyped constant
   integers are 64 bit integers) and rendered as llvm ir through the LLVM C
@@ -2949,7 +3082,7 @@
 (deftest test-procedure-namespace
   (testing "defproc records the namespace that defines the procedure"
     (is (= "clodin.compiler"
-           (:namespace (get @procedure-registry "add-both"))))))
+           (:namespace (get @procedure-registry "clodin.compiler/add-both"))))))
 
 (deftest test-add-gigabyte
   (testing "untyped constant integers are 64 bit integers"
@@ -3115,14 +3248,16 @@
     (define-proc! "clodin.compiler" "branch-test-leaf" [] [] [5] nil false)
     (define-proc! "clodin.compiler" "branch-test-caller" ['flag] [:boolean]
                   '[(if flag (branch-test-leaf) 1)] :i64 false)
-    (is (contains? (:callees (get @procedure-registry "branch-test-caller"))
-                   "branch-test-leaf")))
+    (is (contains? (:callees (get @procedure-registry
+                                  "clodin.compiler/branch-test-caller"))
+                   "clodin.compiler/branch-test-leaf")))
 
   (testing "a global referenced only inside a branch is still recorded"
     (define-proc! "clodin.compiler" "branch-test-global-reader" ['flag] [:boolean]
                   '[(if flag globals-test-counter 0)] :i64 false)
-    (is (contains? (:globals (get @procedure-registry "branch-test-global-reader"))
-                   "globals-test-counter"))))
+    (is (contains? (:globals (get @procedure-registry
+                                  "clodin.compiler/branch-test-global-reader"))
+                   "clodin.compiler.globals-test-counter"))))
 
 (deftest test-if-value-uses-a-phi
   (testing "the join block merges both arms with a phi node"
@@ -3385,10 +3520,11 @@
       (is (= 2 (invoke-procedure "reload-test-caller" []))))
     (testing "the body symbol is versioned but the stub keeps its name"
       (is (string/includes? (:body-symbol (get @procedure-registry
-                                            "reload-test-value"))
+                                            "clodin.compiler/reload-test-value"))
                             "$"))
-      (is (= "reload-test-value"
-             (:stub-symbol (get @procedure-registry "reload-test-value")))))
+      (is (= "clodin.compiler.reload-test-value"
+             (:stub-symbol (get @procedure-registry
+                                "clodin.compiler/reload-test-value")))))
     (finally
       (set-build-mode! :monolithic))))
 
@@ -3428,11 +3564,11 @@
       (is (= 1.5 (invoke-procedure "reload-test-producer" [])))
       (is (= 1.5 (invoke-procedure "reload-test-consumer" [])))
       (is (= :f64 (:return-type (get @procedure-registry
-                                  "reload-test-consumer")))))
+                                  "clodin.compiler/reload-test-consumer")))))
     (testing "the old stub is replaced by a signature stub"
-      (is (not= "reload-test-producer"
+      (is (not= "clodin.compiler.reload-test-producer"
                 (:stub-symbol (get @procedure-registry
-                                "reload-test-producer")))))
+                                   "clodin.compiler/reload-test-producer")))))
     (finally
       (set-build-mode! :monolithic))))
 
@@ -3458,7 +3594,7 @@
                   '[(reload-test-ir-callee)] nil false)
     (let [llvm-ir (requiring-resolve 'clodin.inspect/llvm-ir)
           ir (llvm-ir "reload-test-ir-caller")]
-      (is (string/includes? ir "@reload-test-ir-callee"))
+      (is (string/includes? ir "@clodin.compiler.reload-test-ir-callee"))
       (is (not (string/includes? ir "@reload-test-ir-callee$"))))
     (finally
       (set-build-mode! :monolithic))))
@@ -3524,9 +3660,9 @@
 
 (deftest test-globals-registry
   (testing "defvar registers a typed global and binds a handle"
-    (is (= :boolean (globals/global-type "globals-test-boolean")))
-    (is (= :i64 (globals/global-type "globals-test-counter")))
-    (is (= :ptr (globals/global-type "globals-test-pointer")))
+    (is (= :boolean (globals/global-type "clodin.compiler/globals-test-boolean")))
+    (is (= :i64 (globals/global-type "clodin.compiler/globals-test-counter")))
+    (is (= :ptr (globals/global-type "clodin.compiler/globals-test-pointer")))
     (is (instance? clodin.globals.Global globals-test-counter)))
 
   (testing "the handle implements the interfaces reset! and swap! need"
@@ -3731,7 +3867,7 @@
       (let [[entry changed?] (globals/register! "clodin.compiler"
                                                 "globals-test-retyped" :f64 1.5)]
         (is (true? changed?))
-        (is (= "globals-test-retyped$g1" (:symbol entry)))
+        (is (= "clodin.compiler.globals-test-retyped$g1" (:symbol entry)))
         (is (= :f64 (:type entry)))))
     (testing "the re-emitted body reads the new layout"
       (define-proc! "clodin.compiler" "globals-test-retyped-reader" [] []
@@ -3865,10 +4001,33 @@
                           (define-proc! "clodin.compiler" "stack-allocate-arity" [] []
                                         '[(stack-allocate 16)] nil false))))
 
-  (testing "stack-allocate is a reserved name, so a procedure cannot shadow it"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"built in form"
-                          (defproc-form "clodin.compiler" 'stack-allocate []
-                                        '[(to-i32 0)])))))
+  (testing "a procedure may shadow a compiler form, but stays qualified only"
+    (let [namespace "clodin.compiler.shadow"
+          warnings (with-out-str
+                     (binding [*err* *out*]
+                       (defproc-form namespace 'stack-allocate []
+                                     '[(to-i32 0)])))]
+      (try
+        (is (string/includes? warnings "shadows the compiler form"))
+        (is (= :i32 (:return-type (get @procedure-registry
+                                       "clodin.compiler.shadow/stack-allocate"))))
+        ;; An unqualified name still means the form, so the body below compiles
+        ;; a stack block rather than calling the shadowing procedure.
+        (define-proc! "clodin.compiler.shadow" "unqualified-is-the-form" [] []
+                      '[(stack-allocate 8 8)] nil false)
+        (is (= :ptr (:return-type (get @procedure-registry
+                                       "clodin.compiler.shadow/unqualified-is-the-form"))))
+        ;; The qualified name reaches the procedure.
+        (define-proc! "clodin.compiler.shadow" "qualified-is-the-procedure" [] []
+                      '[(clodin.compiler.shadow/stack-allocate)] nil false)
+        (is (= :i32 (:return-type (get @procedure-registry
+                                       "clodin.compiler.shadow/qualified-is-the-procedure"))))
+        (finally
+          (doseq [name ["clodin.compiler.shadow/stack-allocate"
+                        "clodin.compiler.shadow/unqualified-is-the-form"
+                        "clodin.compiler.shadow/qualified-is-the-procedure"]]
+            (swap! procedure-registry dissoc name)
+            (swap! procedure-handles dissoc name)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; is-null and pointer-call tests
@@ -3961,7 +4120,8 @@
     (is (= 5 (pointer-call-strlen (libc-symbol "strlen")))))
 
   (testing "an argument and return type written at the call site are used"
-    (is (= :i64 (:return-type (get @procedure-registry "pointer-call-inferred")))))
+    (is (= :i64 (:return-type (get @procedure-registry
+                                   "clodin.compiler/pointer-call-inferred")))))
 
   (testing "a void signature produces no value"
     (let [arena (Arena/ofShared)
@@ -4149,7 +4309,7 @@
     (is (nil? (store-only (.allocate (Arena/ofShared) 8) 1))))
 
   (testing "the registry keeps the declaration but reports a void ABI"
-    (let [entry (get @procedure-registry "void-value-body")]
+    (let [entry (get @procedure-registry "clodin.compiler/void-value-body")]
       (is (nil? (:return-type entry)))
       (is (= :void (:explicit-return-type entry)))))
 
@@ -4169,6 +4329,93 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unsupported return type"
                           (define-proc! "clodin.compiler" "unsupported-return" [] []
                                         '[1] :i8 false)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Qualified names
+;;; ---------------------------------------------------------------------------
+
+(deftest test-qualified-names
+  (try
+    (testing "a procedure registers under its qualified name and symbol"
+      (define-proc! "examples.naming" "helper" [] [] '[41] :i64 false)
+      (let [entry (get @procedure-registry "examples.naming/helper")]
+        (is (some? entry))
+        (is (= "helper" (:name entry)))
+        (is (= "examples.naming" (:namespace entry)))
+        (is (= "examples.naming.helper" (:body-symbol entry)))))
+
+    (testing "its own namespace reaches it unqualified"
+      (define-proc! "examples.naming" "own-caller" [] []
+                    '[(helper)] :i64 false)
+      (is (= :i64 (:return-type (get @procedure-registry
+                                     "examples.naming/own-caller")))))
+
+    (testing "another namespace reaches it by qualified name"
+      (define-proc! "examples.naming" "qualified-caller" [] []
+                    '[(examples.naming/helper)] :i64 false)
+      (is (= :i64 (:return-type (get @procedure-registry
+                                     "examples.naming/qualified-caller")))))
+
+    (testing "an unqualified name is not visible from another namespace"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                            #"Unknown clodin procedure: helper"
+                            (define-proc! "examples.other" "caller" [] []
+                                          '[(helper)] :i64 false))))
+
+    (testing "two namespaces can define the same short name"
+      (define-proc! "examples.other" "helper" [] [] '[42] :i64 false)
+      (is (= "examples.other.helper"
+             (:body-symbol (get @procedure-registry "examples.other/helper"))))
+      (is (= "examples.naming.helper"
+             (:body-symbol (get @procedure-registry "examples.naming/helper")))))
+
+    (testing "a core procedure is visible unqualified everywhere"
+      (define-proc! "clodin.core" "core-helper" [] [] '[7] :i64 false)
+      (define-proc! "examples.other" "core-caller" [] []
+                    '[(core-helper)] :i64 false)
+      (is (= :i64 (:return-type (get @procedure-registry
+                                     "examples.other/core-caller")))))
+
+    (testing "its own namespace shadows core"
+      (define-proc! "clodin.core" "shadowed-helper" [] [] '[1] :i64 false)
+      (define-proc! "examples.naming" "shadowed-helper" [] [] '[2] :i64 false)
+      (define-proc! "examples.naming" "shadow-caller" [] []
+                    '[(shadowed-helper)] :i64 false)
+      (let [callees (:callees (get @procedure-registry
+                                   "examples.naming/shadow-caller"))]
+        (is (contains? callees "examples.naming/shadowed-helper"))
+        (is (not (contains? callees "clodin.core/shadowed-helper")))))
+
+    (testing "a global is qualified the same way"
+      (define-var! "examples.naming" "counter" :i64 5)
+      (is (= "examples.naming.counter"
+             (:symbol (globals/entry "examples.naming/counter"))))
+      (define-proc! "examples.naming" "reads-own-global" [] []
+                    '[(+ counter 1)] :i64 false)
+      (define-proc! "examples.naming" "reads-qualified-global" [] []
+                    '[(+ examples.naming/counter 1)] :i64 false)
+      (is (= #{"examples.naming.counter"}
+             (:globals (get @procedure-registry
+                            "examples.naming/reads-own-global"))))
+      (is (= #{"examples.naming.counter"}
+             (:globals (get @procedure-registry
+                            "examples.naming/reads-qualified-global"))))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unknown symbol: counter"
+                            (define-proc! "examples.other" "reads-naming-global" [] []
+                                          '[(+ counter 1)] :i64 false))))
+
+    (finally
+      (doseq [name ["examples.naming/helper" "examples.naming/own-caller"
+                    "examples.naming/qualified-caller"
+                    "examples.naming/shadowed-helper"
+                    "examples.naming/shadow-caller"
+                    "examples.naming/reads-own-global"
+                    "examples.naming/reads-qualified-global"
+                    "examples.other/helper" "examples.other/core-caller"
+                    "clodin.core/core-helper" "clodin.core/shadowed-helper"]]
+        (swap! procedure-registry dissoc name)
+        (swap! procedure-handles dissoc name))
+      (swap! globals/registry dissoc "examples.naming/counter"))))
 
 (defn -main
   [& _]

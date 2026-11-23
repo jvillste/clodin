@@ -18,6 +18,7 @@
   that gives real atomic loads, stores and compare-and-set for both sides.
   Native code still sees an i1 after the load and converts on the store."
   (:require [clodin.llvm-api :as llvm]
+            [clodin.names :as names]
             [clojure.string :as string])
   (:import (clojure.lang IAtom2 IDeref IPersistentVector)
            (java.lang.foreign Arena MemorySegment ValueLayout)
@@ -140,21 +141,22 @@
   and re-emit every body, the same way a procedure signature change is
   handled."
   [namespace name type initial-value]
-  (let [name (str name)]
-    (when (string/includes? name "$")
-      (throw (ex-info "Global names must not contain '$'" {:name name})))
+  (let [name (str name)
+        qualified (names/qualified-name namespace name)]
+    (names/valid-short-name! "Global" name)
     (when-not (supported-type? type)
       (throw (ex-info (str "Unsupported global type: " type)
-                      {:name name :type type})))
-    (check-value! name type initial-value)
-    (let [existing (entry name)
+                      {:name qualified :type type})))
+    (check-value! qualified type initial-value)
+    (let [existing (entry qualified)
           type-changed? (and existing (not= type (:type existing)))
           revision (if type-changed? (inc (:revision existing 0)) 0)
+          base-symbol (names/symbol-name namespace name :qualified)
           symbol (cond
-                   (nil? existing) name
-                   type-changed? (str name "$g" (max 1 revision))
+                   (nil? existing) base-symbol
+                   type-changed? (str base-symbol "$g" (max 1 revision))
                    :else (:symbol existing))]
-      (swap! registry assoc name
+      (swap! registry assoc qualified
              {:namespace namespace
               :name name
               :type type
@@ -163,11 +165,12 @@
               :revision revision
               :address (when-not type-changed? (:address existing))
               :jit (when-not type-changed? (:jit existing))})
-      [(entry name) type-changed?])))
+      [(entry qualified) type-changed?])))
 
 (defn set-initial-value!
   "Records a new source initial value for an already registered global
-  without changing its live storage, mirroring defonce."
+  without changing its live storage, mirroring defonce. name is the global's
+  qualified name."
   [name initial-value]
   (let [name (str name)
         existing (entry name)]

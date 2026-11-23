@@ -16,7 +16,7 @@
 
 (defn- procedure-bitcode
   [procedure-name]
-  (or (:bitcode (get @compiler/procedure-registry (str procedure-name)))
+  (or (some-> (compiler/procedure-entry procedure-name) second :bitcode)
       (throw (ex-info (str "Unknown clodin procedure: " procedure-name)
                       {:procedure procedure-name}))))
 
@@ -258,7 +258,8 @@
 
 (deftest test-llvm-ir
   (testing "the stored bitcode prints as llvm ir"
-    (is (re-find #"define i64 @add-both" (llvm-ir "add-both")))))
+    (is (re-find #"define i64 @clodin\.compiler\.add-both"
+                 (llvm-ir "add-both")))))
 
 (deftest test-assembly
   (testing "the procedure emits target assembly"

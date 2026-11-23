@@ -77,15 +77,74 @@ unloaded until a full reset.
 
 ### Naming
 
+Symbols are qualified; see "Qualified names" below for the rule and the
+separators. Relative to a mangled procedure symbol `foo`:
+
 - The first stub for a name is `foo`. A signature change mints a new stub
   `foo$sigK`, where K counts signature revisions for that name. The registry
   keeps `name -> {signature -> stub}`. Old stubs stay until a reset.
 - Bodies are `foo$N`, where N is a process-wide monotonic counter. A body
   symbol is never reused. In `:monolithic` mode the body is emitted under the
-  public name `foo` with no version number.
-- Generated names use `$` suffixes. Procedure and global names containing `$`
-  are rejected for now, so a Clojure symbol can never collide with a
-  generated stub, body, setter, cell or global symbol.
+  procedure's symbol `foo` with no version number.
+- Generated names use `$` suffixes, and a short name may not contain `$` or
+  `.`, so a Clojure symbol can never collide with a generated stub, body,
+  setter, cell or global symbol.
+
+### Qualified names (done)
+
+Names are qualified: every procedure and global is registered under
+`namespace/name` and its native symbol carries the namespace as
+`namespace.name`. The prefix rule below was written when names were bare, so
+read `foo` everywhere in this section as the mangled symbol
+`clodin.compiler.foo`, `foo$N` as `clodin.compiler.foo$N`, and so on.
+
+Decisions:
+
+- **Why.** Two namespaces must be able to define the same short name, and the
+  JIT looks symbols up by name, so the namespace has to be in the symbol.
+  C++ has the same requirement and solves it the same way: namespaces vanish
+  at link time and the mangled symbol carries them (`ns::foo` becomes
+  `_ZN2ns3fooEv`), so `a::foo` and `b::foo` cannot collide. There is no ADL
+  analogue and none is wanted: clodin has no overloading, so a reference is
+  resolved by namespace, not by argument type.
+- **Separators.** The registry key uses `/` (`clodin.runtime/print-i64`); the
+  native symbol uses `.` (`clodin.runtime.print-i64`). `$` stays reserved for
+  generated suffixes (`foo$3`, `foo$sig2`, `counter$g1`), and a short name may
+  not contain `$` or `.`, so `clodin.runtime.print-i64$3` can only be read one
+  way. Both rules are in `clodin.names`.
+- **Resolution.** A symbol with a slash is used as written. An unqualified
+  symbol refers to the defining namespace first, then to `clodin.core`, and
+  nothing else. There is no `require`, `refer` or alias form yet, so a
+  procedure in another namespace is called by its qualified name. Clodin has
+  no overloading, so namespace resolution is the whole rule and there is no
+  argument driven lookup to add later.
+- **Offline builds drop the prefix.** A JIT build needs the qualified symbol,
+  but the system linker exports the plain names and the entry point has to be
+  exactly `main`, so `procedures-for-linking` binds `*symbol-style*` to
+  `:plain`. The consequence is that short names must be unique across the
+  procedure set of one offline build, which is what they were before this
+  change.
+- **Shadowing is allowed.** `clodin.core` is a namespace like any other and
+  holds no procedures yet, because `print` and `println` are compiler forms,
+  not procedures: they are variadic and lowered per operand type, so they
+  cannot be written as `defproc`s. A definition may shadow a built in form,
+  but an unqualified reference always means the form, so the procedure is then
+  reachable only by its qualified name. `defproc` and `defvar` warn when that
+  happens instead of rejecting it.
+- **Globals too.** Same rule, same mangling: `clodin.runtime/clodin-write` is
+  `clodin.runtime.clodin-write` natively. Globals always keep the qualified
+  symbol, even in an offline build, because nothing has to export them.
+- **REPL leniency.** `invoke-procedure` and the `clodin.inspect` helpers accept
+  a short name when exactly one registered procedure has it, and report the
+  candidates when it is ambiguous. The language itself is always strict.
+- **Not part of this change.** Module state is still global to
+  `clodin.compiler`: one module, one JIT, one handle table. Qualified names do
+  not make a reload of one namespace cheaper; that is still the separate
+  namespace-aware module state item. `:callees` keys and `procedure-handles`
+  are qualified names now, so that work starts from a consistent base.
+
+Covered by `test-qualified-names` in `clodin.compiler` and
+`clodin.names`'s own tests.
 
 ### Stub module
 
@@ -389,8 +448,11 @@ Each stub, body and global module gets its own IR and disassembly view.
 The registry is the source of truth for the module. Each procedure entry
 stores (refined by "Hot reload design decisions"):
 
-- `:namespace` — the defining namespace, used by AOT selection.
-- `:name` — the public symbol name.
+- `:namespace` — the defining namespace, used by AOT selection and to build
+  the native symbol.
+- `:name` — the short name, without the namespace.
+- The registry key is the qualified name `namespace/name`; the native symbol
+  is `namespace.name`.
 - `:param-names` — the parameter symbols, needed to re-emit the AST.
 - `:param-types` — the parameter types.
 - `:return-type` — the settled return type (explicit or inferred).
@@ -461,10 +523,11 @@ did not change.
 
 - [ ] Make module state namespace-aware.
 
-  `procedure-registry`, `module-dirty`, the current JIT generation, and
-  the downcall handles are currently global to `clodin.compiler`. Multiple
-  namespaces that use `defproc` share one module, so editing one
-  namespace can force a full rebuild that includes unrelated
+  Registry keys, `:callees` keys and handle keys are qualified names now, so
+  the naming half of this is done. What is still shared is the state itself:
+  `module-dirty`, the current JIT generation and the downcall handles are
+  global to `clodin.compiler`, and every namespace compiles into one module.
+  Editing one namespace still forces a full rebuild that includes unrelated
   procedures.
 
 - [ ] Support forward references and mutual recursion with `declare-proc`.
@@ -582,10 +645,11 @@ Deferred deliberately; everything on this list is a separate iteration.
   Buffers, structs and arrays as global storage. Needs the Odin-style buffer
   type first, then a constant-expression form for the initializer.
 
-- [ ] Namespace-qualified global symbols.
-  Globals are bare-named, so two namespaces cannot both define `counter`.
-  This is blocked on the general namespace-aware module state, the same
-  blocker as procedures.
+- [x] Namespace-qualified global symbols.
+  Globals are registered as `namespace/name` with the native symbol
+  `namespace.name`, the same rule as procedures. Two namespaces can both
+  define `counter`. It turned out to need only the naming refactor, not the
+  namespace-aware module state. See "Qualified names".
 
 - [ ] Ownership and freeing.
   A `:ptr` global can hold malloc'ed memory but nothing frees it, and a
@@ -884,6 +948,11 @@ address-of-procedure form, so `pointer-call` reaches JVM upcall stubs and
 resolved C symbols only. See "Next features".
 
 ### Phase 4: move the runtime into clodin
+
+The naming question is settled: runtime helpers live in `clodin.runtime` and
+are called by their qualified names, `clodin.core` holds no procedures because
+`print` and `println` are compiler forms, and `clodin-write` is
+`clodin.runtime/clodin-write`. See "Qualified names".
 
 - New namespace `clodin.runtime` with the print helpers as `defproc`s.
 - The writer pointer becomes a global, `(defvar clodin-write :ptr nil)`, used by
