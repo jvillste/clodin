@@ -63,6 +63,15 @@
   (when condition body...) runs its body only when the condition is true and
   produces no value; use if when a value is needed.
 
+  Raw memory is reached through (load type pointer), (store type pointer
+  value), (pointer-add pointer offset), (buffer-get pointer type index) and
+  (buffer-set pointer type index value). (stack-allocate byte-count alignment)
+  reserves an uninitialised block on the stack and yields a :ptr to it, one
+  block per call however often a loop runs it. (is-null pointer) tests address
+  zero, and (pointer-call pointer [param-types] return-type arguments...) calls
+  a function address with its signature written at the call site, because a
+  :ptr carries no type.
+
   Top level mutable state is declared with (defvar name type literal), for
   example (defvar running? :boolean true). In clodin source the name reads as
   a value and (set name value) writes it. Access is atomic on both sides, so a
@@ -85,7 +94,8 @@
             [clojure.string :as string]
             [clojure.test :refer [deftest is run-tests testing]])
   (:import (java.lang.foreign Arena FunctionDescriptor Linker Linker$Option
-                              MemorySegment SymbolLookup ValueLayout)))
+                              MemoryLayout MemorySegment SymbolLookup ValueLayout)
+           (java.lang.invoke MethodHandles MethodType)))
 
 (declare compile-expression compile-body)
 
@@ -931,6 +941,96 @@
   [type]
   (or type "no value"))
 
+(def ^:private scalar-types
+  "The types a pointer-call signature may name. Aggregate types do not exist
+  yet, and :void is only legal as a return type."
+  #{:boolean :i64 :i32 :f64 :f32 :ptr})
+
+(defn- pointer-call-signature
+  "Reads the literal signature of a pointer-call: a vector of parameter types
+  and a return type, where :void (or nil) means the call produces no value.
+
+  The signature is written at the call site because a :ptr carries no type.
+  LLVM trusts the function type it is given, so a mismatch does not fail at
+  build time, it silently reinterprets values; this checks everything the
+  written form can be checked against."
+  [param-type-forms return-type-form]
+  (when-not (vector? param-type-forms)
+    (throw (ex-info "pointer-call expects a literal vector of parameter types"
+                    {:param-types param-type-forms})))
+  (doseq [param-type param-type-forms]
+    (when-not (contains? scalar-types param-type)
+      (throw (ex-info (str "pointer-call parameter types are "
+                           ":boolean :i64 :i32 :f64 :f32 :ptr, got "
+                           (pr-str param-type))
+                      {:param-type param-type}))))
+  (let [void-return? (or (nil? return-type-form) (= :void return-type-form))]
+    (when-not (or void-return? (contains? scalar-types return-type-form))
+      (throw (ex-info (str "pointer-call return type is "
+                           ":void :boolean :i64 :i32 :f64 :f32 :ptr, got "
+                           (pr-str return-type-form))
+                      {:return-type return-type-form})))
+    {:param-types (vec param-type-forms)
+     :return-type (when-not void-return? return-type-form)}))
+
+(deftest test-pointer-call-signature
+  (is (= {:param-types [:ptr :i64] :return-type :i32}
+         (pointer-call-signature [:ptr :i64] :i32)))
+  (is (= {:param-types [] :return-type nil}
+         (pointer-call-signature [] :void)))
+  (is (= {:param-types [] :return-type nil}
+         (pointer-call-signature [] nil)))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"literal vector"
+                        (pointer-call-signature '(:ptr) :i64)))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"parameter types are"
+                        (pointer-call-signature [:void] :i64)))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"return type is"
+                        (pointer-call-signature [] :i8))))
+
+(defn- compile-pointer-call
+  "Compiles (pointer-call pointer [param-types] return-type arguments...), an
+  indirect call through a :ptr that holds a function address, so clodin source
+  can reach a JVM upcall stub or a C function address.
+
+  There is no null guard: a null pointer jumps to address zero and takes the
+  process down. A caller whose pointer may be absent tests it first with
+  is-null, which is what the print runtime's writer pointer does."
+  [state environment expression]
+  (when (< (count expression) 4)
+    (throw (ex-info (str "pointer-call expects (pointer-call pointer"
+                         " [param-types] return-type arguments...)")
+                    {:expression expression})))
+  (let [[pointer-form param-type-forms return-type-form & argument-forms]
+        (rest expression)
+        {:keys [param-types return-type]}
+        (pointer-call-signature param-type-forms return-type-form)
+        [state pointer-value pointer-type]
+        (compile-expression state environment pointer-form)]
+    (when-not (= :ptr pointer-type)
+      (throw (ex-info (str "pointer-call expects a :ptr function address, got "
+                           (type-name pointer-type))
+                      {:type pointer-type})))
+    (when-not (= (count argument-forms) (count param-types))
+      (throw (ex-info (str "pointer-call signature " (vec param-types) " takes "
+                           (count param-types) " arguments, got "
+                           (count argument-forms))
+                      {:param-types param-types
+                       :argument-count (count argument-forms)})))
+    (let [[state argument-values argument-types]
+          (compile-operands state environment argument-forms)]
+      (when-not (= argument-types param-types)
+        (throw (ex-info (str "Argument types " argument-types
+                             " do not match pointer-call parameters " param-types)
+                        {:argument-types argument-types
+                         :param-types param-types})))
+      (let [{:keys [context builder arena]} state
+            function-type (llvm/function-type context arena return-type param-types)
+            result (llvm/build-call builder function-type pointer-value
+                                    argument-values arena)]
+        (if return-type
+          [state result return-type]
+          [state nil nil])))))
+
 (defn- compile-let
   "Compiles (let [name type value ...] body...). Every binding gets its
   own stack slot, so a later binding may shadow an earlier one and the
@@ -1071,6 +1171,22 @@
           result (if (float-type? type)
                    (llvm/build-fcmp builder operator (first values) (second values) arena)
                    (llvm/build-icmp builder operator (first values) (second values) arena))]
+      [state result :boolean])))
+
+(defn- compile-is-null
+  "Compiles (is-null pointer) into a comparison against address zero. A :ptr is
+  the only clodin type that has a null, so a caller that may hold an absent
+  address, such as the print runtime's writer pointer, tests it with this."
+  [state environment expression]
+  (when-not (= 2 (count expression))
+    (throw (ex-info "is-null expects (is-null pointer)" {:expression expression})))
+  (let [[state value type] (compile-expression state environment (second expression))]
+    (when-not (= :ptr type)
+      (throw (ex-info (str "is-null expects a :ptr, got " (type-name type))
+                      {:type type})))
+    (let [result (llvm/build-icmp (:builder state) '= value
+                                  (llvm/const-null (llvm/type-for (:context state) :ptr))
+                                  (:arena state))]
       [state result :boolean])))
 
 (defn- compile-boolean-condition
@@ -1310,6 +1426,8 @@
         (= operator 'buffer-get) (compile-buffer-get state environment expression)
         (= operator 'buffer-set) (compile-buffer-set state environment expression)
         (= operator 'to-pointer) (compile-to-pointer state environment expression)
+        (= operator 'is-null) (compile-is-null state environment expression)
+        (= operator 'pointer-call) (compile-pointer-call state environment expression)
         (= operator 'stack-allocate) (compile-stack-allocate state environment expression)
         (= operator 'let) (compile-let state environment expression)
         (= operator 'set) (compile-set state environment expression)
@@ -1367,6 +1485,13 @@
           (= operator 'buffer-get) (nth expression 2)
           (= operator 'buffer-set) nil
           (= operator 'to-pointer) :ptr
+          (= operator 'is-null) :boolean
+          (= operator 'pointer-call)
+          ;; A malformed form falls through as no value so that compilation
+          ;; reports the arity error rather than this reader.
+          (when (>= (count expression) 4)
+            (:return-type (pointer-call-signature (nth expression 2)
+                                                  (nth expression 3))))
           (= operator 'stack-allocate) :ptr
           (= operator 'let)
           (let [[_ bindings & inner-body] expression
@@ -2422,7 +2547,7 @@
 
 (def ^:private reserved-names
   "Names the compiler lowers itself, so a user definition would be shadowed."
-  #{"print" "println" "stack-allocate"})
+  #{"print" "println" "stack-allocate" "is-null" "pointer-call"})
 
 (defn- defvar-form
   "Parses a defvar form, registers the global through define-var! and returns
@@ -3661,6 +3786,154 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"built in form"
                           (defproc-form "clodin.compiler" 'stack-allocate []
                                         '[(to-i32 0)])))))
+
+;;; ---------------------------------------------------------------------------
+;;; is-null and pointer-call tests
+;;; ---------------------------------------------------------------------------
+
+(defproc is-null-pointer [pointer :ptr]
+  (if (is-null pointer) 1 0))
+
+;; strlen is a libc symbol, so this covers a real C function address reached
+;; through a :ptr rather than through a declared extern.
+(defproc pointer-call-strlen [strlen :ptr]
+  (pointer-call strlen [:ptr] :i64 "hello"))
+
+;; No declared return type: :i64 comes from the pointer-call signature.
+(defproc pointer-call-inferred [strlen :ptr]
+  (pointer-call strlen [:ptr] :i64 "hello"))
+
+;; The shape the print runtime needs: the writer pointer may be absent.
+(defproc pointer-call-if-null [callback :ptr value :i64]
+  (if (is-null callback)
+    -1
+    (pointer-call callback [:i64] :i64 value)))
+
+;; A void signature produces no value.
+(defproc pointer-call-void-callback [callback :ptr value :i64]
+  (pointer-call callback [:i64] :void value))
+
+(defn- libc-symbol
+  "Resolves a name in the default lookup, which covers the C library, and
+  returns its address as a :ptr, so a test can hand clodin a real code pointer."
+  [name]
+  (let [lookup (.defaultLookup (Linker/nativeLinker))]
+    (.orElseThrow (.find lookup name))))
+
+(defn- upcall-stub
+  "Builds a JVM upcall stub with the given FunctionDescriptor that invokes
+  handler, and returns its segment. This is how a test hands native code an
+  address that re-enters the JVM."
+  [^Arena arena ^FunctionDescriptor descriptor handler]
+  (let [method-type (.toMethodType descriptor)
+        argument-count (.parameterCount method-type)
+        invoke-type (MethodType/methodType
+                     Object (into-array Class (repeat argument-count Object)))
+        handle (-> (.findVirtual (MethodHandles/publicLookup)
+                                 clojure.lang.IFn "invoke" invoke-type)
+                   (.bindTo handler)
+                   (.asType method-type))]
+    (clojure.lang.Reflector/invokeInstanceMethod
+     (Linker/nativeLinker) "upcallStub"
+     (to-array [handle descriptor arena (make-array Linker$Option 0)]))))
+
+(defn- record-i64-upcall
+  "A void(i64) upcall that records its argument."
+  [^Arena arena recorded]
+  (upcall-stub arena
+               (FunctionDescriptor/ofVoid
+                (into-array MemoryLayout [ValueLayout/JAVA_LONG]))
+               (fn [value] (reset! recorded value))))
+
+(defn- echo-i64-upcall
+  "An i64(i64) upcall that returns its argument."
+  [^Arena arena]
+  (upcall-stub arena
+               (FunctionDescriptor/of ValueLayout/JAVA_LONG
+                                      (into-array MemoryLayout [ValueLayout/JAVA_LONG]))
+               (fn [value] value)))
+
+(deftest test-is-null
+  (testing "a :ptr holding address zero is null and any other address is not"
+    (let [arena (Arena/ofShared)]
+      (try
+        (is (= 1 (is-null-pointer nil)))
+        (is (= 1 (is-null-pointer (MemorySegment/ofAddress 0))))
+        (is (= 0 (is-null-pointer (.allocate arena 8))))
+        (finally
+          (.close arena)))))
+
+  (testing "is-null rejects a type that cannot hold a null"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"expects a :ptr, got :i64"
+                          (define-proc! "clodin.compiler" "is-null-non-pointer" [] []
+                                        '[(if (is-null 5) 1 0)] :i64 false))))
+
+  (testing "is-null expects exactly one operand"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"is-null expects"
+                          (define-proc! "clodin.compiler" "is-null-arity" [] []
+                                        '[(if (is-null) 1 0)] :i64 false)))))
+
+(deftest test-pointer-call
+  (testing "a pointer-call reaches a libc function address"
+    (is (= 5 (pointer-call-strlen (libc-symbol "strlen")))))
+
+  (testing "an argument and return type written at the call site are used"
+    (is (= :i64 (:return-type (get @procedure-registry "pointer-call-inferred")))))
+
+  (testing "a void signature produces no value"
+    (let [arena (Arena/ofShared)
+          recorded (atom nil)]
+      (try
+        (is (nil? (pointer-call-void-callback (record-i64-upcall arena recorded) 42)))
+        (is (= 42 @recorded))
+        (finally
+          (.close arena)))))
+
+  (testing "a pointer-call reaches a JVM upcall stub"
+    (let [arena (Arena/ofShared)]
+      (try
+        (is (= 7 (pointer-call-if-null (echo-i64-upcall arena) 7)))
+        (finally
+          (.close arena)))))
+
+  (testing "a null pointer is the caller's problem, tested with is-null"
+    (is (= -1 (pointer-call-if-null nil 7))))
+
+  (testing "the written signature is checked as far as it can be"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"expects a :ptr function address"
+                          (define-proc! "clodin.compiler" "pointer-call-non-pointer" [] []
+                                        '[(pointer-call 5 [] :void)] nil false)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"takes 1 arguments, got 0"
+                          (define-proc! "clodin.compiler" "pointer-call-arity" ['callback] [:ptr]
+                                        '[(pointer-call callback [:i64] :void)] nil false)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"do not match pointer-call parameters"
+                          (define-proc! "clodin.compiler" "pointer-call-argument-types"
+                                        ['callback] [:ptr]
+                                        '[(pointer-call callback [:i64] :void 1.5)]
+                                        nil false)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"literal vector of parameter types"
+                          (define-proc! "clodin.compiler" "pointer-call-non-literal"
+                                        ['callback] [:ptr]
+                                        '[(pointer-call callback :i64 :void)]
+                                        nil false)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"parameter types are"
+                          (define-proc! "clodin.compiler" "pointer-call-void-parameter"
+                                        ['callback] [:ptr]
+                                        '[(pointer-call callback [:void] :void)]
+                                        nil false)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"return type is"
+                          (define-proc! "clodin.compiler" "pointer-call-silly-return"
+                                        ['callback] [:ptr]
+                                        '[(pointer-call callback [] :i8)]
+                                        nil false))))
+
+  (testing "a void call has no value to bind"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"its value is no value"
+                          (define-proc! "clodin.compiler" "pointer-call-void-value"
+                                        ['callback] [:ptr]
+                                        '[(let [value :i64 (pointer-call callback [] :void)]
+                                            value)]
+                                        nil false)))))
 
 (defn -main
   [& _]

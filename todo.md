@@ -641,7 +641,9 @@ of the boundary. Only the native half moves.
    would race between threads. Resolved by Phase 2, `(stack-allocate size
    alignment)`.
 3. There is no indirect call, so a `:ptr` holding a function address cannot be
-   invoked from clodin source.
+   invoked from clodin source. Resolved by Phase 3, `(pointer-call pointer
+   [param-types] return-type args...)`, together with `(is-null pointer)` for
+   the null check.
 
 ### Mapping of runtime functions
 
@@ -816,31 +818,76 @@ At `:O3` on linux-aarch64, `stack-scratch-record-addresses` emits one
 Covered by `test-stack-allocate`, `test-stack-allocate-literal` and
 `test-power-of-two` in `clodin.compiler`.
 
-### Phase 3: indirect call
+### Phase 3: indirect call (done)
 
 A form that calls a function pointer:
 
-    (call-pointer clodin-write :void [:ptr :i64] data length)
+    (pointer-call clodin-write [:ptr :i64] :void data length)
 
-Options:
+Decisions:
 
-- `(call-pointer pointer return-type [param-types ...] args...)`: explicit and
-  small; the type is written at the call site.
-- A first class function-pointer type `:fn` so a `:ptr` can be called directly:
-  larger type-system change, and every place that handles `:ptr` would need to
-  distinguish the two.
+- The form is `(pointer-call pointer [param-types] return-type args...)`:
+  pointer first, then the signature, then the arguments. Parameter types come
+  before the return type to match `extern`, which is `(extern name [params]
+  return-type ...)`, so there is one order to remember.
+- The name is `pointer-call`, not `call-pointer`, for the same reason
+  `stack-allocate` beat `alloca`: the family is object first, verb second
+  (`pointer-add`, `buffer-get`, `buffer-set`, `stack-allocate`), and the noun
+  names the thing being called.
+- The signature is written at the call site because a `:ptr` carries no type. A
+  `:fn` type was rejected: it is a larger type-system change, and every place
+  that handles `:ptr` would have to distinguish the two.
+- The signature must be literal: a literal vector of parameter types and a
+  literal return type. Parameter types are checked against
+  `:boolean :i64 :i32 :f64 :f32 :ptr`, a return type of `:void` (or `nil`, as
+  `extern` allows) means the call produces no value, and `:void` is rejected as
+  a parameter. The argument count must equal the vector length and every
+  argument type is checked against the written one.
+- The callee's *real* signature cannot be checked: LLVM trusts the function
+  type it is handed and silently reinterprets values on a mismatch. That is
+  documented rather than prevented, and it is why the written form is checked
+  as strictly as it can be.
+- A `:void` call produces no value, so binding one is a compile error rather
+  than a mystery `i64` from the return register.
+- No variadic pointer calls. `extern` has `:varargs`, but a `:ptr` to `printf`
+  cannot be called; the print runtime only needs the fixed-signature `write`
+  fallback, which goes through `extern`, not through a pointer.
+- No null guard. A null pointer jumps to address zero and takes the process
+  down; the caller tests first. Silently calling `abort` instead would hide the
+  mistake behind a call that appears to return.
+- `(is-null pointer)` was added for exactly that test: an `icmp eq` against
+  address zero, yielding a `:boolean`. A `:ptr` is the only clodin type that
+  can hold a null, so any other operand is a compile error. This is the one
+  place the print runtime needs it: `clodin$write$bytes` checks its writer
+  pointer before calling through it.
+- The result type drives `expression-type`, so a procedure ending in a
+  `pointer-call` infers the declared return type and `:void` means no value.
+- A `pointer-call` records no `:callees` entry, because there is no name to
+  re-emit against. Globals referenced inside the pointer expression are
+  recorded by the ordinary compile path, so AOT selection and re-emission stay
+  correct.
+- `:boolean` in a pointer signature lowers to `i1`, while the JVM boundary uses
+  a one-byte layout. That mismatch already exists for `extern` and procedure
+  signatures, so it is allowed for consistency and not promised for C `_Bool`.
+- Both names are reserved, so no procedure can shadow `pointer-call` or
+  `is-null`.
 
-Recommendation: `call-pointer`. It is one compiler form and one `build-call`
-with a loaded pointer, and it does not touch the type system.
+Acceptance met: `clodin$write$bytes` can be written as a `defproc`, including
+the null check that falls back to `write(1, ...)`. Covered by
+`test-pointer-call`, `test-pointer-call-signature` and `test-is-null` in
+`clodin.compiler`, which reach a real libc address (`strlen`, resolved from the
+JVM side with the default lookup) and a JVM upcall stub in both directions. The
+null pointer trap itself is documented, not tested: triggering it kills the JVM.
 
-Acceptance: `clodin$write$bytes` can be written as a `defproc`, including the
-null check that falls back to `write(1, ...)`.
+Deferred: a native callback that points at a *clodin* procedure. There is no
+address-of-procedure form, so `pointer-call` reaches JVM upcall stubs and
+resolved C symbols only. See "Next features".
 
 ### Phase 4: move the runtime into clodin
 
 - New namespace `clodin.runtime` with the print helpers as `defproc`s.
 - The writer pointer becomes a global, `(defvar clodin-write :ptr nil)`, used by
-  `clodin$write$bytes` as `(call-pointer clodin-write ...)`. This reuses the
+  `clodin$write$bytes` as `(pointer-call clodin-write ...)`. This reuses the
   globals feature instead of a hand-built global.
 - The compiler loads `clodin.runtime` before any user namespace and, after
   creating or resetting the JIT, `reset!`s `clodin-write` to
@@ -849,6 +896,46 @@ null check that falls back to `write(1, ...)`.
   fallback writes to file descriptor 1.
 - Delete `runtime-module`, the `build-*` helpers and the `install-runtime!`
   module plumbing. `clodin.print` keeps only the upcall stub and the writer.
+
+Phases 1 to 3 unblock both functions, but they are not writable in the
+obvious shape. The natural spelling is rejected, because one arm produces a
+value and the other does not:
+
+    (if (is-null clodin-write)
+      (write (to-i32 1) data length)                  ; :i64
+      (pointer-call clodin-write [:ptr :i64] :void data length))   ; no value
+
+    ;; if arms must both produce a value of the same type, or both be
+    ;; statements; got :i64 and no value
+
+Two shapes do compile, and choosing between them (or adding a form) is the
+first Phase 4 decision:
+
+1. Two complementary `when`s. `when` discards its body's value, so no dummy
+   binding is needed, at the cost of testing the pointer twice and spelling the
+   negation as `(= ... false)` because there is no `not`:
+
+       (when (is-null clodin-write)
+         (write (to-i32 1) data length))
+       (when (= (is-null clodin-write) false)
+         (pointer-call clodin-write [:ptr :i64] :void data length))
+
+2. A `let`-bound dummy, so both arms are statements:
+
+       (let [ignored :i64 0]
+         (if (is-null clodin-write)
+           (set ignored (write (to-i32 1) data length))
+           (pointer-call clodin-write [:ptr :i64] :void data length)))
+
+Neither belongs in a runtime, so the real gap to close is: there is no way to
+discard a value in one arm of a branching form. The options are a statement
+wrapper such as `(discard form...)`, a `not` (and so a `when-not`), or relaxing
+`if` so a value arm is dropped when the other arm is a statement. Note that
+`(write (to-i32 1) ...)` is needed because a Clojure integer literal is `:i64`
+and `write` takes an `:i32` descriptor.
+
+The rest of the shape is plain: a `:ptr` scratch block from `stack-allocate`,
+`snprintf`, and `strlen` over it.
 
 Acceptance: `(println ...)` from a procedure, from `with-out-str`, from a
 `future`, and from a standalone binary all work with no runtime module built by
@@ -1083,7 +1170,8 @@ Clodin has no runtime nil for scalar types, and that is deliberate.
   `while`, `set`, `store` and `print` are like that. It is a compile-time
   property, not a value.
 - The only runtime null is a `:ptr` holding address zero. `(defvar p :ptr nil)`
-  starts there, and printing a null `:ptr` writes nothing.
+  starts there, `(is-null p)` tests it, and printing a null `:ptr` writes
+  nothing.
 - `(let [x :i64 (when false 42)] ...)` is a compile error:
   "let binding x is declared as :i64 but its value is no value". It does not
   become 0. Defaulting to 0 would make "absent" indistinguishable from a real
@@ -1115,4 +1203,11 @@ Clodin has no runtime nil for scalar types, and that is deliberate.
   decide separately whether a block carries a length header at all, and
   whether it earns its keep once the element count is a compile time
   literal.
+- [ ] Add an address-of form for procedures, so native code can call clodin
+  back. `pointer-call` can only reach JVM upcall stubs and resolved C symbols
+  today, because clodin source has no way to take a procedure's address. A
+  `(procedure-address foo)` yielding the stub's address would make callbacks
+  native-to-native too, and mixed with `pointer-call` it closes the loop. It
+  must keep the hot reload promise in mind: the stub address is stable until a
+  signature change or a reset, while a body address is not.
 - [ ] Add `for` as a macro that lowers to `let` + `while`.
