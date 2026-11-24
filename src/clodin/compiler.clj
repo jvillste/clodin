@@ -19,6 +19,9 @@
   literals, and :boolean can be used for locals, parameters, returns and
   buffer elements.
 
+  There is no not= form: write (not (= a b)), which composes the not
+  procedure with =.
+
   Pointers use the :ptr type. Memory is accessed with
   (load type pointer), (store type pointer value), (pointer-add pointer
   offset) and (to-pointer integer-address).
@@ -1524,7 +1527,7 @@
           {:keys [context module builder arena] :as state} state]
       (cond
         (#{'+ '- '* '/} operator) (compile-arithmetic state environment operator (rest expression))
-        (#{'< '<= '> '>= '= 'not=} operator) (compile-comparison state environment operator (rest expression))
+        (#{'< '<= '> '>= '=} operator) (compile-comparison state environment operator (rest expression))
         (= operator 'to-float) (compile-to-float state environment expression)
         (= operator 'to-f32) (compile-to-f32 state environment expression)
         (= operator 'to-i32) (compile-to-i32 state environment expression)
@@ -1615,7 +1618,7 @@
       (when (symbol? operator)
         (cond
           (#{'+ '- '* '/} operator) (expression-type environment (second expression))
-          (#{'< '<= '> '>= '= 'not=} operator) :boolean
+          (#{'< '<= '> '>= '=} operator) :boolean
           (= operator 'to-float) :f64
           (= operator 'to-f32) :f32
           (= operator 'to-i32) :i32
@@ -2794,7 +2797,7 @@
   "The names the compiler lowers itself. A definition may shadow one, because
   an unqualified reference always means the form, so a procedure or global
   with one of these names is reachable only by its qualified name."
-  '#{+ - * / < <= > >= = not= if when while let set load store pointer-add
+  '#{+ - * / < <= > >= = if when while let set load store pointer-add
      buffer-get buffer-set to-pointer to-float to-f32 to-i32 to-i64 sqrt abs
      min max print println stack-allocate pointer-call})
 
@@ -3399,6 +3402,10 @@
 (defproc is-greater [a :i64 b :i64]
   (> a b))
 
+;; not= is not a form; composing not with = gives the same result.
+(defproc is-different [a :i64 b :i64]
+  (not (= a b)))
+
 (defproc choose-by-flag [flag :boolean a :i64 b :i64]
   (if flag a b))
 
@@ -3551,6 +3558,17 @@
                           #"do not match parameters"
                           (define-proc! "clodin.compiler" "not-on-integer" [] []
                                         '[(not 1)] :boolean false)))))
+
+(deftest test-not-equal
+  (testing "not= is composed from not and ="
+    (is (true? (is-different 1 2)))
+    (is (false? (is-different 2 2))))
+
+  (testing "not= is no longer a compiler form"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"Unknown clodin procedure: not="
+                          (define-proc! "clodin.compiler" "not-equal-removed" [] []
+                                        '[(if (not= 1 2) 1 0)] :i64 false)))))
 
 (deftest test-boolean-buffer
   (let [arena (Arena/ofShared)
