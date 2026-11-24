@@ -104,7 +104,13 @@
   concatenated without separators; add spaces explicitly. A string literal
   and a :ptr are written as text, numbers are formatted with snprintf, and a
   :boolean writes true or false. (println) appends a newline. extern printf
-  stays raw libc output and goes to the process stdout."
+  stays raw libc output and goes to the process stdout.
+
+  print and println are forms, not procedures: they are variadic and lowered
+  per operand type to calls to the procedures in the clodin.runtime
+  namespace, which is written in clodin and loaded on demand. Its
+  clodin-write global holds the JVM upcall address, so an offline build leaves
+  it null and the runtime falls back to write(1, ...)."
   (:require [clodin.globals :as globals]
             [clodin.llvm-api :as llvm]
             [clodin.names :as names]
@@ -210,7 +216,8 @@
 ;; is installed once and never recreated until a full reset.
 (defonce installed-stubs (atom {}))
 
-(declare compile-module! define-proc! reemit-all-bodies! reset-module! set-build-mode!)
+(declare compile-module! define-proc! reemit-all-bodies! reset-module! set-build-mode!
+         install-globals!)
 
 ;;; The LLVM IR optimization level used when a module is built, one of
 ;;; :none (JIT the IR as emitted, the default) or :O0/:O1/:O2/:O3. The
@@ -492,42 +499,53 @@
   [name]
   (str name "$" (swap! body-counter inc)))
 
+(defn- emit-procedure-call
+  "Emits a call to an already resolved procedure with already compiled
+  arguments: checks the signature, records the callee for AOT selection and
+  re-emission, and returns [state value type].
+
+  compile-procedure-call compiles the argument forms first and delegates here,
+  and the print lowering calls it directly because its arguments are already
+  compiled."
+  [state qualified-name argument-values argument-types]
+  (let [procedure (get @procedure-registry qualified-name)]
+    (when-not procedure
+      (throw (ex-info (str "Unknown clodin procedure: " qualified-name)
+                      {:procedure qualified-name})))
+    (when-not (= (count argument-values) (count (:param-types procedure)))
+      (throw (ex-info (str "Procedure " qualified-name " expects "
+                           (count (:param-types procedure))
+                           " arguments, got " (count argument-values))
+                      {:procedure qualified-name})))
+    (when-not (= (vec argument-types) (vec (:param-types procedure)))
+      (throw (ex-info (str "Argument types " (vec argument-types)
+                           " do not match parameters " (:param-types procedure)
+                           " for procedure " qualified-name)
+                      {:procedure qualified-name
+                       :argument-types (vec argument-types)})))
+    (let [{:keys [module context builder arena]} state
+          target-name (call-target-symbol procedure)
+          name-token (llvm/c-string arena target-name)
+          callee-type (llvm/function-type context arena (:return-type procedure)
+                                          (:param-types procedure))
+          callee (llvm/get-or-add-function module name-token callee-type)
+          result (llvm/build-call builder callee-type callee argument-values arena)
+          state (assoc state :callees
+                       (assoc (:callees state) qualified-name
+                              {:param-types (vec (:param-types procedure))
+                               :return-type (:return-type procedure)}))]
+      (if (:return-type procedure)
+        [state result (:return-type procedure)]
+        [state nil nil]))))
+
 (defn- compile-procedure-call
   "Compiles a call to another clodin procedure by its qualified name. The call
   is emitted as a direct llvm call inside the JIT module, so the jvm is not
   involved when native procedures call each other."
   [state environment qualified-name argument-forms]
-  (let [procedure (get @procedure-registry qualified-name)]
-    (when-not procedure
-      (throw (ex-info (str "Unknown clodin procedure: " qualified-name)
-                      {:procedure qualified-name})))
-    (when-not (= (count argument-forms) (count (:param-types procedure)))
-      (throw (ex-info (str "Procedure " qualified-name " expects "
-                           (count (:param-types procedure))
-                           " arguments, got " (count argument-forms))
-                      {:procedure qualified-name})))
-    (let [[state argument-values argument-types]
-          (compile-operands state environment argument-forms)]
-      (when-not (= argument-types (vec (:param-types procedure)))
-        (throw (ex-info (str "Argument types " (vec argument-types)
-                             " do not match parameters " (:param-types procedure)
-                             " for procedure " qualified-name)
-                        {:procedure qualified-name
-                         :argument-types (vec argument-types)})))
-      (let [{:keys [module context builder arena]} state
-            target-name (call-target-symbol procedure)
-            name-token (llvm/c-string arena target-name)
-            callee-type (llvm/function-type context arena (:return-type procedure)
-                                            (:param-types procedure))
-            callee (llvm/get-or-add-function module name-token callee-type)
-            result (llvm/build-call builder callee-type callee argument-values arena)
-            state (assoc state :callees
-                         (assoc (:callees state) qualified-name
-                                {:param-types (vec (:param-types procedure))
-                                 :return-type (:return-type procedure)}))]
-        (if (:return-type procedure)
-          [state result (:return-type procedure)]
-          [state nil nil])))))
+  (let [[state argument-values argument-types]
+        (compile-operands state environment argument-forms)]
+    (emit-procedure-call state qualified-name argument-values argument-types)))
 
 (defn- promote-variadic-argument
   "Applies the C default argument promotion to a variadic argument. Clodin
@@ -678,16 +696,25 @@
       [state result argument-type])))
 
 (defn- compile-to-float
-  "Compiles (to-float x), a cast of an integer value to a 64 bit float."
+  "Compiles (to-float x), a cast of an integer or a 32 bit float value to a
+  64 bit float."
   [state environment expression]
+  (when-not (= 2 (count expression))
+    (throw (ex-info "to-float expects exactly one operand" {:expression expression})))
   (let [[state value type] (compile-expression state environment (second expression))]
-    (when-not (#{:i64 :i32} type)
-      (throw (ex-info (str "to-float expects an integer, got " type)
-                      {:type type})))
-    (let [result (llvm/build-sitofp (:builder state) value
-                                    (llvm/type-for (:context state) :f64)
-                                    (:arena state) nil)]
-      [state result :f64])))
+    (case type
+      (:i64 :i32)
+      (let [result (llvm/build-sitofp (:builder state) value
+                                      (llvm/type-for (:context state) :f64)
+                                      (:arena state) nil)]
+        [state result :f64])
+      :f32
+      (let [result (llvm/build-fpext (:builder state) value
+                                     (llvm/type-for (:context state) :f64)
+                                     (:arena state) nil)]
+        [state result :f64])
+      (throw (ex-info (str "to-float expects an integer or an :f32, got " type)
+                      {:type type})))))
 
 (defn- compile-to-f32
   "Compiles (to-f32 x), a cast of an integer or a 64 bit float value to a
@@ -993,6 +1020,25 @@
   [type]
   (or type "no value"))
 
+(def ^:private runtime-namespace
+  "The namespace that holds the native print helpers the compiler lowers print
+  and println to. It is written in clodin itself, so it is loaded lazily on
+  the first procedure definition rather than required at the top of this
+  namespace, which would be a cycle."
+  "clodin.runtime")
+
+(defonce runtime-loaded
+  (atom false))
+
+(defn- require-runtime!
+  "Loads clodin.runtime once. The flag is set before the require so the
+  runtime's own defproc forms, which run while it loads, do not recurse."
+  []
+  (when-not @runtime-loaded
+    (reset! runtime-loaded true)
+    (require (symbol runtime-namespace)))
+  nil)
+
 (def ^:private scalar-types
   "The types a pointer-call signature may name. Aggregate types do not exist
   yet, and :void is only legal as a return type."
@@ -1160,15 +1206,15 @@
         (throw (ex-info (str "Cannot set unknown local or global: " name)
                         {:symbol name}))))))
 
-(defn- call-print-runtime
-  "Calls one of the print runtime functions. The runtime module defines them;
-  a procedure module only declares them."
-  [state name param-types argument-values]
-  (let [{:keys [context module builder arena]} state
-        function-type (llvm/function-type context arena nil param-types)
-        callee (llvm/get-or-add-function module (llvm/c-string arena name) function-type)]
-    (llvm/build-call builder function-type callee argument-values arena)
-    state))
+(defn- call-print-helper
+  "Calls one of the print helpers in clodin.runtime with already compiled
+  arguments. Going through emit-procedure-call gives a print the same
+  signature check, stub target and callee record as any other call, so an
+  offline build links the runtime because it is in the call graph."
+  [state helper-name argument-values argument-types]
+  (first (emit-procedure-call state
+                              (names/qualified-name runtime-namespace helper-name)
+                              argument-values argument-types)))
 
 (defn- compile-print-operand
   "Lowers one print operand according to its clodin type. A string literal is
@@ -1179,16 +1225,17 @@
     (let [[state value _type] (compile-expression state environment operand)
           length (alength (.getBytes ^String operand
                                      java.nio.charset.StandardCharsets/UTF_8))]
-      (call-print-runtime state "clodin$print$bytes" [:ptr :i64]
-                          [value (llvm/const-int-of-type (:context state) :i64 length)]))
+      (call-print-helper state "print-bytes"
+                         [value (llvm/const-int-of-type (:context state) :i64 length)]
+                         [:ptr :i64]))
     (let [[state value type] (compile-expression state environment operand)]
       (case type
-        :i64 (call-print-runtime state "clodin$print$i64" [:i64] [value])
-        :i32 (call-print-runtime state "clodin$print$i32" [:i32] [value])
-        :f64 (call-print-runtime state "clodin$print$f64" [:f64] [value])
-        :f32 (call-print-runtime state "clodin$print$f32" [:f32] [value])
-        :boolean (call-print-runtime state "clodin$print$bool" [:boolean] [value])
-        :ptr (call-print-runtime state "clodin$print$cstr" [:ptr] [value])
+        :i64 (call-print-helper state "print-i64" [value] [:i64])
+        :i32 (call-print-helper state "print-i32" [value] [:i32])
+        :f64 (call-print-helper state "print-f64" [value] [:f64])
+        :f32 (call-print-helper state "print-f32" [value] [:f32])
+        :boolean (call-print-helper state "print-bool" [value] [:boolean])
+        :ptr (call-print-helper state "print-cstr" [value] [:ptr])
         (throw (ex-info (str "Cannot print a value of type " type)
                         {:type type :operand operand}))))))
 
@@ -1203,7 +1250,7 @@
                       state
                       (rest expression))
         state (if println?
-                (call-print-runtime state "clodin$print$newline" [] [])
+                (call-print-helper state "print-newline" [] [])
                 state)]
     [state nil nil]))
 
@@ -1689,26 +1736,25 @@
 ;;; keep calling the same symbol and running native loops see the new body.
 ;;; ---------------------------------------------------------------------------
 
-(defn- install-runtime!
-  "Adds the print runtime module to jit. Reloadable mode keeps one JIT, so the
-  runtime is added once when the JIT is created. A monolithic build links the
-  runtime into the procedure module instead."
+(defn- install-writer!
+  "Points clodin.runtime/clodin-write at the JVM upcall stub, so a print from
+  native code reaches the calling thread's *out*. Every build has to do this:
+  a monolithic rebuild reinitialises global storage from the source initial
+  value, and a reset drops it. Offline builds never call it, so the writer
+  stays null and write-to-out falls back to write(1, ...).
+
+  The global's storage must already be recorded, which is why the callers run
+  this after installing or linking it: writing through a global with no
+  address would ask ensure-storage! for one, and in monolithic mode that hook
+  compiles the module again while the current build is still in progress."
   [jit]
-  (let [arena (Arena/ofConfined)]
-    (try
-      (let [context (llvm/new-context)
-            module (print/runtime-module context arena (print/writer-address))
-            added? (volatile! false)]
-        (try
-          (llvm/verify module arena)
-          (vreset! added? true)
-          (llvm/add-module-to-jit! jit module context)
-          (finally
-            (when-not @added?
-              (llvm/dispose-module module)
-              (llvm/dispose-context context)))))
-      (finally
-        (.close arena)))))
+  (let [qualified (names/qualified-name runtime-namespace "clodin-write")]
+    (when-let [entry (globals/entry qualified)]
+      ;; Both checks matter: with no recorded address, writing would ask
+      ;; ensure-storage! for one and compile the module again.
+      (when (and (:address entry) (= jit (:jit entry)))
+        (globals/write-value! qualified (print/writer-address)))))
+  nil)
 
 (defn- ensure-jit!
   "Returns the long-lived LLJIT, creating it on first use. Reloadable mode
@@ -1722,7 +1768,7 @@
                 (llvm/init-targets!)
                 (let [jit (llvm/create-jit arena)]
                   (reset! current-jit jit)
-                  (install-runtime! jit)
+                  (install-globals! jit)
                   jit)
                 (finally
                   (.close arena))))))))
@@ -1807,6 +1853,7 @@
                     (llvm/dispose-context context)))))
             (finally
               (.close arena))))))
+    (install-writer! jit)
     (globals/installed-symbols jit)))
 
 (defn- ensure-global-storage!
@@ -2139,6 +2186,10 @@
   types must settle across the whole call graph."
   [namespace name param-names param-types body-forms explicit-return-type static?]
   (names/valid-short-name! "Procedure" name)
+  ;; print and println lower to the runtime's procedures, so they have to be
+  ;; registered before any body that prints is compiled.
+  (when-not (= namespace runtime-namespace)
+    (require-runtime!))
   (when (contains? @external-registry name)
     (warn! (str "procedure " (names/qualified-name namespace name)
                 " has the same name as the external function " name
@@ -2320,19 +2371,16 @@
 (defn- link-procedures
   "Parses the stored bitcode of the given procedures into a single linked
   module in the given context. A procedure module only declares the globals it
-  reads and the print runtime, so the storage modules and the runtime module
-  are linked in too. writer-address is the JVM print upcall for a monolithic
-  JIT build, or nil for an offline build."
-  [procedures context arena writer-address]
+  reads and the procedures it calls, so the storage modules of the globals
+  those procedures use are linked in too. The print runtime is ordinary
+  procedures now, so it arrives through the call graph like everything else."
+  [procedures context arena]
   (when (empty? procedures)
     (throw (ex-info "No clodin procedures to link" {})))
   (let [used-globals (into #{} (mapcat :globals) (vals procedures))
         specs (filter (fn [[symbol _type _value]] (contains? used-globals symbol))
                       (globals/storage-specs))
-        base (print/runtime-module context arena writer-address)
-        base (if (seq specs)
-               (llvm/link-into! base (global-storage-module context specs arena))
-               base)]
+        base (global-storage-module context specs arena)]
     (reduce (fn [merged {:keys [bitcode]}]
               (llvm/link-into! merged (llvm/parse-bitcode context bitcode arena)))
             base
@@ -2344,7 +2392,7 @@
   [context arena]
   (when (empty? @procedure-registry)
     (throw (ex-info "No clodin procedures registered to compile" {})))
-  (link-procedures @procedure-registry context arena (print/writer-address)))
+  (link-procedures @procedure-registry context arena))
 
 (defn- used-global-symbols
   "The native symbols of the globals that the linked module defines. A
@@ -2403,6 +2451,7 @@
             jit (llvm/create-jit arena)
             _ (llvm/add-module-to-jit! jit module context)
             _ (record-global-addresses! jit (used-global-symbols module))
+            _ (install-writer! jit)
             handles (build-handles jit arena)]
         (let [old-jit @current-jit]
           (reset! current-jit jit)
@@ -2576,7 +2625,7 @@
     (let [arena (Arena/ofConfined)]
       (try
         (let [context (llvm/new-context)
-              module (link-procedures procedures context arena nil)]
+              module (link-procedures procedures context arena)]
           (try
             (f module arena)
             (finally
@@ -2634,7 +2683,7 @@
      (let [arena (Arena/ofConfined)]
        (try
          (let [context (llvm/new-context)
-               module (link-procedures (procedures-for-linking procedures) context arena nil)
+               module (link-procedures (procedures-for-linking procedures) context arena)
                target-machine (llvm/create-target-machine arena)]
            (try
              (llvm/set-module-target! module target-machine arena)
@@ -2706,7 +2755,7 @@
      (let [arena (Arena/ofConfined)]
        (try
          (let [context (llvm/new-context)
-               module (link-procedures (procedures-for-linking procedures) context arena nil)
+               module (link-procedures (procedures-for-linking procedures) context arena)
                target-machine (llvm/create-target-machine arena {:pic? true})]
            (try
              (llvm/set-module-target! module target-machine arena)
@@ -4416,6 +4465,90 @@
         (swap! procedure-registry dissoc name)
         (swap! procedure-handles dissoc name))
       (swap! globals/registry dissoc "examples.naming/counter"))))
+
+;;; ---------------------------------------------------------------------------
+;;; Print runtime in clodin
+;;; ---------------------------------------------------------------------------
+
+(def ^:private writer-global "clodin.runtime/clodin-write")
+
+(defn- writer-address
+  "The address the writer global currently holds, or nil when it is null."
+  []
+  (some-> ^MemorySegment (globals/read-value writer-global) (.address)))
+
+(defproc runtime-print-caller [value :i64]
+  (println "value = " value))
+
+(deftest test-runtime-writer
+  (testing "a build installs the writer upcall address"
+    (is (= (print/writer-address) (writer-address))))
+
+  (testing "a procedure that prints records the runtime as callees"
+    (let [callees (:callees (get @procedure-registry
+                                 "clodin.compiler/runtime-print-caller"))]
+      (is (contains? callees "clodin.runtime/print-bytes"))
+      (is (contains? callees "clodin.runtime/print-i64"))
+      (is (contains? callees "clodin.runtime/print-newline"))))
+
+  (testing "the compiler loads the runtime before a user body is compiled"
+    (is (contains? @procedure-registry "clodin.runtime/write-to-out"))
+    (is (some? (globals/entry writer-global))))
+
+  (testing "a reset installs it again after it was cleared"
+    (globals/write-value! writer-global 0)
+    (is (nil? (writer-address)))
+    (reset-module!)
+    (is (= (print/writer-address) (writer-address))))
+
+  (testing "a monolithic rebuild installs it again after it was cleared"
+    (try
+      (set-build-mode! :monolithic)
+      (reset-module!)
+      (globals/write-value! writer-global 0)
+      (is (nil? (writer-address)))
+      (reset! module-dirty true)
+      (compile-module!)
+      (is (= (print/writer-address) (writer-address)))
+      (finally
+        (set-build-mode! :monolithic)))))
+
+(deftest test-runtime-writer-does-not-recompile
+  (testing "installing the writer does not trigger a second build"
+    (let [original (var-get #'recompile-module!)
+          builds (atom 0)]
+      (with-redefs [recompile-module! (fn []
+                                        (swap! builds inc)
+                                        (original))]
+        (reset! module-dirty true)
+        (compile-module!))
+      (is (= 1 @builds)))))
+
+(deftest test-runtime-in-standalone-build
+  (testing "an offline binary prints through write(1, ...) with no JVM"
+    (let [output (str (System/getProperty "java.io.tmpdir")
+                      "/clodin-runtime-test-" (System/nanoTime))
+          package "clodin_runtime_aot_test"
+          file (java.io.File. (str (System/getProperty "java.io.tmpdir")
+                                   "/" package ".clj"))
+          source (str
+                  "(ns " package "\n"
+                  "  (:require [clodin.compiler :refer [defproc]]))\n\n"
+                  "(defproc main [argc :i32 argv :ptr] :i32\n"
+                  "  (println \"value = \" 42)\n"
+                  "  (print \"done\")\n"
+                  "  (println)\n"
+                  "  (to-i32 0))\n")]
+      (try
+        (spit file source)
+        (load-file (.getAbsolutePath file))
+        (build-executable! (symbol package) {:output output})
+        (let [{:keys [out exit]} (shell/sh output)]
+          (is (zero? exit))
+          (is (= "value = 42\ndone\n" out)))
+        (finally
+          (io/delete-file file true)
+          (io/delete-file output true))))))
 
 (defn -main
   [& _]

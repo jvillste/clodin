@@ -334,21 +334,23 @@ is lowered according to its static type:
 - `:boolean` writes `true` or `false`;
 - `println` appends a newline.
 
-The runtime lives in `clodin.print` as an LLVM module with
-`clodin$write$bytes(ptr, i64)` and one formatting helper per type. The compiler only
-emits calls to those helpers, so a procedure module is small and the
-formatting code exists once.
+The runtime lives in `clodin.runtime` as ordinary procedures: `write-to-out`,
+`print-bytes`, `print-newline`, and one formatting helper per type. The
+compiler lowers a print to calls to those procedures, so a procedure module
+only declares them and the formatting code exists once. The runtime used to be
+an LLVM module built through the C API and was ported to clodin in "Porting the
+print runtime to clodin"; `clodin.print` now holds only the JVM side.
 
-`clodin$write$bytes` loads a function pointer, `@clodin$write`. In a JIT build the
-pointer is a JVM upcall stub that writes the bytes to the calling thread's
-`*out*`. The upcall runs on the thread that entered the native procedure, so
+`write-to-out` loads the writer pointer from the `clodin-write` global. In a
+JIT build the compiler points that global at a JVM upcall stub that writes the
+bytes to the calling thread's `*out*`. The upcall runs on the thread that entered the native procedure, so
 the dynamic binding is the caller's: `with-out-str`, CIDER and a `future` that
 conveys `*out*` all work. There is no capture lock and no global redirect, so
 a long-running procedure never blocks another procedure's output.
 
-In an offline build there is no JVM, so `@clodin$write` is null and
-`clodin$write$bytes` falls back to `write(1, ...)`, which is what a standalone
-binary wants. The same lowering therefore works in both modes.
+In an offline build there is no JVM, so `clodin-write` stays null and
+`write-to-out` falls back to `write(1, ...)`, which is what a standalone binary
+wants. The same lowering therefore works in both modes.
 
 `extern printf` remains raw libc output and goes to the process stdout, not
 `*out*`. That is the deliberate split: use `println` for REPL-visible output,
@@ -669,9 +671,15 @@ Deferred deliberately; everything on this list is a separate iteration.
   alignment. The runtime already has the formatting helpers; only the surface
   form and the format-string lowering are missing.
 
-- [ ] Print an arbitrary byte range.
-  `clodin$print$bytes` exists but is only used for string literals. Expose it
-  as `(print-bytes pointer length)` for buffers that are not null terminated.
+- [x] Print an arbitrary byte range.
+  `clodin.runtime/print-bytes` is a public procedure, so a buffer that is not
+  null terminated is printed with `(clodin.runtime/print-bytes data length)`.
+  It is not a compiler form, so `print` does not dispatch to it.
+
+- [ ] A `not`, and so a `when-not`.
+  `print-cstr` spells its null test `(when (= (is-null value) false) ...)`
+  because there is no way to negate a `:boolean`. A `not` form is one `xor`
+  with true and would remove the only awkward line in the runtime.
 
 - [ ] Print aggregate values.
   Structs, arrays and the Odin-style buffer type, once those types exist.
@@ -680,13 +688,13 @@ Deferred deliberately; everything on this list is a separate iteration.
   Useful for building a message before printing it, and for tests that want
   the formatted text without touching `*out*`.
 
-## Porting the print runtime to clodin
+## Porting the print runtime to clodin (done)
 
-`clodin.print` builds the runtime with the LLVM C API because it needs three
-things the language does not have yet. The goal is to write the runtime as
-ordinary `defproc`s in a `clodin.runtime` namespace and delete the hand-built
-runtime module, so the printing code is no longer a special case the compiler
-maintains.
+`clodin.print` used to build the runtime with the LLVM C API because it needed
+three things the language did not have. The runtime is now ordinary `defproc`s
+in `clodin.runtime` and the hand-built runtime module is gone, so the printing
+code is no longer a special case the compiler maintains. The phases below are
+kept as the record of what each blocker was and how it was removed.
 
 ### What stays in Clojure
 
@@ -697,8 +705,10 @@ of the boundary. Only the native half moves.
 ### The three blockers
 
 1. `if` lowers to `llvm.select`, so both branches are evaluated and neither can
-   have a side effect. `clodin$write$bytes` needs "if the pointer is null call
+   have a side effect. `write-to-out` needs "if the pointer is null call
    `write`, else call the pointer", which must execute exactly one branch.
+   Resolved by Phase 1, a real branching `if`, plus statement position in
+   "Statement position and `:void`".
 2. There is no stack scratch buffer, so `snprintf` has nowhere to write. `let`
    binds one scalar into a hoisted slot; it does not give an addressable block.
    `malloc`/`free` would work but allocates per print and a shared global buffer
@@ -711,15 +721,15 @@ of the boundary. Only the native half moves.
 
 ### Mapping of runtime functions
 
-| runtime function | needs | after phases |
+| runtime procedure | needed | landed as |
 | --- | --- | --- |
-| `clodin$print$bool` | Phase 1 | clodin |
-| `clodin$print$bytes` | none | clodin |
-| `clodin$print$newline` | none | clodin |
-| `clodin$print$cstr` | Phase 1 (null guard) | clodin |
-| `clodin$print$i64` / `i32` / `f64` / `f32` | Phases 1, 2 | clodin |
-| `clodin$write$bytes` | Phases 1, 2, 3 | clodin |
-| upcall stub, `write-bytes!` | JVM | stays Clojure |
+| `clodin.runtime/print-bool` | Phase 1 | clodin |
+| `clodin.runtime/print-bytes` | none | clodin |
+| `clodin.runtime/print-newline` | none | clodin |
+| `clodin.runtime/print-cstr` | Phase 1 (null guard) | clodin |
+| `clodin.runtime/print-i64` / `i32` / `f64` / `f32` | Phases 1, 2 | clodin |
+| `clodin.runtime/write-to-out` | Phases 1, 2, 3 | clodin |
+| upcall stub, `write-bytes!` | JVM | stays Clojure in `clodin.print` |
 
 ### Phase 1: branching `if` (done)
 
@@ -921,9 +931,9 @@ Decisions:
   mistake behind a call that appears to return.
 - `(is-null pointer)` was added for exactly that test: an `icmp eq` against
   address zero, yielding a `:boolean`. A `:ptr` is the only clodin type that
-  can hold a null, so any other operand is a compile error. This is the one
-  place the print runtime needs it: `clodin$write$bytes` checks its writer
-  pointer before calling through it.
+  can hold a null, so any other operand is a compile error. The print runtime
+  needs it twice: `write-to-out` checks its writer pointer before calling
+  through it, and `print-cstr` checks the string it was handed.
 - The result type drives `expression-type`, so a procedure ending in a
   `pointer-call` infers the declared return type and `:void` means no value.
 - A `pointer-call` records no `:callees` entry, because there is no name to
@@ -933,11 +943,12 @@ Decisions:
 - `:boolean` in a pointer signature lowers to `i1`, while the JVM boundary uses
   a one-byte layout. That mismatch already exists for `extern` and procedure
   signatures, so it is allowed for consistency and not promised for C `_Bool`.
-- Both names are reserved, so no procedure can shadow `pointer-call` or
-  `is-null`.
+- Shadowing is allowed, so `pointer-call` and `is-null` are in
+  `compiler-forms`: a procedure may take those names, but an unqualified
+  reference still means the form and `defproc` warns. See "Qualified names".
 
-Acceptance met: `clodin$write$bytes` can be written as a `defproc`, including
-the null check that falls back to `write(1, ...)`. Covered by
+Acceptance met: `write-to-out` is written as a `defproc`, including the null
+check that falls back to `write(1, ...)`; see "Phase 4". Covered by
 `test-pointer-call`, `test-pointer-call-signature` and `test-is-null` in
 `clodin.compiler`, which reach a real libc address (`strlen`, resolved from the
 JVM side with the default lookup) and a JVM upcall stub in both directions. The
@@ -947,52 +958,84 @@ Deferred: a native callback that points at a *clodin* procedure. There is no
 address-of-procedure form, so `pointer-call` reaches JVM upcall stubs and
 resolved C symbols only. See "Next features".
 
-### Phase 4: move the runtime into clodin
+### Phase 4: move the runtime into clodin (done)
 
-The naming question is settled: runtime helpers live in `clodin.runtime` and
-are called by their qualified names, `clodin.core` holds no procedures because
-`print` and `println` are compiler forms, and `clodin-write` is
-`clodin.runtime/clodin-write`. See "Qualified names".
+The print runtime is ordinary clodin source in `clodin.runtime`, and the
+hand-built LLVM runtime module is gone.
 
-- New namespace `clodin.runtime` with the print helpers as `defproc`s.
-- The writer pointer becomes a global, `(defvar clodin-write :ptr nil)`, used by
-  `clodin$write$bytes` as `(pointer-call clodin-write ...)`. This reuses the
-  globals feature instead of a hand-built global.
-- The compiler loads `clodin.runtime` before any user namespace and, after
-  creating or resetting the JIT, `reset!`s `clodin-write` to
-  `(print/writer-address)`. A monolithic rebuild reinitialises globals, so the
-  reset has to happen on every build; an AOT build leaves it nil and the
-  fallback writes to file descriptor 1.
-- Delete `runtime-module`, the `build-*` helpers and the `install-runtime!`
-  module plumbing. `clodin.print` keeps only the upcall stub and the writer.
+Decisions:
 
-Both functions are now writable in the obvious shape, because statement
-position and `:void` landed:
+- **Names.** The helpers live in `clodin.runtime` and are called by their
+  qualified names, because names are qualified now. `clodin.core` holds no
+  procedures: `print` and `println` are compiler forms (variadic, lowered per
+  operand type), so they cannot be procedures, and no core procedure is needed.
+- **The two halves.** `clodin.runtime` is the native half: `write-to-out`,
+  `print-bytes`, `print-newline`, `print-i64`, `print-i32`, `print-f64`,
+  `print-f32`, `print-bool` and `print-cstr`, all `defproc`s. `clodin.print` is
+  the JVM half and keeps only the upcall stub and `writer-address`, which are
+  the two things that cannot be written in clodin.
+- **`write-to-out` versus `print-bytes`.** The name that crosses the boundary
+  says where it goes (`write-to-out`), so it is not confused with
+  `print-bytes`, which writes a byte range to it. Everything routes through
+  `write-to-out`:
 
-    (defproc write-bytes [data :ptr length :i64] :void
-      (if (is-null clodin-write)
-        (write (to-i32 1) data length)
-        (pointer-call clodin-write [:ptr :i64] :void data length)))
+      (defproc write-to-out [data :ptr length :i64] :void
+        (if (is-null clodin-write)
+          (write (to-i32 1) data length)
+          (pointer-call clodin-write [:ptr :i64] :void data length)))
 
-    (defproc print-i64 [value :i64] :void
-      (let [scratch :ptr (stack-allocate 32 16)]
-        (snprintf scratch 32 "%ld" value)
-        (print-bytes scratch (strlen scratch))))
+  The `if` is a statement `if`: one arm returns `:i64` and the other returns
+  nothing, which is exactly what statement position allows.
+- **The writer is a global.** `(defvar clodin-write :ptr nil)` in
+  `clodin.runtime`, so the hand-built `@clodin$write` global is gone and the
+  write is an atomic acquire load. The compiler stores the JVM upcall address
+  in it with one idempotent `install-writer!`, called after the storage
+  addresses are recorded and before the handles are published: from
+  `recompile-module!` for a monolithic build, and from `install-globals!` for a
+  reloadable one. It has to run on every build, because a monolithic rebuild
+  reinitialises globals from their source initial value and a reset drops them.
+  It runs *after* the addresses are recorded on purpose: writing through a
+  global with no address would ask `ensure-storage!` for one, and that hook
+  compiles the module again inside the build that is already running.
+- **Loading order.** `clodin.runtime` requires `clodin.compiler` for `defproc`,
+  and the compiler needs the helpers registered before it compiles any body
+  that prints, so the runtime is loaded lazily: `define-proc!` calls
+  `require-runtime!` for any namespace but `clodin.runtime` itself, and the
+  flag is set before the `require` so the runtime's own `defproc`s cannot
+  recurse. A top-level require in either direction would be a cycle.
+- **Print lowering is an ordinary call.** `compile-print-operand` emits a call
+  to `clodin.runtime/print-*` through the same `emit-procedure-call` the
+  language uses, so a print gets the signature check, the stub target in
+  reloadable mode, and a `:callees` entry. The callee entry is what makes
+  `namespace-closure` pull `clodin.runtime` into an offline build; the old
+  special case that linked a runtime module in unconditionally is gone, and
+  `link-procedures` lost its `writer-address` parameter.
+- **AOT.** The writer stays nil offline, so `write-to-out` falls back to
+  `write(1, ...)`. A library build exports `clodin.runtime.clodin-write` like
+  any other global, so a host could install its own writer; nothing does that
+  automatically, and it is documented rather than tested.
+- **`print-cstr` needs a negated test.** `(when (= (is-null value) false) ...)`
+  is the spelling until a `not` (and so a `when-not`) exists. Recorded under
+  "Future print features".
+- **Two casts stay.** `(write (to-i32 1) ...)` because a Clojure integer
+  literal is `:i64` and `write` takes `:i32`; `to-float` was extended to accept
+  `:f32` so `print-f32` can widen through it rather than formatting twice.
+- **`snprintf` is clamped.** It returns the length it would have written, so a
+  truncated format would make `print-bytes` read past the 32-byte scratch
+  block. `(min (to-i64 length) 32)` keeps the read inside the block. `%ld` and
+  `%g` cannot reach 32 bytes today, so this was a latent bug, not a live one.
+- **Literal lengths.** `print-bool` passes 4 and 5 for `"true"` and `"false"`,
+  because there is still no way to ask a string literal for its length. The
+  alternative would be a `strlen` call per print.
+- **Live sessions must reset.** Registry bitcode compiled against
+  `clodin$print$*` no longer has a matching definition, so an already-running
+  REPL has to `reset-module!` or restart after this change. No aliases were
+  kept.
 
-Two smaller gaps remain, neither blocking:
-
-- `(write (to-i32 1) ...)` is needed because a Clojure integer literal is
-  `:i64` and `write` takes an `:i32`. An integer literal that adapts to the
-  parameter type would remove the cast; that is a typing change, not a
-  runtime one.
-- `snprintf` returns the length it *would* have written, so a truncated format
-  would make `print-bytes` read past the scratch block. `%ld` and `%g` cannot
-  reach 32 bytes, but the port should clamp: `(min length (to-i64 32))`.
-
-Acceptance: `(println ...)` from a procedure, from `with-out-str`, from a
-`future`, and from a standalone binary all work with no runtime module built by
-the LLVM C API; the only remaining C-API-built module is the globals and
-procedure modules the compiler already produces.
+Covered by `test-println-writes-to-out`, `test-extern-printf`,
+`test-background-print-goes-to-conveyed-out`, `test-runtime-writer`,
+`test-runtime-writer-does-not-recompile` and `test-runtime-in-standalone-build`
+in `clodin.compiler`, plus the existing boolean, f32, cstr and library tests.
 
 ### Branching `if` options
 
@@ -1060,9 +1103,9 @@ Amends the rule above: mixing a value arm with a statement arm is an error **in
 value position only**. In statement position both arms are compiled as
 statements, so their values are discarded and the arms need not agree in type.
 That is what the print runtime needs, because `write` returns `:i64` while
-`clodin$write$bytes` returns nothing:
+`write-to-out` returns nothing:
 
-    (defproc write-bytes [data :ptr length :i64] :void
+    (defproc write-to-out [data :ptr length :i64] :void
       (if (is-null clodin-write)
         (write (to-i32 1) data length)
         (pointer-call clodin-write [:ptr :i64] :void data length)))

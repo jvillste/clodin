@@ -14,10 +14,10 @@
 
     hello, standalone binary from an imported namespace"
   (:require [clodin.compiler :refer [defproc]]
-            [examples.standalone-lib :refer [greet]]))
+            [examples.standalone-lib :as standalone-lib]))
 
 (defproc main [argc :i32 argv :ptr] :i32
-  (greet "standalone binary from an imported namespace")
+  (examples.standalone-lib/greet "standalone binary from an imported namespace")
   (to-i32 0))
 
 (comment
