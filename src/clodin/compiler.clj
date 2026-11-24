@@ -82,18 +82,18 @@
   (when condition body...) runs its body only when the condition is true and
   produces no value; use if when a value is needed.
 
-  (not value) negates a :boolean. It is a procedure in clodin.core, written
-  in clodin itself like clojure.core, not a compiler form; at :O3 LLVM
-  inlines it, so it costs the same single xor instruction as the form did.
+  (not value) negates a :boolean and (is-null pointer) tests address zero.
+  Both are procedures in clodin.core, written in clodin itself like
+  clojure.core, not compiler forms; at :O3 LLVM inlines them, so not costs
+  the same single xor instruction as the form did.
 
   Raw memory is reached through (load type pointer), (store type pointer
   value), (pointer-add pointer offset), (buffer-get pointer type index) and
   (buffer-set pointer type index value). (stack-allocate byte-count alignment)
   reserves an uninitialised block on the stack and yields a :ptr to it, one
-  block per call however often a loop runs it. (is-null pointer) tests address
-  zero, and (pointer-call pointer [param-types] return-type arguments...) calls
-  a function address with its signature written at the call site, because a
-  :ptr carries no type.
+  block per call however often a loop runs it. (pointer-call pointer
+  [param-types] return-type arguments...) calls a function address with its
+  signature written at the call site, because a :ptr carries no type.
 
   Top level mutable state is declared with (defvar name type literal), for
   example (defvar running? :boolean true). In clodin source the name reads as
@@ -1291,22 +1291,6 @@
                    (llvm/build-icmp builder operator (first values) (second values) arena))]
       [state result :boolean])))
 
-(defn- compile-is-null
-  "Compiles (is-null pointer) into a comparison against address zero. A :ptr is
-  the only clodin type that has a null, so a caller that may hold an absent
-  address, such as the print runtime's writer pointer, tests it with this."
-  [state environment expression]
-  (when-not (= 2 (count expression))
-    (throw (ex-info "is-null expects (is-null pointer)" {:expression expression})))
-  (let [[state value type] (compile-expression state environment (second expression))]
-    (when-not (= :ptr type)
-      (throw (ex-info (str "is-null expects a :ptr, got " (type-name type))
-                      {:type type})))
-    (let [result (llvm/build-icmp (:builder state) '= value
-                                  (llvm/const-null (llvm/type-for (:context state) :ptr))
-                                  (:arena state))]
-      [state result :boolean])))
-
 (defn- compile-boolean-condition
   "Compiles a branching form's condition and checks that it is a :boolean."
   [state environment condition-form form-name]
@@ -1554,7 +1538,6 @@
         (= operator 'buffer-get) (compile-buffer-get state environment expression)
         (= operator 'buffer-set) (compile-buffer-set state environment expression)
         (= operator 'to-pointer) (compile-to-pointer state environment expression)
-        (= operator 'is-null) (compile-is-null state environment expression)
         (= operator 'pointer-call) (compile-pointer-call state environment expression)
         (= operator 'stack-allocate) (compile-stack-allocate state environment expression)
         (= operator 'let) (compile-let state environment expression true)
@@ -1645,7 +1628,6 @@
           (= operator 'buffer-get) (nth expression 2)
           (= operator 'buffer-set) nil
           (= operator 'to-pointer) :ptr
-          (= operator 'is-null) :boolean
           (= operator 'pointer-call)
           ;; A malformed form falls through as no value so that compilation
           ;; reports the arity error rather than this reader.
@@ -2814,7 +2796,7 @@
   with one of these names is reachable only by its qualified name."
   '#{+ - * / < <= > >= = not= if when while let set load store pointer-add
      buffer-get buffer-set to-pointer to-float to-f32 to-i32 to-i64 sqrt abs
-     min max print println stack-allocate is-null pointer-call})
+     min max print println stack-allocate pointer-call})
 
 (defn- defvar-form
   "Parses a defvar form, registers the global through define-var! and returns
@@ -4197,6 +4179,8 @@
                (fn [value] value)))
 
 (deftest test-is-null
+  (testing "is-null is a procedure in clodin.core, not a compiler form"
+    (is (contains? @procedure-registry "clodin.core/is-null")))
   (testing "a :ptr holding address zero is null and any other address is not"
     (let [arena (Arena/ofShared)]
       (try
@@ -4207,12 +4191,12 @@
           (.close arena)))))
 
   (testing "is-null rejects a type that cannot hold a null"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"expects a :ptr, got :i64"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"do not match parameters"
                           (define-proc! "clodin.compiler" "is-null-non-pointer" [] []
                                         '[(if (is-null 5) 1 0)] :i64 false))))
 
   (testing "is-null expects exactly one operand"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"is-null expects"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"expects 1 arguments"
                           (define-proc! "clodin.compiler" "is-null-arity" [] []
                                         '[(if (is-null) 1 0)] :i64 false)))))
 

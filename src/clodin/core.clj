@@ -11,3 +11,6 @@
 
 (defproc not [value :boolean]
   (= false value))
+
+(defproc is-null [value :ptr]
+  (= value (to-pointer 0)))

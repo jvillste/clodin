@@ -22,8 +22,14 @@
 
 (defvar clodin-write :ptr nil)
 
+;; clodin.runtime is loaded while clodin.core is still being defined, so it
+;; cannot call clodin.core/is-null. This is the same comparison against
+;; address zero.
+(defproc null-pointer? [value :ptr] :boolean
+  (= value (to-pointer 0)))
+
 (defproc write-to-out [data :ptr length :i64] :void
-  (if (is-null clodin-write)
+  (if (null-pointer? clodin-write)
     (write (to-i32 1) data length)
     (pointer-call clodin-write [:ptr :i64] :void data length)))
 
@@ -63,5 +69,5 @@
     (print-bytes "false" 5)))
 
 (defproc print-cstr [value :ptr] :void
-  (when (= (is-null value) false)
+  (when (= (null-pointer? value) false)
     (print-bytes value (strlen value))))
