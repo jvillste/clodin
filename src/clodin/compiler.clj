@@ -82,6 +82,10 @@
   (when condition body...) runs its body only when the condition is true and
   produces no value; use if when a value is needed.
 
+  (not value) negates a :boolean. It is a procedure in clodin.core, written
+  in clodin itself like clojure.core, not a compiler form; at :O3 LLVM
+  inlines it, so it costs the same single xor instruction as the form did.
+
   Raw memory is reached through (load type pointer), (store type pointer
   value), (pointer-add pointer offset), (buffer-get pointer type index) and
   (buffer-set pointer type index value). (stack-allocate byte-count alignment)
@@ -1037,6 +1041,18 @@
   (when-not @runtime-loaded
     (reset! runtime-loaded true)
     (require (symbol runtime-namespace)))
+  nil)
+
+(defonce core-loaded
+  (atom false))
+
+(defn- require-core!
+  "Loads clodin.core once. The flag is set before the require so the core's
+  own defproc forms, which run while it loads, do not recurse."
+  []
+  (when-not @core-loaded
+    (reset! core-loaded true)
+    (require (symbol names/core-namespace)))
   nil)
 
 (def ^:private scalar-types
@@ -2186,6 +2202,10 @@
   types must settle across the whole call graph."
   [namespace name param-names param-types body-forms explicit-return-type static?]
   (names/valid-short-name! "Procedure" name)
+  ;; clodin.core holds the procedures visible unqualified everywhere, such as
+  ;; not, so it has to be loaded before a body that may call one is compiled.
+  (when-not (= namespace names/core-namespace)
+    (require-core!))
   ;; print and println lower to the runtime's procedures, so they have to be
   ;; registered before any body that prints is compiled.
   (when-not (= namespace runtime-namespace)
@@ -3233,6 +3253,12 @@
     (store :i64 pointer 7))
   (load :i64 pointer))
 
+(defproc when-composed-not-store [pointer :ptr flag :boolean]
+  (store :i64 pointer 0)
+  (when (not flag)
+    (store :i64 pointer 7))
+  (load :i64 pointer))
+
 (defproc when-runs-one-side-effect [flag :boolean]
   (let [turns :i64 0]
     (when flag
@@ -3400,8 +3426,11 @@
 
 (defproc flip-flag [flag :boolean]
   (let [current :boolean flag]
-    (set current (if current false true))
+    (set current (not current))
     (if current 1 0)))
+
+(defproc negate-flag [flag :boolean]
+  (not flag))
 
 (defproc always-true []
   true)
@@ -3517,6 +3546,29 @@
     (is (= 0 (flag-to-i32 3 5)))
     (is (= 1 (flag-to-i64 5 3)))
     (is (= 0 (flag-to-i64 3 5)))))
+
+(deftest test-not
+  (testing "not is a procedure in clodin.core, not a compiler form"
+    (is (contains? @procedure-registry "clodin.core/not")))
+
+  (testing "not negates a :boolean"
+    (is (false? (negate-flag true)))
+    (is (true? (negate-flag false))))
+
+  (testing "when composes with not to run the body only when false"
+    (let [arena (Arena/ofShared)
+          buffer (.allocate arena 8)]
+      (try
+        (is (= 0 (when-composed-not-store buffer true)))
+        (is (= 7 (when-composed-not-store buffer false)))
+        (finally
+          (.close arena)))))
+
+  (testing "not checks its argument type"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"do not match parameters"
+                          (define-proc! "clodin.compiler" "not-on-integer" [] []
+                                        '[(not 1)] :boolean false)))))
 
 (deftest test-boolean-buffer
   (let [arena (Arena/ofShared)

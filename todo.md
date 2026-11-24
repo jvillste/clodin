@@ -28,9 +28,10 @@ Constraints for anything new. Changing one is a deliberate step, not a detail.
 - Names are qualified: `namespace/name` in the registry, `namespace.name` for
   the native symbol. Only the referring namespace and `clodin.core` are visible
   unqualified. There is no `require`, `refer` or alias form.
-- `clodin.core` holds no procedures. `print` and `println` are compiler forms
-  (variadic, lowered per operand type), not procedures, so they cannot live in
-  a namespace.
+- `clodin.core` holds procedures written in clodin itself, not compiler forms,
+  and they are visible unqualified everywhere. `print` and `println` stay
+  compiler forms because they are variadic and lowered per operand type, so
+  they cannot live in a namespace.
 - Globals are always accessed atomically. A non-atomic variant is a separate
   item below, not a default.
 - Offline builds export plain symbols, so short names must be unique across one
@@ -129,12 +130,6 @@ Constraints for anything new. Changing one is a deliberate step, not a detail.
   forgot its value. `noreturn` assertions (`unreachable`, non-null promises)
   are the same family and are the second real performance case after tail
   calls.
-
-- [ ] Add `not`, and so `when-not`.
-
-  There is no way to negate a `:boolean`; `(= ... false)` is the workaround and
-  it appears in the print runtime. One `xor` with true is enough, and
-  `when-not` follows from it.
 
 - [ ] Add `for` as a macro that lowers to `let` + `while`.
 

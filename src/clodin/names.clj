@@ -12,9 +12,9 @@
   clodin.core. There is no require, refer or alias support yet, so a name from
   any other namespace has to be written qualified.
 
-  clodin.core holds no procedures yet: print and println are compiler forms,
-  not procedures, so the core lookup exists for the procedures that land there
-  later."
+  clodin.core holds procedures written in clodin itself, such as not, and
+  they are visible unqualified everywhere. print and println are compiler
+  forms, so they cannot live in a namespace."
   (:require [clojure.string :as string]
             [clojure.test :refer [deftest is testing]]))
 
