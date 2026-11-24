@@ -3,3 +3,5 @@ language called Clodin.
 
 The source code of various other programming languages can be found
 under the folder "references"
+
+todo.md keeps track of ongoing work.
