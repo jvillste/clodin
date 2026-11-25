@@ -108,18 +108,18 @@
             (set carry next-carry))
           (set carry-index (- carry-index 1))
           (set carry (* carry (if (>= carry-index 1) 1 0)))))
-      (printf "%ld" (buffer-get digits :i64 1))
+      (print (buffer-get digits :i64 1))
       (let [point-index :i64 0
             point-end :i64 (if (> d 0) 1 0)]
         (while (< point-index point-end)
-          (printf ".")
+          (print ".")
           (set point-index (+ point-index 1))))
       (let [digit-index :i64 2
             digit-end :i64 (+ d 1)]
         (while (<= digit-index digit-end)
-          (printf "%ld" (buffer-get digits :i64 digit-index))
+          (print (buffer-get digits :i64 digit-index))
           (set digit-index (+ digit-index 1))))
-      (printf "\n")
+      (print "\n")
       (free a)
       (free digits))))
 
