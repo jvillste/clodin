@@ -17,11 +17,18 @@
 
 (def deps-file "deps.edn")
 
+(def test-roots
+  "The directory that holds the namespaces containing only tests. It is on
+  the classpath through the :test alias, not through :paths, so it is named
+  here instead of being read from deps.edn."
+  ["test"])
+
 (defn source-roots
-  "The directories listed in :paths of deps.edn that exist here."
+  "The directories listed in :paths of deps.edn, plus the test roots, that
+  exist here."
   []
   (filter #(.isDirectory (io/file %))
-          (:paths (edn/read-string (slurp deps-file)))))
+          (concat (:paths (edn/read-string (slurp deps-file))) test-roots)))
 
 (defn clojure-files
   "Every .clj file under root, recursively."

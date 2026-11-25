@@ -1,9 +1,9 @@
 (ns clodin.inspect
   "Inspect the code clodin generates for a procedure.
 
-  (llvm-ir \"add-both\")     ; textual LLVM IR from the stored bitcode
-  (assembly \"add-both\")    ; target assembly after optimization
-  (disassembly \"add-both\") ; objdump/otool output for the emitted object file"
+  (llvm-ir \"examples.standalone-lib/greet\")     ; textual LLVM IR from the stored bitcode
+  (assembly \"examples.standalone-lib/greet\")    ; target assembly after optimization
+  (disassembly \"examples.standalone-lib/greet\") ; objdump/otool output for the emitted object file"
   (:require [clodin.annotate :as annotate]
             [clodin.compiler :as compiler]
             [clodin.llvm-api :as llvm]
@@ -258,12 +258,14 @@
 
 (deftest test-llvm-ir
   (testing "the stored bitcode prints as llvm ir"
-    (is (re-find #"define i64 @clodin\.compiler\.add-both"
-                 (llvm-ir "add-both")))))
+    (require 'examples.standalone-lib)
+    (is (re-find #"define i32 @examples\.standalone-lib\.greet"
+                 (llvm-ir "examples.standalone-lib/greet")))))
 
 (deftest test-assembly
   (testing "the procedure emits target assembly"
-    (is (re-find #"add-both" (assembly "add-both")))))
+    (require 'examples.standalone-lib)
+    (is (re-find #"greet" (assembly "examples.standalone-lib/greet")))))
 
 (deftest test-annotate-assembly
   (testing "instructions get plain-english descriptions"
@@ -319,8 +321,10 @@
 
 (deftest test-print-functions
   (testing "print-*! prints the inspection output"
-    (is (= (str (llvm-ir "add-both") "\n")
-           (with-out-str (print-llvm-ir! "add-both"))))
+    (require 'examples.standalone-lib)
+    (is (= (str (llvm-ir "examples.standalone-lib/greet") "\n")
+           (with-out-str
+             (print-llvm-ir! "examples.standalone-lib/greet"))))
     (is (= (str (module-llvm-ir 'examples.standalone-lib) "\n")
            (with-out-str
              (print-module-llvm-ir! 'examples.standalone-lib))))))

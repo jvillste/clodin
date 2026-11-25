@@ -3,7 +3,7 @@
  {:dev
   {:jvm-opts ["--enable-native-access=ALL-UNNAMED"]}
   :test
-  {:extra-paths ["scripts"]
+  {:extra-paths ["scripts" "test"]
    :jvm-opts ["--enable-native-access=ALL-UNNAMED"]
    :main-opts ["-m" "run-tests"]}
   :build

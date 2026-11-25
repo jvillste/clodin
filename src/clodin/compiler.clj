@@ -117,7 +117,12 @@
   per operand type to calls to the procedures in the clodin.runtime
   namespace, which is written in clodin and loaded on demand. Its
   clodin-write global holds the JVM upcall address, so an offline build leaves
-  it null and the runtime falls back to write(1, ...)."
+  it null and the runtime falls back to write(1, ...).
+
+  The procedures the test suite compiles and calls natively live in
+  clodin.compiler-test, under test/. The tests here cover the parts that need
+  no native call: type layout, argument checking, name resolution, error
+  messages and the JIT-free standalone builds."
   (:require [clodin.globals :as globals]
             [clodin.llvm-api :as llvm]
             [clodin.names :as names]
@@ -235,17 +240,10 @@
 (defonce current-jit (atom nil))
 (defonce compile-lock (Object.))
 
-;; The build mode. :monolithic relinks every procedure into one module on
-;; each build; :reloadable gives every reloadable procedure a stable stub and
-;; installs a new body module per compilation. See todo.md.
 (defonce build-mode (atom :monolithic))
 
-;; Process-wide counter for the body symbols foo$1, foo$2, ... so a body
-;; symbol is never reused within a session.
 (defonce body-counter (atom 0))
 
-;; installed-stubs maps a stub symbol to its JIT addresses and handles. A stub
-;; is installed once and never recreated until a full reset.
 (defonce installed-stubs (atom {}))
 
 (declare compile-module! define-proc! reemit-all-bodies! reset-module! set-build-mode!
@@ -2959,424 +2957,13 @@
   [name params & body]
   (defproc-form (str *ns*) name params body))
 
-;;; ---------------------------------------------------------------------------
-;;; Procedures and tests
-;;; ---------------------------------------------------------------------------
-
-(defproc substract-one [number :i64]
-  (- number 1))
-
-(defproc add-some [number :i64]
-  (+ number 42))
-
-(defproc add-both [a :i64 b :i64]
-  (+ a b))
-
-(defproc add-gigabyte [number :i64]
-  (+ number 1073741824))
-
-(defproc halve [number :f64]
-  (* number 0.5))
-
-(defproc mix-both [a :i64 b :f64]
-  (+ b (halve (to-float (add-both a 1)))))
-
-(defproc store-i64-at [pointer :ptr value :i64]
-  (store :i64 pointer value))
-
-(defproc load-i64-at [pointer :ptr]
-  (load :i64 pointer))
-
-(defproc store-i64-through-address [address :i64 value :i64]
-  (store :i64 (to-pointer address) value))
-
-(defproc store-second-i64 [pointer :ptr value :i64]
-  (store :i64 (pointer-add pointer 8) value))
-
-(defproc increment-i64-at [pointer :ptr]
-  (store-i64-at pointer (+ (load :i64 pointer) 1)))
-
-(defproc pointer-to-second-i64 [pointer :ptr]
-  (pointer-add pointer 8))
-
-(defproc shadowed-let []
-  (let [x :i64 10
-        x :i64 (+ x 10)]
-    x))
-
-(defproc sum-to [limit :i64]
-  (let [sum :i64 0
-        index :i64 0]
-    (while (< index limit)
-      (set sum (+ sum index))
-      (set index (+ index 1)))
-    sum))
-
-(defproc count-down [start :i64]
-  (let [value :i64 start
-        steps :i64 0]
-    (while (> value 0)
-      (set value (- value 1))
-      (set steps (+ steps 1)))
-    steps))
-
-(defproc sum-floats-while [limit :f64]
-  (let [sum :f64 0.0
-        value :f64 0.0]
-    (while (< value limit)
-      (set sum (+ sum value))
-      (set value (+ value 1.0)))
-    sum))
-
-(defproc fill-i64 [pointer :ptr value :i64 count :i64]
-  (let [index :i64 0]
-    (while (< index count)
-      (store :i64 (pointer-add pointer (* index 8)) value)
-      (set index (+ index 1)))))
-
-(defproc sum-array-i64 [pointer :ptr count :i64]
-  (let [sum :i64 0
-        index :i64 0]
-    (while (< index count)
-      (set sum (+ sum (load :i64 (pointer-add pointer (* index 8)))))
-      (set index (+ index 1)))
-    sum))
-
-(defproc sum-squares [limit :i64]
-  (let [sum :i64 0
-        index :i64 0]
-    (while (< index limit)
-      (let [square :i64 (* index index)]
-        (set sum (+ sum square)))
-      (set index (+ index 1)))
-    sum))
-
-(defproc sqrt-of [x :f64]
-  (sqrt x))
-
-(defproc abs-float [x :f64]
-  (abs x))
-
-(defproc abs-int [x :i64]
-  (abs x))
-
-(defproc min-two [a :f64 b :f64]
-  (min a b))
-
-(defproc max-three [a :f64 b :f64 c :f64]
-  (max a b c))
-
-(defproc min-int [a :i64 b :i64]
-  (min a b))
-
-(defproc max-int [a :i64 b :i64]
-  (max a b))
-
-(defproc fill-buffer-f64 [pointer :ptr value :f64 count :i64]
-  (let [index :i64 0]
-    (while (< index count)
-      (buffer-set pointer :f64 index value)
-      (set index (+ index 1)))))
-
-(defproc sum-buffer-f64 [pointer :ptr count :i64]
-  (let [sum :f64 0.0
-        index :i64 0]
-    (while (< index count)
-      (set sum (+ sum (buffer-get pointer :f64 index)))
-      (set index (+ index 1)))
-    sum))
-
-(defproc buffer-i32-at [pointer :ptr index :i64]
-  (buffer-get pointer :i32 index))
-
-(defproc buffer-f64-at [pointer :ptr index :i64]
-  (buffer-get pointer :f64 index))
-
-(defproc buffer-i32-set-at [pointer :ptr index :i64 value :i32]
-  (buffer-set pointer :i32 index value))
-
-(deftest test-buffer-get-set
-  (let [arena (Arena/ofShared)
-        buffer (.allocate arena 40)]
-    (try
-      (testing "f64 elements are 8 bytes apart"
-        (fill-buffer-f64 buffer 2.5 4)
-        (is (= 10.0 (sum-buffer-f64 buffer 4)))
-        (is (= 2.5 (.getAtIndex buffer ValueLayout/JAVA_DOUBLE 3))))
-
-      (testing "i32 elements are 4 bytes apart"
-        (buffer-i32-set-at buffer 1 33)
-        (buffer-i32-set-at buffer 2 44)
-        (is (= 33 (buffer-i32-at buffer 1)))
-        (is (= 44 (buffer-i32-at buffer 2)))
-        (is (= 33 (.getAtIndex buffer ValueLayout/JAVA_INT 1)))
-        (is (= 44 (.getAtIndex buffer ValueLayout/JAVA_INT 2)))
-        (is (= 0 (.getAtIndex buffer ValueLayout/JAVA_INT 0))))
-
-      (testing "f64 and i32 views address the same bytes"
-        ;; f64 index 1 occupies bytes 8-15, which are exactly i32 indices 2
-        ;; and 3, so a write through the i32 view must be visible through the
-        ;; f64 view (little-endian: i32 2 is the low half, i32 3 the high).
-        (fill-buffer-f64 buffer 0.0 2)
-        (buffer-i32-set-at buffer 2 123456789)
-        (buffer-i32-set-at buffer 3 -987654321)
-        (is (= 123456789 (buffer-i32-at buffer 2)))
-        (is (= -987654321 (buffer-i32-at buffer 3)))
-        (is (= 123456789 (.getAtIndex buffer ValueLayout/JAVA_INT 2)))
-        (is (= -987654321 (.getAtIndex buffer ValueLayout/JAVA_INT 3)))
-        (is (= (.getAtIndex buffer ValueLayout/JAVA_LONG 1)
-               (Double/doubleToRawLongBits (buffer-f64-at buffer 1)))))
-      (finally
-        (.close arena)))))
-
-(deftest test-math-intrinsics
-  (testing "sqrt"
-    (is (= 3.0 (sqrt-of 9.0))))
-
-  (testing "abs"
-    (is (= 4.0 (abs-float -4.0)))
-    (is (= 7 (abs-int -7))))
-
-  (testing "min/max"
-    (is (= 2.0 (min-two 5.0 2.0)))
-    (is (= 9.0 (max-three 1.0 9.0 3.0)))
-    (is (= 3 (min-int 7 3)))
-    (is (= 8 (max-int 8 2)))))
-
-(deftest test-substract-one
-  (is (= 9 (substract-one 10))))
-
-(deftest test-add-some
-  (is (= 43 (add-some 1))))
-
-(deftest test-add-both
-  (is (= 7 (add-both 3 4)))
-  (is (= -2 (add-both 2 -4))))
-
-(deftest test-procedure-namespace
-  (testing "defproc records the namespace that defines the procedure"
-    (is (= "clodin.compiler"
-           (:namespace (get @procedure-registry "clodin.compiler/add-both"))))))
-
-(deftest test-add-gigabyte
-  (testing "untyped constant integers are 64 bit integers"
-    (is (= 1073741825 (add-gigabyte 1)))))
-
-(deftest test-halve
-  (is (= 2.5 (halve 5.0))))
-
-(deftest test-mix-both
-  (testing "native procedures call each other and float calls flow through"
-    (is (< (abs (- 6.0 (mix-both 3 4.0))) 0.000001))))
-
-(deftest test-pointer-memory
-  (let [arena (Arena/ofShared)
-        buffer (.allocate arena 16)]
-    (try
-      (store-i64-at buffer 42)
-      (is (= 42 (load-i64-at buffer)))
-      (is (= 42 (.getAtIndex buffer ValueLayout/JAVA_LONG 0)))
-      (store-second-i64 buffer 99)
-      (is (= 99 (.getAtIndex buffer ValueLayout/JAVA_LONG 1)))
-      (store-i64-through-address (.address buffer) 7)
-      (is (= 7 (load-i64-at buffer)))
-      (increment-i64-at buffer)
-      (is (= 8 (load-i64-at buffer)))
-      (store-i64-at (pointer-to-second-i64 buffer) 123)
-      (is (= 123 (load-i64-at (pointer-to-second-i64 buffer))))
-      (finally
-        (.close arena)))))
-
-(deftest test-coerce-pointer-argument
-  (let [arena (Arena/ofShared)
-        buffer (.allocate arena 8)]
-    (try
-      (is (identical? buffer (coerce-argument :ptr buffer)))
-      (is (instance? MemorySegment (coerce-argument :ptr (.address buffer))))
-      (finally
-        (.close arena)))))
-
-(deftest test-shadowed-let
-  (testing "a later let binding shadows an earlier one"
-    (is (= 20 (shadowed-let)))))
-
-(deftest test-while
-  (is (= 10 (sum-to 5)))
-  (is (= 0 (sum-to 0)))
-  (is (= 5 (count-down 5)))
-  (is (= 6.0 (sum-floats-while 4.0))))
-
-(deftest test-while-with-memory
-  (let [arena (Arena/ofShared)
-        buffer (.allocate arena 32)]
-    (try
-      (fill-i64 buffer 3 4)
-      (is (= 12 (sum-array-i64 buffer 4)))
-      (is (= 3 (.getAtIndex buffer ValueLayout/JAVA_LONG 3)))
-      (finally
-        (.close arena)))))
-
-(deftest test-let-inside-while
-  (testing "a let inside a while is hoisted and reused"
-    (is (= 14 (sum-squares 4)))
-    (is (= 0 (sum-squares 0)))))
 
 ;;; if and to-f32 support
-(defproc if-choose [a :i64 b :i64]
-  (if (< a b) a b))
 
-;; if branches for real, so an arm may have a side effect.
-(defproc if-store [pointer :ptr flag :boolean]
-  (if flag
-    (store :i64 pointer 1)
-    (store :i64 pointer 2)))
 
-;; Only the taken arm runs, so the untaken arm cannot touch the local.
-(defproc if-arms-are-exclusive [flag :boolean]
-  (let [turns :i64 0]
-    (if flag
-      (set turns (+ turns 1))
-      (set turns (+ turns 10)))
-    turns))
 
-(defproc if-nested [a :i64 b :i64] :i64
-  (if (< a b)
-    (if (= a 0) 100 200)
-    300))
 
-(defproc if-inside-loop [limit :i64] :i64
-  (let [sum :i64 0
-        index :i64 0]
-    (while (< index limit)
-      (set sum (+ sum (if (= index 0) 10 1)))
-      (set index (+ index 1)))
-    sum))
 
-(defproc when-store [pointer :ptr flag :boolean]
-  (store :i64 pointer 0)
-  (when flag
-    (store :i64 pointer 7))
-  (load :i64 pointer))
-
-(defproc when-composed-not-store [pointer :ptr flag :boolean]
-  (store :i64 pointer 0)
-  (when (not flag)
-    (store :i64 pointer 7))
-  (load :i64 pointer))
-
-(defproc when-runs-one-side-effect [flag :boolean]
-  (let [turns :i64 0]
-    (when flag
-      (set turns (+ turns 5)))
-    turns))
-
-;; A literal false condition must compile, not be mistaken for a missing one.
-(defproc when-literal-false []
-  (let [turns :i64 0]
-    (when false
-      (set turns (+ turns 5)))
-    turns))
-
-(defproc while-literal-false []
-  (let [turns :i64 0]
-    (while false
-      (set turns (+ turns 5)))
-    turns))
-
-(defproc choice-abs [x :f64]
-  (if (< x 0.0) (abs x) x))
-
-(defproc halve-f32 [x :f32]
-  (/ x (to-f32 2)))
-
-(defproc f32-from-f64 [x :f64]
-  (to-f32 x))
-
-(defproc f32-from-i64 [x :i64]
-  (to-f32 x))
-
-(deftest test-if
-  (testing "a value if produces the taken arm's value"
-    (is (= 2 (if-choose 2 5)))
-    (is (= 2 (if-choose 5 2)))
-    (is (= 3.0 (choice-abs -3.0)))
-    (is (= 3.0 (choice-abs 3.0))))
-
-  (testing "a statement if runs exactly one arm"
-    (let [arena (Arena/ofShared)
-          buffer (.allocate arena 8)]
-      (try
-        (if-store buffer true)
-        (is (= 1 (.get buffer ValueLayout/JAVA_LONG 0)))
-        (if-store buffer false)
-        (is (= 2 (.get buffer ValueLayout/JAVA_LONG 0)))
-        (finally
-          (.close arena)))))
-
-  (testing "the untaken arm does not run"
-    (is (= 1 (if-arms-are-exclusive true)))
-    (is (= 10 (if-arms-are-exclusive false))))
-
-  (testing "nested and loop-hosted ifs"
-    (is (= 100 (if-nested 0 5)))
-    (is (= 200 (if-nested 1 5)))
-    (is (= 300 (if-nested 9 5)))
-    (is (= 12 (if-inside-loop 3)))))
-
-(deftest test-branch-bookkeeping
-  (testing "a callee referenced only inside a branch is still recorded"
-    (define-proc! "clodin.compiler" "branch-test-leaf" [] [] [5] nil false)
-    (define-proc! "clodin.compiler" "branch-test-caller" ['flag] [:boolean]
-      '[(if flag (branch-test-leaf) 1)] :i64 false)
-    (is (contains? (:callees (get @procedure-registry
-                                  "clodin.compiler/branch-test-caller"))
-                   "clodin.compiler/branch-test-leaf")))
-
-  (testing "a global referenced only inside a branch is still recorded"
-    (define-proc! "clodin.compiler" "branch-test-global-reader" ['flag] [:boolean]
-      '[(if flag globals-test-counter 0)] :i64 false)
-    (is (contains? (:globals (get @procedure-registry
-                                  "clodin.compiler/branch-test-global-reader"))
-                   "clodin.compiler.globals-test-counter"))))
-
-(deftest test-if-value-uses-a-phi
-  (testing "the join block merges both arms with a phi node"
-    (let [ir (requiring-resolve 'clodin.inspect/llvm-ir)]
-      (is (string/includes? (ir "if-choose") "phi i64")))))
-
-(deftest test-if-arm-mismatch
-  (testing "mixing a value arm with a statement arm is a clear error"
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo
-         #"arms must both produce a value of the same type"
-         (define-proc! "clodin.compiler" "if-arm-mismatch" ['pointer] [:ptr]
-           '[(if true 1 (store :i64 pointer 0))] :i64 false)))))
-
-(deftest test-when
-  (testing "when runs its body only when the condition is true"
-    (let [arena (Arena/ofShared)
-          buffer (.allocate arena 8)]
-      (try
-        (is (= 7 (when-store buffer true)))
-        (is (= 0 (when-store buffer false)))
-        (finally
-          (.close arena)))))
-
-  (testing "a literal false condition is a condition, not a missing one"
-    (is (= 0 (when-literal-false)))
-    (is (= 0 (while-literal-false))))
-
-  (testing "when has no value, so it cannot be used where one is needed"
-    (is (= 5 (when-runs-one-side-effect true)))
-    (is (= 0 (when-runs-one-side-effect false)))
-    (is (thrown? clojure.lang.ExceptionInfo
-                 (define-proc! "clodin.compiler" "when-as-value" [] []
-                   '[(let [value :i64 (when true 1)] value)] :i64 false)))))
-
-(deftest test-to-f32
-  (is (= 2.5 (halve-f32 5.0)))
-  (is (= 1.5 (f32-from-f64 1.5)))
-  (is (= 3.0 (f32-from-i64 3))))
 
 ;;; External C functions
 ;;;
@@ -3389,225 +2976,10 @@
 (extern strlen [:ptr] :i64)
 (extern srand [:i32] :void)
 
-(defproc print-nothing []
-  (printf ""))
-
-(defproc string-length-of-hello []
-  (strlen "hello"))
-
-(defproc string-length-of-empty []
-  (strlen ""))
-
-(defproc format-value-into-buffer [buffer :ptr]
-  (sprintf buffer "value=%ld" 12345))
-
-(defproc format-f32-into-buffer [buffer :ptr value :f32]
-  (sprintf buffer "%.1f" value))
-
-(defproc print-value [value :i64]
-  (println "value = " value))
-
-(defproc print-without-newline [value :i64]
-  (print "value = " value))
-
-(defproc print-mixed [flag :boolean ratio :f64 label :ptr]
-  (println label " " flag " " ratio))
-
-(defproc truncate-to-i32 [value :i64]
-  (to-i32 value))
-
-(defproc widen-to-i64 [value :i32]
-  (to-i64 value))
-
-(defproc is-greater [a :i64 b :i64]
-  (> a b))
 
 ;; not= is not a form; composing not with = gives the same result.
-(defproc is-different [a :i64 b :i64]
-  (not (= a b)))
 
-(defproc choose-by-flag [flag :boolean a :i64 b :i64]
-  (if flag a b))
 
-(defproc count-if-greater [a :i64 b :i64]
-  (let [flag :boolean (> a b)]
-    (if flag 1 0)))
-
-(defproc flip-flag [flag :boolean]
-  (let [current :boolean flag]
-    (set current (not current))
-    (if current 1 0)))
-
-(defproc negate-flag [flag :boolean]
-  (not flag))
-
-(defproc always-true []
-  true)
-
-(defproc flag-to-i32 [a :i64 b :i64]
-  (to-i32 (> a b)))
-
-(defproc flag-to-i64 [a :i64 b :i64]
-  (to-i64 (> a b)))
-
-(defproc set-flag [pointer :ptr index :i64 value :boolean]
-  (buffer-set pointer :boolean index value))
-
-(defproc get-flag [pointer :ptr index :i64]
-  (buffer-get pointer :boolean index))
-
-(defproc seed-random [seed :i32]
-  (srand seed))
-
-(deftest test-extern-printf
-  (testing "printf is callable and returns the number of bytes written"
-    (is (= 0 (print-nothing)))))
-
-(deftest test-println-writes-to-out
-  (testing "println writes to the calling thread's *out*"
-    (is (= "value = 42\n" (with-out-str (print-value 42)))))
-
-  (testing "print does not append a newline"
-    (is (= "value = 42" (with-out-str (print-without-newline 42)))))
-
-  (testing "println formats booleans, floats and C strings"
-    (let [arena (Arena/ofShared)
-          label (.allocateFrom arena "label")]
-      (try
-        (is (= "label true 1.5\n" (with-out-str (print-mixed true 1.5 label))))
-        (finally
-          (.close arena)))))
-
-  (testing "a procedure called from a future prints to the conveyed *out*"
-    (let [output (deref (future (with-out-str (print-value 7))) 5000 ::timeout)]
-      (is (= "value = 7\n" output)))))
-
-(deftest test-build-library
-  (let [output (str (System/getProperty "java.io.tmpdir")
-                    "/clodin-test-lib-" (System/nanoTime)
-                    (if (string/includes? (System/getProperty "os.name") "Mac")
-                      ".dylib" ".so"))]
-    (try
-      (build-library! 'examples.standalone-lib {:output output})
-      (let [arena (Arena/ofConfined)]
-        (try
-          (let [lookup (SymbolLookup/libraryLookup output arena)
-                greet-length (.orElseThrow (.find lookup "greet-length"))
-                descriptor (FunctionDescriptor/of
-                            ValueLayout/JAVA_LONG
-                            (into-array java.lang.foreign.MemoryLayout
-                                        [ValueLayout/ADDRESS]))
-                handle (.downcallHandle (Linker/nativeLinker) greet-length descriptor
-                                        (make-array Linker$Option 0))
-                text (.allocateFrom arena "library")]
-            ;; greet-length calls extern strlen, so the test exercises the
-            ;; linked library without writing to the process stdout.
-            (is (= 7 (long (.invokeWithArguments handle (object-array [text]))))))
-          (finally
-            (.close arena))))
-      (finally
-        (io/delete-file output true)))))
-
-(deftest test-extern-strlen
-  (testing "string literals are null terminated C strings"
-    (is (= 5 (string-length-of-hello)))
-    (is (= 0 (string-length-of-empty)))))
-
-(deftest test-extern-sprintf
-  (let [arena (Arena/ofShared)
-        buffer (.allocate arena 64)]
-    (try
-      (is (= 11 (format-value-into-buffer buffer)))
-      (is (= "value=12345" (.getString buffer 0)))
-      (is (= 3 (format-f32-into-buffer buffer 2.5)))
-      (is (= "2.5" (.getString buffer 0)))
-      (finally
-        (.close arena)))))
-
-(deftest test-to-i32
-  (testing "to-i32 truncates a 64 bit integer"
-    (is (= 42 (truncate-to-i32 42)))
-    (is (= 0 (truncate-to-i32 4294967296)))))
-
-(deftest test-to-i64
-  (testing "to-i64 sign extends a 32 bit integer"
-    (is (= 42 (widen-to-i64 42)))
-    (is (= -1 (widen-to-i64 -1)))))
-
-(deftest test-boolean
-  (testing "comparisons produce :boolean values that cross the jvm boundary"
-    (is (true? (is-greater 5 3)))
-    (is (false? (is-greater 3 5))))
-
-  (testing ":boolean parameters and let bindings"
-    (is (= 7 (choose-by-flag true 7 9)))
-    (is (= 9 (choose-by-flag false 7 9)))
-    (is (= 1 (count-if-greater 5 3)))
-    (is (= 0 (count-if-greater 3 5))))
-  (is (= 1 (flip-flag false)))
-  (is (= 0 (flip-flag true)))
-
-  (testing "boolean literals are :boolean"
-    (is (true? (always-true))))
-
-  (testing ":boolean widens to i32 and i64"
-    (is (= 1 (flag-to-i32 5 3)))
-    (is (= 0 (flag-to-i32 3 5)))
-    (is (= 1 (flag-to-i64 5 3)))
-    (is (= 0 (flag-to-i64 3 5)))))
-
-(deftest test-not
-  (testing "not is a procedure in clodin.core, not a compiler form"
-    (is (contains? @procedure-registry "clodin.core/not")))
-
-  (testing "not negates a :boolean"
-    (is (false? (negate-flag true)))
-    (is (true? (negate-flag false))))
-
-  (testing "when composes with not to run the body only when false"
-    (let [arena (Arena/ofShared)
-          buffer (.allocate arena 8)]
-      (try
-        (is (= 0 (when-composed-not-store buffer true)))
-        (is (= 7 (when-composed-not-store buffer false)))
-        (finally
-          (.close arena)))))
-
-  (testing "not checks its argument type"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                          #"do not match parameters"
-                          (define-proc! "clodin.compiler" "not-on-integer" [] []
-                            '[(not 1)] :boolean false)))))
-
-(deftest test-not-equal
-  (testing "not= is composed from not and ="
-    (is (true? (is-different 1 2)))
-    (is (false? (is-different 2 2))))
-
-  (testing "not= is no longer a compiler form"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                          #"Unknown clodin procedure: not="
-                          (define-proc! "clodin.compiler" "not-equal-removed" [] []
-                            '[(if (not= 1 2) 1 0)] :i64 false)))))
-
-(deftest test-boolean-buffer
-  (let [arena (Arena/ofShared)
-        buffer (.allocate arena 4)]
-    (try
-      (set-flag buffer 0 true)
-      (set-flag buffer 1 false)
-      (set-flag buffer 2 true)
-      (is (true? (get-flag buffer 0)))
-      (is (false? (get-flag buffer 1)))
-      (is (true? (get-flag buffer 2)))
-      (is (true? (.get buffer ValueLayout/JAVA_BOOLEAN 0)))
-      (is (false? (.get buffer ValueLayout/JAVA_BOOLEAN 1)))
-      (finally
-        (.close arena)))))
-
-(deftest test-extern-void-return
-  (testing "a void external function produces no value"
-    (is (nil? (seed-random 1)))))
 (deftest test-register-external-replaces-signature
   (try
     (register-external! 'clodin-test-extern [:i64] :i64 false)
@@ -3627,19 +2999,6 @@
     (finally
       (swap! external-registry dissoc "clodin-test-extern"))))
 
-
-(deftest test-optimization-level
-  (testing "set-optimization-level! preserves results at every level"
-    (try
-      (set-optimization-level! :O3)
-      (is (= 2.5 (halve 5.0)))
-      (is (= 7 (add-both 3 4)))
-      (finally
-        (set-optimization-level! :none))))
-  (testing "rejects unknown levels"
-    (is (thrown? clojure.lang.ExceptionInfo
-                 (set-optimization-level! :O9)))))
-
 ;;; ---------------------------------------------------------------------------
 ;;; Reloadable mode tests
 ;;;
@@ -3648,83 +3007,6 @@
 ;;; namespace loads, not when the test runs.
 ;;; ---------------------------------------------------------------------------
 
-(deftest test-reloadable-redefinition-propagates
-  (try
-    (set-build-mode! :reloadable)
-    (define-proc! "clodin.compiler" "reload-test-value" [] [] [1] nil false)
-    (define-proc! "clodin.compiler" "reload-test-caller" [] []
-      '[(reload-test-value)] nil false)
-    (is (= 1 (invoke-procedure "reload-test-caller" [])))
-    (define-proc! "clodin.compiler" "reload-test-value" [] [] [2] nil false)
-    (testing "an already compiled native caller sees the new body"
-      (is (= 2 (invoke-procedure "reload-test-caller" []))))
-    (testing "the body symbol is versioned but the stub keeps its name"
-      (is (string/includes? (:body-symbol (get @procedure-registry
-                                               "clodin.compiler/reload-test-value"))
-                            "$"))
-      (is (= "clodin.compiler.reload-test-value"
-             (:stub-symbol (get @procedure-registry
-                                "clodin.compiler/reload-test-value")))))
-    (finally
-      (set-build-mode! :monolithic))))
-
-(deftest test-reloadable-preserves-buffer-state
-  (let [arena (Arena/ofShared)
-        buffer (.allocate arena 8)]
-    (try
-      (set-build-mode! :reloadable)
-      (define-proc! "clodin.compiler" "reload-test-bump" ['pointer] [:ptr]
-        '[(let [value :i64 (load :i64 pointer)]
-            (store :i64 pointer (+ value 1))
-            value)]
-        :i64 false)
-      (is (= 0 (invoke-procedure "reload-test-bump" [buffer])))
-      (is (= 1 (invoke-procedure "reload-test-bump" [buffer])))
-      (define-proc! "clodin.compiler" "reload-test-bump" ['pointer] [:ptr]
-        '[(let [value :i64 (load :i64 pointer)]
-            (store :i64 pointer (+ value 10))
-            value)]
-        :i64 false)
-      (testing "the new body reads the memory the old body wrote"
-        (is (= 2 (invoke-procedure "reload-test-bump" [buffer])))
-        (is (= 12 (invoke-procedure "reload-test-bump" [buffer]))))
-      (finally
-        (set-build-mode! :monolithic)
-        (.close arena)))))
-
-(deftest test-reloadable-signature-change-cascades
-  (try
-    (set-build-mode! :reloadable)
-    (define-proc! "clodin.compiler" "reload-test-producer" [] [] [1] nil false)
-    (define-proc! "clodin.compiler" "reload-test-consumer" [] []
-      '[(reload-test-producer)] nil false)
-    (is (= 1 (invoke-procedure "reload-test-consumer" [])))
-    (define-proc! "clodin.compiler" "reload-test-producer" [] [] [1.5] nil false)
-    (testing "the callers are re-emitted and their inferred types follow"
-      (is (= 1.5 (invoke-procedure "reload-test-producer" [])))
-      (is (= 1.5 (invoke-procedure "reload-test-consumer" [])))
-      (is (= :f64 (:return-type (get @procedure-registry
-                                     "clodin.compiler/reload-test-consumer")))))
-    (testing "the old stub is replaced by a signature stub"
-      (is (not= "clodin.compiler.reload-test-producer"
-                (:stub-symbol (get @procedure-registry
-                                   "clodin.compiler/reload-test-producer")))))
-    (finally
-      (set-build-mode! :monolithic))))
-
-(deftest test-build-mode-switch
-  (try
-    (set-build-mode! :reloadable)
-    (define-proc! "clodin.compiler" "reload-test-mode" [] [] [7] nil false)
-    (is (= 7 (invoke-procedure "reload-test-mode" [])))
-    (set-build-mode! :monolithic)
-    (is (= :monolithic (current-build-mode)))
-    (is (= 7 (invoke-procedure "reload-test-mode" [])))
-    (set-build-mode! :reloadable)
-    (is (= :reloadable (current-build-mode)))
-    (is (= 7 (invoke-procedure "reload-test-mode" [])))
-    (finally
-      (set-build-mode! :monolithic))))
 
 (deftest test-reloadable-caller-calls-the-stub
   (try
@@ -3738,40 +3020,6 @@
       (is (not (string/includes? ir "@reload-test-ir-callee$"))))
     (finally
       (set-build-mode! :monolithic))))
-
-(deftest test-reloadable-native-loop-sees-new-body
-  (let [arena (Arena/ofShared)
-        flag (.allocate arena 8)
-        out (.allocate arena 8)
-        previous-level (current-optimization-level)]
-    (try
-      (set-optimization-level! :none)
-      (set-build-mode! :reloadable)
-      (.set flag ValueLayout/JAVA_LONG 0 0)
-      (define-proc! "clodin.compiler" "reload-test-loop-synth" [] [] [1] nil false)
-      (define-proc! "clodin.compiler" "reload-test-loop-driver" ['flag 'out] [:ptr :ptr]
-        '[(let [index :i64 0]
-            (while (= (load :i64 flag) 0)
-              (buffer-set out :i64 0 (reload-test-loop-synth))
-              (set index (+ index 1)))
-            index)]
-        :i64 false)
-      (let [worker (future (invoke-procedure "reload-test-loop-driver" [flag out]))]
-        (try
-          (Thread/sleep 200)
-          (is (= 1 (.get out ValueLayout/JAVA_LONG 0)))
-          (define-proc! "clodin.compiler" "reload-test-loop-synth" [] [] [2] nil false)
-          (Thread/sleep 200)
-          (testing "the running native loop picks up the new body"
-            (is (= 2 (.get out ValueLayout/JAVA_LONG 0))))
-          (finally
-            (.set flag ValueLayout/JAVA_LONG 0 1)))
-        (is (integer? (deref worker 10000 ::timeout))))
-      (finally
-        (.set flag ValueLayout/JAVA_LONG 0 1)
-        (set-build-mode! :monolithic)
-        (set-optimization-level! previous-level)
-        (.close arena)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Test isolation
@@ -3788,21 +3036,23 @@
 ;;; no longer has.
 ;;; ---------------------------------------------------------------------------
 
-(defn- registry-keys
+(defn registry-keys
+  "The registry keys a test can add to, as a snapshot for isolated-registrations."
   []
   {:procedures (set (keys @procedure-registry))
    :externs (set (keys @external-registry))
    :globals (set (keys @globals/registry))})
 
-(defn- test-namespace?
-  "True for the namespaces the tests in this file create registrations in."
+(defn test-namespace?
+  "True for the namespaces a test in this project creates registrations in."
   [qualified-name]
   (or (string/starts-with? qualified-name "clodin.compiler/")
+      (string/starts-with? qualified-name "clodin.compiler-test/")
       (string/starts-with? qualified-name "clodin.core/test-")
       (string/starts-with? qualified-name "examples.naming/")
       (string/starts-with? qualified-name "examples.other/")))
 
-(defn- drop-registrations!
+(defn drop-registrations!
   "Removes every procedure, extern and global that a test registered in one
   of the test namespaces, so the registries end up as they started.
   Registrations a test makes in another namespace are kept, because they
@@ -3822,13 +3072,18 @@
     (swap! globals/registry dissoc name))
   nil)
 
-(use-fixtures :each
-  (fn [test-function]
-    (let [before (registry-keys)]
-      (try
-        (test-function)
-        (finally
-          (drop-registrations! before (registry-keys)))))))
+(defn isolated-registrations
+  "A clojure.test :each fixture that removes the registrations a test adds.
+  clodin.compiler-test uses it too, so both test namespaces can run in one
+  JVM without seeing each other's leftovers."
+  [test-function]
+  (let [before (registry-keys)]
+    (try
+      (test-function)
+      (finally
+        (drop-registrations! before (registry-keys))))))
+
+(use-fixtures :each isolated-registrations)
 
 ;;; ---------------------------------------------------------------------------
 ;;; Globals
@@ -3846,14 +3101,6 @@
 (defvar globals-test-float :f64 1.5)
 (defvar globals-test-float32 :f32 2.5)
 (defvar globals-test-pointer :ptr nil)
-
-;; A defproc wrapper for the print-from-a-background-thread test.
-(defproc globals-test-background-printer [] :i64
-  (let [turns :i64 0]
-    (while globals-test-boolean
-      (set turns (+ turns 1)))
-    (println "background turns = " turns)
-    turns))
 
 (deftest test-globals-registry
   (testing "defvar registers a typed global and binds a handle"
@@ -3938,179 +3185,6 @@
       (reset! globals-test-counter 7)
       (reset! globals-test-boolean true))))
 
-(deftest test-globals-native-access
-  (try
-    (reset! globals-test-counter 7)
-    (reset! globals-test-boolean true)
-    (define-proc! "clodin.compiler" "globals-test-read-counter" [] []
-      '[(+ globals-test-counter 1)] nil false)
-    (define-proc! "clodin.compiler" "globals-test-write-counter" ['value] [:i64]
-      '[(set globals-test-counter value)] nil false)
-    (define-proc! "clodin.compiler" "globals-test-read-boolean" [] []
-      '[globals-test-boolean] nil false)
-    (define-proc! "clodin.compiler" "globals-test-clear-boolean" [] []
-      '[(set globals-test-boolean false)] nil false)
-
-    (testing "native code reads a global written by Clojure"
-      (is (= 8 (invoke-procedure "globals-test-read-counter" [])))
-      (reset! globals-test-counter 40)
-      (is (= 41 (invoke-procedure "globals-test-read-counter" []))))
-
-    (testing "a native set is visible to Clojure"
-      (invoke-procedure "globals-test-write-counter" [99])
-      (is (= 99 @globals-test-counter)))
-
-    (testing "a :boolean global crosses the boundary as a boolean"
-      (is (true? (invoke-procedure "globals-test-read-boolean" [])))
-      (invoke-procedure "globals-test-clear-boolean" [])
-      (is (false? @globals-test-boolean))
-      (is (false? (invoke-procedure "globals-test-read-boolean" []))))
-    (finally
-      (reset! globals-test-counter 7)
-      (reset! globals-test-boolean true))))
-
-(deftest test-background-print-goes-to-conveyed-out
-  (testing "a loop started in a future prints to the future's *out*"
-    (reset! globals-test-boolean true)
-    (let [output (java.io.StringWriter.)
-          worker (binding [*out* output]
-                   (future (globals-test-background-printer)))]
-      (try
-        (Thread/sleep 100)
-        (is (not (realized? worker)))
-        (reset! globals-test-boolean false)
-        (is (integer? (deref worker 20000 ::timeout)))
-        (is (re-find #"background turns = [0-9]+" (str output)))
-        (finally
-          (reset! globals-test-boolean false))))))
-
-(deftest test-globals-native-loop-sees-reset
-  (let [previous-level (current-optimization-level)]
-    (try
-      ;; Optimization is the point of this test: a plain, non-atomic load of a
-      ;; loop invariant is hoisted out of the loop at every level, so an
-      ;; optimized build only terminates because the load is atomic.
-      (set-optimization-level! :O3)
-      (reset! globals-test-boolean true)
-      (define-proc! "clodin.compiler" "globals-test-spin" [] []
-        '[(let [turns :i64 0]
-            (while globals-test-boolean
-              (set turns (+ turns 1)))
-            turns)]
-        :i64 false)
-      (let [worker (future (invoke-procedure "globals-test-spin" []))]
-        (try
-          (Thread/sleep 100)
-          (is (not (realized? worker)))
-          (reset! globals-test-boolean false)
-          (is (integer? (deref worker 20000 ::timeout)))
-          (finally
-            (reset! globals-test-boolean true))))
-      (finally
-        (reset! globals-test-boolean true)
-        (set-optimization-level! previous-level)))))
-
-(deftest test-globals-reloadable-preserves-value
-  (try
-    (set-build-mode! :reloadable)
-    (reset! globals-test-counter 0)
-    (define-proc! "clodin.compiler" "globals-test-bump" [] []
-      '[(let [next-value :i64 (+ globals-test-counter 1)]
-          (set globals-test-counter next-value)
-          next-value)]
-      :i64 false)
-    (is (= 1 (invoke-procedure "globals-test-bump" [])))
-    (is (= 2 (invoke-procedure "globals-test-bump" [])))
-    (testing "a procedure redefinition keeps the live global value"
-      (define-proc! "clodin.compiler" "globals-test-bump" [] []
-        '[(let [next-value :i64 (+ globals-test-counter 10)]
-            (set globals-test-counter next-value)
-            next-value)]
-        :i64 false)
-      (is (= 12 (invoke-procedure "globals-test-bump" [])))
-      (is (= 12 @globals-test-counter)))
-    (finally
-      (reset! globals-test-counter 7)
-      (set-build-mode! :monolithic))))
-
-(deftest test-globals-reset-reinitialises
-  (try
-    (define-proc! "clodin.compiler" "globals-test-reading" [] []
-      '[globals-test-counter] nil false)
-    ;; A monolithic build replaces the whole JIT and links fresh storage, so a
-    ;; global does not survive a rebuild in that mode. This is the documented
-    ;; trade-off: stateful programs use :reloadable mode.
-    (is (= 7 (invoke-procedure "globals-test-reading" [])))
-    (reset! globals-test-counter 10)
-    (reset! globals-test-boolean false)
-    (is (= 10 (invoke-procedure "globals-test-reading" [])))
-    (reset-module!)
-    (testing "a full reset restores the source initial values"
-      (is (= 7 @globals-test-counter))
-      (is (true? @globals-test-boolean)))
-    (testing "re-emitted native code reads the rebuilt storage"
-      (is (= 7 (invoke-procedure "globals-test-reading" []))))
-    (finally
-      (reset! globals-test-counter 7))))
-
-(deftest test-globals-forget-unlinked-storage
-  ;; A monolithic rebuild links storage only for the globals its procedures
-  ;; use. A global left out of the new generation must lose its address: the
-  ;; address belongs to the JIT that is about to be disposed, and reading
-  ;; through it would dereference freed memory.
-  (try
-    (set-build-mode! :monolithic)
-    (define-var! "clodin.compiler" "globals-test-unlinked" :i64 3)
-    (define-proc! "clodin.compiler" "globals-test-unlinked-reader" [] []
-      '[globals-test-unlinked] nil false)
-    (is (= 3 (invoke-procedure "globals-test-unlinked-reader" [])))
-    (testing "a rebuild that links no user of the global forgets its address"
-      (swap! procedure-registry dissoc
-             "clodin.compiler/globals-test-unlinked-reader")
-      (swap! procedure-handles dissoc
-             "clodin.compiler/globals-test-unlinked-reader")
-      (reset! module-dirty true)
-      (compile-module!)
-      (is (nil? (:address (globals/entry
-                           "clodin.compiler/globals-test-unlinked")))))
-    (testing "the next access installs fresh storage at the source value"
-      (is (= 3 (globals/read-value
-                "clodin.compiler/globals-test-unlinked"))))
-    (finally
-      (swap! procedure-registry dissoc
-             "clodin.compiler/globals-test-unlinked-reader")
-      (swap! procedure-handles dissoc
-             "clodin.compiler/globals-test-unlinked-reader")
-      (swap! globals/registry dissoc
-             "clodin.compiler/globals-test-unlinked"))))
-
-(deftest test-globals-type-change
-  (try
-    (set-build-mode! :reloadable)
-    (define-var! "clodin.compiler" "globals-test-retyped" :i64 5)
-    (define-proc! "clodin.compiler" "globals-test-retyped-reader" [] []
-      '[globals-test-retyped] nil false)
-    (is (= 5 (invoke-procedure "globals-test-retyped-reader" [])))
-    (testing "a type change mints a new native symbol"
-      (let [[entry changed?] (globals/register! "clodin.compiler"
-                                                "globals-test-retyped" :f64 1.5)]
-        (is (true? changed?))
-        (is (= "clodin.compiler.globals-test-retyped$g1" (:symbol entry)))
-        (is (= :f64 (:type entry)))))
-    (testing "the re-emitted body reads the new layout"
-      (define-proc! "clodin.compiler" "globals-test-retyped-reader" [] []
-        '[(+ globals-test-retyped 0.5)] nil false)
-      (is (= 2.0 (invoke-procedure "globals-test-retyped-reader" []))))
-    (finally
-      ;; The registries are keyed by qualified name, so the cleanup has to use
-      ;; the qualified names too; otherwise the next run of this test starts
-      ;; from the leftovers of the previous one.
-      (swap! globals/registry dissoc "clodin.compiler/globals-test-retyped")
-      (swap! procedure-registry dissoc
-             "clodin.compiler/globals-test-retyped-reader")
-      (swap! procedure-handles dissoc
-             "clodin.compiler/globals-test-retyped-reader")
-      (set-build-mode! :monolithic))))
 
 (deftest test-globals-in-standalone-build
   (let [output (str (System/getProperty "java.io.tmpdir")
@@ -4139,6 +3213,66 @@
       (finally
         (io/delete-file file true)
         (io/delete-file output true)))))
+
+
+
+
+
+
+
+
+
+
+
+(defn- libc-symbol
+  "Resolves a name in the default lookup, which covers the C library, and
+  returns its address as a :ptr, so a test can hand clodin a real code pointer."
+  [name]
+  (let [lookup (.defaultLookup (Linker/nativeLinker))]
+    (.orElseThrow (.find lookup name))))
+
+(defn- upcall-stub
+  "Builds a JVM upcall stub with the given FunctionDescriptor that invokes
+  handler, and returns its segment. This is how a test hands native code an
+  address that re-enters the JVM."
+  [^Arena arena ^FunctionDescriptor descriptor handler]
+  (let [method-type (.toMethodType descriptor)
+        argument-count (.parameterCount method-type)
+        invoke-type (MethodType/methodType
+                     Object (into-array Class (repeat argument-count Object)))
+        handle (-> (.findVirtual (MethodHandles/publicLookup)
+                                 clojure.lang.IFn "invoke" invoke-type)
+                   (.bindTo handler)
+                   (.asType method-type))]
+    (clojure.lang.Reflector/invokeInstanceMethod
+     (Linker/nativeLinker) "upcallStub"
+     (to-array [handle descriptor arena (make-array Linker$Option 0)]))))
+
+(defn- record-i64-upcall
+  "A void(i64) upcall that records its argument."
+  [^Arena arena recorded]
+  (upcall-stub arena
+               (FunctionDescriptor/ofVoid
+                (into-array MemoryLayout [ValueLayout/JAVA_LONG]))
+               (fn [value] (reset! recorded value))))
+
+(defn- echo-i64-upcall
+  "An i64(i64) upcall that returns its argument."
+  [^Arena arena]
+  (upcall-stub arena
+               (FunctionDescriptor/of ValueLayout/JAVA_LONG
+                                      (into-array MemoryLayout [ValueLayout/JAVA_LONG]))
+               (fn [value] value)))
+
+
+
+
+
+
+
+
+
+
 
 ;;; ---------------------------------------------------------------------------
 ;;; Stack scratch allocation tests
@@ -4263,309 +3397,6 @@
             (swap! procedure-handles dissoc name)))))))
 
 ;;; ---------------------------------------------------------------------------
-;;; is-null and pointer-call tests
-;;; ---------------------------------------------------------------------------
-
-(defproc is-null-pointer [pointer :ptr]
-  (if (is-null pointer) 1 0))
-
-;; strlen is a libc symbol, so this covers a real C function address reached
-;; through a :ptr rather than through a declared extern.
-(defproc pointer-call-strlen [strlen :ptr]
-  (pointer-call strlen [:ptr] :i64 "hello"))
-
-;; No declared return type: :i64 comes from the pointer-call signature.
-(defproc pointer-call-inferred [strlen :ptr]
-  (pointer-call strlen [:ptr] :i64 "hello"))
-
-;; The shape the print runtime needs: the writer pointer may be absent.
-(defproc pointer-call-if-null [callback :ptr value :i64]
-  (if (is-null callback)
-    -1
-    (pointer-call callback [:i64] :i64 value)))
-
-;; A void signature produces no value.
-(defproc pointer-call-void-callback [callback :ptr value :i64]
-  (pointer-call callback [:i64] :void value))
-
-(defn- libc-symbol
-  "Resolves a name in the default lookup, which covers the C library, and
-  returns its address as a :ptr, so a test can hand clodin a real code pointer."
-  [name]
-  (let [lookup (.defaultLookup (Linker/nativeLinker))]
-    (.orElseThrow (.find lookup name))))
-
-(defn- upcall-stub
-  "Builds a JVM upcall stub with the given FunctionDescriptor that invokes
-  handler, and returns its segment. This is how a test hands native code an
-  address that re-enters the JVM."
-  [^Arena arena ^FunctionDescriptor descriptor handler]
-  (let [method-type (.toMethodType descriptor)
-        argument-count (.parameterCount method-type)
-        invoke-type (MethodType/methodType
-                     Object (into-array Class (repeat argument-count Object)))
-        handle (-> (.findVirtual (MethodHandles/publicLookup)
-                                 clojure.lang.IFn "invoke" invoke-type)
-                   (.bindTo handler)
-                   (.asType method-type))]
-    (clojure.lang.Reflector/invokeInstanceMethod
-     (Linker/nativeLinker) "upcallStub"
-     (to-array [handle descriptor arena (make-array Linker$Option 0)]))))
-
-(defn- record-i64-upcall
-  "A void(i64) upcall that records its argument."
-  [^Arena arena recorded]
-  (upcall-stub arena
-               (FunctionDescriptor/ofVoid
-                (into-array MemoryLayout [ValueLayout/JAVA_LONG]))
-               (fn [value] (reset! recorded value))))
-
-(defn- echo-i64-upcall
-  "An i64(i64) upcall that returns its argument."
-  [^Arena arena]
-  (upcall-stub arena
-               (FunctionDescriptor/of ValueLayout/JAVA_LONG
-                                      (into-array MemoryLayout [ValueLayout/JAVA_LONG]))
-               (fn [value] value)))
-
-(deftest test-is-null
-  (testing "is-null is a procedure in clodin.core, not a compiler form"
-    (is (contains? @procedure-registry "clodin.core/is-null")))
-  (testing "a :ptr holding address zero is null and any other address is not"
-    (let [arena (Arena/ofShared)]
-      (try
-        (is (= 1 (is-null-pointer nil)))
-        (is (= 1 (is-null-pointer (MemorySegment/ofAddress 0))))
-        (is (= 0 (is-null-pointer (.allocate arena 8))))
-        (finally
-          (.close arena)))))
-
-  (testing "is-null rejects a type that cannot hold a null"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"do not match parameters"
-                          (define-proc! "clodin.compiler" "is-null-non-pointer" [] []
-                            '[(if (is-null 5) 1 0)] :i64 false))))
-
-  (testing "is-null expects exactly one operand"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"expects 1 arguments"
-                          (define-proc! "clodin.compiler" "is-null-arity" [] []
-                            '[(if (is-null) 1 0)] :i64 false)))))
-
-(deftest test-pointer-call
-  (testing "a pointer-call reaches a libc function address"
-    (is (= 5 (pointer-call-strlen (libc-symbol "strlen")))))
-
-  (testing "an argument and return type written at the call site are used"
-    (is (= :i64 (:return-type (get @procedure-registry
-                                   "clodin.compiler/pointer-call-inferred")))))
-
-  (testing "a void signature produces no value"
-    (let [arena (Arena/ofShared)
-          recorded (atom nil)]
-      (try
-        (is (nil? (pointer-call-void-callback (record-i64-upcall arena recorded) 42)))
-        (is (= 42 @recorded))
-        (finally
-          (.close arena)))))
-
-  (testing "a pointer-call reaches a JVM upcall stub"
-    (let [arena (Arena/ofShared)]
-      (try
-        (is (= 7 (pointer-call-if-null (echo-i64-upcall arena) 7)))
-        (finally
-          (.close arena)))))
-
-  (testing "a null pointer is the caller's problem, tested with is-null"
-    (is (= -1 (pointer-call-if-null nil 7))))
-
-  (testing "the written signature is checked as far as it can be"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"expects a :ptr function address"
-                          (define-proc! "clodin.compiler" "pointer-call-non-pointer" [] []
-                            '[(pointer-call 5 [] :void)] nil false)))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"takes 1 arguments, got 0"
-                          (define-proc! "clodin.compiler" "pointer-call-arity" ['callback] [:ptr]
-                            '[(pointer-call callback [:i64] :void)] nil false)))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"do not match pointer-call parameters"
-                          (define-proc! "clodin.compiler" "pointer-call-argument-types"
-                            ['callback] [:ptr]
-                            '[(pointer-call callback [:i64] :void 1.5)]
-                            nil false)))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"literal vector of parameter types"
-                          (define-proc! "clodin.compiler" "pointer-call-non-literal"
-                            ['callback] [:ptr]
-                            '[(pointer-call callback :i64 :void)]
-                            nil false)))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"parameter types are"
-                          (define-proc! "clodin.compiler" "pointer-call-void-parameter"
-                            ['callback] [:ptr]
-                            '[(pointer-call callback [:void] :void)]
-                            nil false)))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"return type is"
-                          (define-proc! "clodin.compiler" "pointer-call-silly-return"
-                            ['callback] [:ptr]
-                            '[(pointer-call callback [] :i8)]
-                            nil false))))
-
-  (testing "a void call has no value to bind"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"its value is no value"
-                          (define-proc! "clodin.compiler" "pointer-call-void-value"
-                            ['callback] [:ptr]
-                            '[(let [value :i64 (pointer-call callback [] :void)]
-                                value)]
-                            nil false)))))
-
-;;; ---------------------------------------------------------------------------
-;;; Statement position and :void return types
-;;; ---------------------------------------------------------------------------
-
-;; A value producing procedure, so an arm can have both a side effect and a
-;; return value that differs from the other arm's.
-(defproc store-and-return [pointer :ptr value :i64]
-  (store :i64 pointer value)
-  value)
-
-(defproc store-only [pointer :ptr value :i64] :void
-  (store :i64 pointer value))
-
-;; The print runtime shape: one arm returns :i64, the other returns nothing.
-;; In value position this is an error; as a statement it is legal.
-(defproc statement-if-mixed-arms [pointer :ptr flag :boolean] :void
-  (if flag
-    (store-only pointer 1)
-    (store-and-return pointer 2)))
-
-;; The same mismatch in a non-final body form, where the value is discarded.
-(defproc statement-if-nonfinal [pointer :ptr flag :boolean]
-  (if flag
-    (store-only pointer 3)
-    (store-and-return pointer 4))
-  (load :i64 pointer))
-
-;; A let in statement position forwards statement position to its last form.
-(defproc statement-let [pointer :ptr flag :boolean]
-  (let [ignored :i64 0]
-    (if flag
-      (store-only pointer 5)
-      (store-and-return pointer 6)))
-  (load :i64 pointer))
-
-;; A when body discards its last form's value too.
-(defproc statement-when [pointer :ptr flag :boolean]
-  (when flag
-    (if flag
-      (store-only pointer 7)
-      (store-and-return pointer 8)))
-  (load :i64 pointer))
-
-;; A while body discards its last form's value on every iteration.
-(defproc statement-while [pointer :ptr count :i64]
-  (let [index :i64 0]
-    (while (< index count)
-      (set index (+ index 1))
-      (if (= index 0)
-        (store-only pointer 9)
-        (store-and-return pointer 10)))
-    (load :i64 pointer)))
-
-;; A declared :void discards whatever the body produces.
-(defproc void-value-body [] :void
-  42)
-
-(deftest test-statement-position
-  (testing "a statement if runs one arm and discards both values"
-    (let [arena (Arena/ofShared)
-          pointer (.allocate arena 8)]
-      (try
-        (is (nil? (statement-if-mixed-arms pointer true)))
-        (is (= 1 (.getAtIndex pointer ValueLayout/JAVA_LONG 0)))
-        (statement-if-mixed-arms pointer false)
-        (is (= 2 (.getAtIndex pointer ValueLayout/JAVA_LONG 0)))
-        (finally
-          (.close arena)))))
-
-  (testing "the same mismatch is legal as a non-final body form"
-    (let [arena (Arena/ofShared)
-          pointer (.allocate arena 8)]
-      (try
-        (is (= 3 (statement-if-nonfinal pointer true)))
-        (is (= 4 (statement-if-nonfinal pointer false)))
-        (finally
-          (.close arena)))))
-
-  (testing "statement position reaches a let body's last form"
-    (let [arena (Arena/ofShared)
-          pointer (.allocate arena 8)]
-      (try
-        (is (= 5 (statement-let pointer true)))
-        (is (= 6 (statement-let pointer false)))
-        (finally
-          (.close arena)))))
-
-  (testing "statement position reaches a when body's last form"
-    (let [arena (Arena/ofShared)
-          pointer (.allocate arena 8)]
-      (try
-        (is (= 7 (statement-when pointer true)))
-        ;; The untaken body must not write, so a sentinel survives.
-        (.set pointer ValueLayout/JAVA_LONG 0 0)
-        (is (= 0 (statement-when pointer false)))
-        (finally
-          (.close arena)))))
-
-  (testing "statement position reaches a while body's last form"
-    (let [arena (Arena/ofShared)
-          pointer (.allocate arena 8)]
-      (try
-        (is (= 10 (statement-while pointer 3)))
-        (.set pointer ValueLayout/JAVA_LONG 0 0)
-        (is (= 0 (statement-while pointer 0)))
-        (finally
-          (.close arena)))))
-
-  (testing "a statement if builds no phi"
-    (let [ir (requiring-resolve 'clodin.inspect/llvm-ir)]
-      (is (not (string/includes? (ir "statement-if-mixed-arms") "phi")))))
-
-  (testing "value position still requires both arms to agree"
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo
-         #"arms must both produce a value of the same type"
-         (define-proc! "clodin.compiler" "statement-if-value-position" ['pointer] [:ptr]
-           '[(if true 1 (store :i64 pointer 0))] :i64 false)))
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo
-         #"arms must both produce a value of the same type"
-         (define-proc! "clodin.compiler" "statement-if-let-value" ['pointer] [:ptr]
-           '[(let [value :i64 (if true 1 (store :i64 pointer 0))] value)]
-           nil false)))))
-
-(deftest test-void-return-type
-  (testing ":void is a declarable return type and the call produces no value"
-    (is (nil? (void-value-body)))
-    (is (nil? (store-only (.allocate (Arena/ofShared) 8) 1))))
-
-  (testing "the registry keeps the declaration but reports a void ABI"
-    (let [entry (get @procedure-registry "clodin.compiler/void-value-body")]
-      (is (nil? (:return-type entry)))
-      (is (= :void (:explicit-return-type entry)))))
-
-  (testing "a declared :void body is a statement, so it has no value to return"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"has no value to return"
-                          (define-proc! "clodin.compiler" "void-declared-i64" ['pointer] [:ptr]
-                            '[(if true (store :i64 pointer 1)
-                                  (store :i64 pointer 2))]
-                            :i64 false))))
-
-  (testing ":void is rejected as a parameter type"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"cannot take a :void parameter"
-                          (define-proc! "clodin.compiler" "void-parameter" ['value] [:void]
-                            '[1] nil false))))
-
-  (testing "an unsupported declared return type is a clear error"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unsupported return type"
-                          (define-proc! "clodin.compiler" "unsupported-return" [] []
-                            '[1] :i8 false)))))
-
-;;; ---------------------------------------------------------------------------
 ;;; Qualified names
 ;;; ---------------------------------------------------------------------------
 
@@ -4652,52 +3483,6 @@
         (swap! procedure-handles dissoc name))
       (swap! globals/registry dissoc "examples.naming/counter"))))
 
-;;; ---------------------------------------------------------------------------
-;;; Print runtime in clodin
-;;; ---------------------------------------------------------------------------
-
-(def ^:private writer-global "clodin.runtime/clodin-write")
-
-(defn- writer-address
-  "The address the writer global currently holds, or nil when it is null."
-  []
-  (some-> ^MemorySegment (globals/read-value writer-global) (.address)))
-
-(defproc runtime-print-caller [value :i64]
-  (println "value = " value))
-
-(deftest test-runtime-writer
-  (testing "a build installs the writer upcall address"
-    (is (= (print/writer-address) (writer-address))))
-
-  (testing "a procedure that prints records the runtime as callees"
-    (let [callees (:callees (get @procedure-registry
-                                 "clodin.compiler/runtime-print-caller"))]
-      (is (contains? callees "clodin.runtime/print-bytes"))
-      (is (contains? callees "clodin.runtime/print-i64"))
-      (is (contains? callees "clodin.runtime/print-newline"))))
-
-  (testing "the compiler loads the runtime before a user body is compiled"
-    (is (contains? @procedure-registry "clodin.runtime/write-to-out"))
-    (is (some? (globals/entry writer-global))))
-
-  (testing "a reset installs it again after it was cleared"
-    (globals/write-value! writer-global 0)
-    (is (nil? (writer-address)))
-    (reset-module!)
-    (is (= (print/writer-address) (writer-address))))
-
-  (testing "a monolithic rebuild installs it again after it was cleared"
-    (try
-      (set-build-mode! :monolithic)
-      (reset-module!)
-      (globals/write-value! writer-global 0)
-      (is (nil? (writer-address)))
-      (reset! module-dirty true)
-      (compile-module!)
-      (is (= (print/writer-address) (writer-address)))
-      (finally
-        (set-build-mode! :monolithic)))))
 
 (deftest test-runtime-writer-does-not-recompile
   (testing "installing the writer does not trigger a second build"
