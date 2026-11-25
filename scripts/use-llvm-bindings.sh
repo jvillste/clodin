@@ -81,3 +81,27 @@ mkdir -p "$(dirname "$current")"
 ln -s "classes/$platform" "$current"
 
 printf 'Active LLVM bindings: %s -> classes/%s\n' "$current" "$platform"
+
+# The generated bindings bake the absolute path of the libLLVM they were
+# created from into a class initializer. A directory generated on another
+# machine, or against an LLVM install that has since moved, fails at load
+# time with "Cannot open library". Report that here instead.
+baked_libraries="$(
+    find "$classes" -type f -name '*.class' \
+        -exec grep -aoh -E '/[A-Za-z0-9._@+/-]*libLLVM[A-Za-z0-9._@+-]*' {} + 2>/dev/null \
+        | sort -u || true
+)"
+
+missing_libraries=""
+while IFS= read -r library; do
+    [ -n "$library" ] || continue
+    [ -e "$library" ] || missing_libraries="${missing_libraries}${library}"$'\n'
+done <<< "$baked_libraries"
+
+if [ -n "$missing_libraries" ]; then
+    printf 'warning: the active bindings were generated against a libLLVM that is missing here:\n' >&2
+    while IFS= read -r library; do
+        [ -n "$library" ] && printf '  %s\n' "$library" >&2
+    done <<< "$missing_libraries"
+    printf 'warning: regenerate them with scripts/generate-llvm-bindings.sh (LLVM_LIBRARY=...)\n' >&2
+fi

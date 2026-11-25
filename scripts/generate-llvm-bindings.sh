@@ -98,15 +98,6 @@ case "$(uname -m)" in
         ;;
 esac
 
-case "$platform_arch" in
-    aarch64)
-        llvm_target="AArch64"
-        ;;
-    x64)
-        llvm_target="X86"
-        ;;
-esac
-
 jextract_version="${JEXTRACT_VERSION:-25-jextract+2-4}"
 jextract_package="${JEXTRACT_PACKAGE:-clodin.llvm}"
 jextract_header_class="${JEXTRACT_HEADER_CLASS:-LLVM}"
@@ -314,6 +305,13 @@ find_llvm_include() {
         fi
         add_candidate "/opt/homebrew/opt/llvm/include"
         add_candidate "/usr/local/opt/llvm/include"
+        # Versioned kegs such as llvm@21 are what Homebrew installs when
+        # the unversioned llvm formula is not present.
+        local keg
+        for keg in /opt/homebrew/opt/llvm@*/include \
+                   /usr/local/opt/llvm@*/include; do
+            [ -d "$keg" ] && add_candidate "$keg"
+        done
     else
         local directory
         while IFS= read -r directory; do
@@ -358,7 +356,9 @@ find_llvm_library() {
         add_candidate "/usr/local/opt/llvm/lib/libLLVM.dylib"
         local library
         for library in /opt/homebrew/opt/llvm/lib/libLLVM*.dylib \
-                         /usr/local/opt/llvm/lib/libLLVM*.dylib; do
+                         /usr/local/opt/llvm/lib/libLLVM*.dylib \
+                         /opt/homebrew/opt/llvm@*/lib/libLLVM*.dylib \
+                         /usr/local/opt/llvm@*/lib/libLLVM*.dylib; do
             [ -e "$library" ] && add_candidate "$library"
         done
     else
@@ -392,18 +392,6 @@ case "$llvm_include" in
         ;;
 esac
 
-headers=(
-    "$llvm_include/llvm-c/Analysis.h"
-    "$llvm_include/llvm-c/BitReader.h"
-    "$llvm_include/llvm-c/BitWriter.h"
-    "$llvm_include/llvm-c/Core.h"
-    "$llvm_include/llvm-c/Error.h"
-    "$llvm_include/llvm-c/Linker.h"
-    "$llvm_include/llvm-c/LLJIT.h"
-    "$llvm_include/llvm-c/Orc.h"
-    "$llvm_include/llvm-c/Support.h"
-    "$llvm_include/llvm-c/Target.h"
-    "$llvm_include/llvm-c/TargetMachine.h"
 # LLVM 20+ renames the PassBuilderOptions constructors; jextract emits
 # whichever this LLVM provides: LLVMCreatePassBuilderOptions /
 # LLVMDisposePassBuilderOptions (20+) or LLVMPassBuilderOptionsCreate /
@@ -432,7 +420,11 @@ done
 
 jextract_library="${JEXTRACT_LIBRARY:-:$llvm_library}"
 
-rm -rf "$jextract_output"
+# jextract numbers its generated classes (LLVM_1, LLVM_2, ...) in the
+# order it emits them, and that numbering differs between platforms and
+# library paths. Remove the previous output, otherwise a stale class can
+# shadow the new loader class and keep an old libLLVM path baked in.
+rm -rf "$jextract_output" "$jextract_classes"
 mkdir -p "$jextract_output" "$jextract_classes"
 
 include_arguments=(--include-dir "$llvm_include")
@@ -449,10 +441,40 @@ if [ ! -f "$llvm_include/llvm/Config/llvm-config.h" ]; then
     rm -rf "$llvm_config_shim"
     mkdir -p "$llvm_config_shim/llvm/Config"
     cp "$llvm_config_source" "$llvm_config_shim/llvm/Config/llvm-config.h"
-    printf 'LLVM_TARGET(%s)\n' "$llvm_target" > "$llvm_config_shim/llvm/Config/Targets.def"
-    printf 'LLVM_ASM_PRINTER(%s)\n' "$llvm_target" > "$llvm_config_shim/llvm/Config/AsmPrinters.def"
-    printf 'LLVM_ASM_PARSER(%s)\n' "$llvm_target" > "$llvm_config_shim/llvm/Config/AsmParsers.def"
-    printf 'LLVM_DISASSEMBLER(%s)\n' "$llvm_target" > "$llvm_config_shim/llvm/Config/Disassemblers.def"
+    # The vendored tree has no generated *.def lists, so write the ones a
+    # distribution build would have. Enable every target, not just the
+    # host: clodin.llvm-api compiles a call for each target it knows
+    # about, and Clojure compiles every case branch even though only the
+    # host one runs.
+    llvm_targets=(
+        AArch64 AMDGPU ARM AVR BPF Hexagon Lanai LoongArch M68k MSP430
+        Mips NVPTX PowerPC RISCV SPIRV Sparc SystemZ VE WebAssembly X86
+        XCore Xtensa
+    )
+    llvm_asm_parser_targets=(
+        AArch64 AMDGPU ARM AVR BPF Hexagon Lanai LoongArch M68k MSP430
+        Mips PowerPC RISCV Sparc SystemZ VE WebAssembly X86 Xtensa
+    )
+    llvm_disassembler_targets=(
+        AArch64 AMDGPU ARM AVR BPF Hexagon Lanai LoongArch M68k MSP430
+        Mips PowerPC RISCV Sparc SystemZ VE WebAssembly X86 XCore Xtensa
+    )
+    write_def() {
+        local macro="$1" file="$2"
+        shift 2
+        local target
+        for target in "$@"; do
+            printf '%s(%s)\n' "$macro" "$target"
+        done > "$file"
+    }
+    write_def LLVM_TARGET "$llvm_config_shim/llvm/Config/Targets.def" \
+        "${llvm_targets[@]}"
+    write_def LLVM_ASM_PRINTER "$llvm_config_shim/llvm/Config/AsmPrinters.def" \
+        "${llvm_targets[@]}"
+    write_def LLVM_ASM_PARSER "$llvm_config_shim/llvm/Config/AsmParsers.def" \
+        "${llvm_asm_parser_targets[@]}"
+    write_def LLVM_DISASSEMBLER "$llvm_config_shim/llvm/Config/Disassemblers.def" \
+        "${llvm_disassembler_targets[@]}"
     include_arguments=(--include-dir "$llvm_config_shim" --include-dir "$llvm_include")
 fi
 
