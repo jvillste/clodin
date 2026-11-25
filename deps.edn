@@ -2,6 +2,10 @@
  :aliases
  {:dev
   {:jvm-opts ["--enable-native-access=ALL-UNNAMED"]}
- :build
+  :test
+  {:extra-paths ["scripts"]
+   :jvm-opts ["--enable-native-access=ALL-UNNAMED"]
+   :main-opts ["-m" "run-tests"]}
+  :build
   {:deps {io.github.clojure/tools.build {:mvn/version "0.10.5"}}
    :ns-default build}}}
