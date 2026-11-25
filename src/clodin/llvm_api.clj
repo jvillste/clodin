@@ -823,13 +823,25 @@
 ;;; ORC / LLJIT
 ;;; ---------------------------------------------------------------------------
 
+(def ^:private error-message-limit
+  "How much of an LLVM error message is searched for the terminating zero.
+  A JIT link error lists every symbol it could not find, so it is several
+  kilobytes long, and the buffer must be longer than the message."
+  (* 1024 1024))
+
 (defn- error-message
   "Reads and frees an LLVMErrorRef message, returning it as a string or
   nil when the error handle is null."
   [^MemorySegment error-ref]
   (when-not (null? error-ref)
     (let [message-pointer (LLVM/LLVMGetErrorMessage error-ref)
-          message (some-> message-pointer (.reinterpret 4096) (.getString 0))]
+          ;; LLVM owns an unterminated-at-a-known-length C string here, so
+          ;; give the segment room for the longest message it can produce.
+          ;; A segment shorter than the message makes getString throw
+          ;; "No null terminator found" and hides the real failure.
+          message (some-> message-pointer
+                        (.reinterpret error-message-limit)
+                        (.getString 0))]
       (LLVM/LLVMDisposeErrorMessage message-pointer)
       message)))
 

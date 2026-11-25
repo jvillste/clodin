@@ -213,6 +213,22 @@
                  entries)))
   nil)
 
+(defn forget-stale-installations!
+  "Forgets every recorded storage address that does not belong to jit. A
+  build that links fresh storage therefore leaves a global it did not link
+  with no address, so the next access installs storage instead of
+  dereferencing the disposed JIT."
+  [jit]
+  (swap! registry
+         (fn [entries]
+           (into {}
+                 (map (fn [[name entry]]
+                        (if (= jit (:jit entry))
+                          [name entry]
+                          [name (assoc entry :address nil :jit nil)])))
+                 entries)))
+  nil)
+
 (defn installed-symbols
   "The native symbols whose storage is installed in the given JIT generation."
   [jit]

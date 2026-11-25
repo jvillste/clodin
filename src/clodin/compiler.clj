@@ -125,7 +125,7 @@
             [clojure.java.io :as io]
             [clojure.java.shell :as shell]
             [clojure.string :as string]
-            [clojure.test :refer [deftest is run-tests testing]])
+            [clojure.test :refer [deftest is run-tests testing use-fixtures]])
   (:import (java.lang.foreign Arena FunctionDescriptor Linker Linker$Option
                               MemoryLayout MemorySegment SymbolLookup ValueLayout)
            (java.lang.invoke MethodHandles MethodType)))
@@ -145,13 +145,30 @@
 ;;; last successful JIT compile.
 ;;; ---------------------------------------------------------------------------
 
-(def procedure-registry (atom {}))
+(defonce procedure-registry
+  ;; defonce, not def: reloading this namespace must not drop the procedures
+  ;; that clodin.core and clodin.runtime registered, because those namespaces
+  ;; are not reloaded with it and would never re-register them.
+  (atom {}))
 
 ;;; external-registry maps an external C function name to
 ;;; {:param-types [...] :return-type ... :varargs? bool}. External functions
 ;;; are declared with the extern macro and resolved by the JIT from the host
 ;;; process, so they need no bitcode of their own.
-(def external-registry (atom {}))
+(defonce external-registry
+  ;; defonce like the procedure registry: clodin.runtime declares externs such
+  ;; as snprintf, and reloading this namespace must not forget them, because
+  ;; re-emitting a runtime body would then fail to resolve the call.
+  (atom {}))
+
+(defn- warn!
+  "Writes a definition-time warning to *err*. A definition that shadows an
+  existing name is allowed, so a warning is the only signal that the compiler
+  will still prefer the extern or the built in form."
+  [message]
+  (binding [*out* *err*]
+    (println (str "WARNING: " message)))
+  nil)
 
 (def ^:private supported-types #{:i64 :i32 :f64 :f32 :ptr})
 
@@ -175,12 +192,17 @@
                     {:name name})))
   (let [signature {:param-types (vec param-types)
                    :return-type return-type
-                   :varargs? (boolean varargs?)}]
-    (when-let [existing (get @external-registry (str name))]
-      (when-not (= existing signature)
-        (throw (ex-info (str "External function " name
-                             " was already declared with a different signature")
-                        {:name name :existing existing :signature signature}))))
+                   :varargs? (boolean varargs?)}
+        existing (get @external-registry (str name))]
+    ;; Re-declaring with another signature replaces it, so editing an extern
+    ;; and reloading its namespace takes effect. Bodies already emitted keep
+    ;; the call they emitted, though: their bitcode is reused on every
+    ;; rebuild, so the warning says what has to be redefined.
+    (when (and existing (not= existing signature))
+      (warn! (str "external function " name " is redeclared with " signature
+                  " instead of " existing
+                  "; procedures that call it keep the old call until they are"
+                  " redefined")))
     (swap! external-registry assoc (str name) signature))
   nil)
 
@@ -205,7 +227,10 @@
                       (boolean (some #{:varargs} options)))
   nil)
 
-(def procedure-handles (atom {}))
+(defonce procedure-handles
+  ;; defonce for the same reason as procedure-registry: a handle stays valid
+  ;; while its JIT generation is alive, and a reload does not dispose it.
+  (atom {}))
 (def module-dirty (atom true))
 (defonce current-jit (atom nil))
 (defonce compile-lock (Object.))
@@ -292,7 +317,7 @@
                (integer? value) (not (zero? value))
                :else (throw (ex-info (str "Expected a boolean or integer for :boolean, got "
                                           (some-> value class .getName))
-                                      {:type type :value value})))
+                                     {:type type :value value})))
     :i64 (long value)
     :i32 (int value)
     :f64 (double value)
@@ -353,7 +378,7 @@
     (if (llvm/null? existing)
       (llvm/global-declaration (:module state)
                                (llvm/type-for (:context state)
-                                               (globals/storage-type type))
+                                              (globals/storage-type type))
                                name-token
                                (globals/storage-size type))
       existing)))
@@ -1610,9 +1635,9 @@
     (boolean? expression) :boolean
     (string? expression) :ptr
     (symbol? expression) (or (:type (get environment expression))
-                              (some-> (resolve-global-name (get environment ::namespace)
-                                                           expression)
-                                      globals/global-type))
+                             (some-> (resolve-global-name (get environment ::namespace)
+                                                          expression)
+                                     globals/global-type))
     (seq? expression)
     (let [operator (first expression)]
       (when (symbol? operator)
@@ -1680,7 +1705,7 @@
         function-type (llvm/function-type context arena return-type param-types)]
     (try
       (let [function (llvm/add-function module (llvm/c-string arena (str emitted-name))
-                                       function-type)
+                                        function-type)
             builder (llvm/new-builder context)
             entry-block (llvm/append-entry-block function builder context arena "entry")
             state {:arena arena :context context :module module :builder builder
@@ -1784,8 +1809,8 @@
     (doseq [[symbol type initial-value] specs]
       (let [storage (globals/storage-type type)
             global (llvm/add-global module
-                                     (llvm/type-for context storage)
-                                     (llvm/c-string arena (str symbol)))]
+                                    (llvm/type-for context storage)
+                                    (llvm/c-string arena (str symbol)))]
         (llvm/set-alignment global (globals/storage-size type))
         (llvm/set-initializer
          global
@@ -1901,7 +1926,7 @@
             module (llvm/new-module context stub-symbol)
             pointer (llvm/pointer-type context)
             cell (llvm/add-global module pointer
-                                 (llvm/c-string arena (str stub-symbol "$cell")))
+                                  (llvm/c-string arena (str stub-symbol "$cell")))
             thunk-type (llvm/function-type context arena return-type param-types)
             thunk (llvm/add-function module (llvm/c-string arena stub-symbol) thunk-type)
             builder (llvm/new-builder context)
@@ -1919,8 +1944,8 @@
             abort-type (llvm/function-type context arena nil [])
             abort (llvm/add-function module (llvm/c-string arena "abort") abort-type)
             unbound (llvm/add-function module
-                                         (llvm/c-string arena (str stub-symbol "$unbound"))
-                                         thunk-type)
+                                       (llvm/c-string arena (str stub-symbol "$unbound"))
+                                       thunk-type)
             unbound-builder (llvm/new-builder context)
             _ (llvm/append-entry-block unbound unbound-builder context arena "entry")
             _ (llvm/build-call unbound-builder abort-type abort [] arena)
@@ -2168,15 +2193,6 @@
             (install-globals! @current-jit))
           entry)))))
 
-(defn- warn!
-  "Writes a definition-time warning to *err*. A definition that shadows an
-  existing name is allowed, so a warning is the only signal that the compiler
-  will still prefer the extern or the built in form."
-  [message]
-  (binding [*out* *err*]
-    (println (str "WARNING: " message)))
-  nil)
-
 (defn define-proc!
   "Defines or redefines a procedure from already parsed parts. The defproc
   macro calls this at macro expansion time; tests call it directly.
@@ -2266,14 +2282,14 @@
 
           (nil? existing)
           (let [provisional (assoc definition
-                                 :body-symbol nil
-                                 :bitcode nil
-                                 :callees {}
-                                 :stub-symbol nil
-                                 :stub-signature nil
-                                 :stubs {}
-                                 :sig-counter 0
-                                 :generation 1)]
+                                   :body-symbol nil
+                                   :bitcode nil
+                                   :callees {}
+                                   :stub-symbol nil
+                                   :stub-signature nil
+                                   :stubs {}
+                                   :sig-counter 0
+                                   :generation 1)]
             (swap! procedure-registry assoc qualified provisional)
             (try
               (let [entry (ensure-stub-for-entry! qualified provisional)]
@@ -2456,6 +2472,10 @@
             jit (llvm/create-jit arena)
             _ (llvm/add-module-to-jit! jit module context)
             _ (record-global-addresses! jit (used-global-symbols module))
+            ;; A global this module does not link keeps the address it had in
+            ;; the JIT that is about to be disposed, so forget it: the next
+            ;; access installs fresh storage instead of reading freed memory.
+            _ (globals/forget-stale-installations! jit)
             _ (install-writer! jit)
             handles (build-handles jit arena)]
         (let [old-jit @current-jit]
@@ -2848,8 +2868,8 @@
         explicit-return-type (when (keyword? (first body)) (first body))
         body-forms (if explicit-return-type (next body) body)]
     (define-proc! namespace (str name) param-names param-types body-forms
-                  explicit-return-type
-                  (boolean (:static (meta name))))
+      explicit-return-type
+      (boolean (:static (meta name))))
     `(defn ~name [~@param-names]
        (invoke-procedure ~(names/qualified-name namespace (str name))
                          [~@param-names]))))
@@ -3307,14 +3327,14 @@
   (testing "a callee referenced only inside a branch is still recorded"
     (define-proc! "clodin.compiler" "branch-test-leaf" [] [] [5] nil false)
     (define-proc! "clodin.compiler" "branch-test-caller" ['flag] [:boolean]
-                  '[(if flag (branch-test-leaf) 1)] :i64 false)
+      '[(if flag (branch-test-leaf) 1)] :i64 false)
     (is (contains? (:callees (get @procedure-registry
                                   "clodin.compiler/branch-test-caller"))
                    "clodin.compiler/branch-test-leaf")))
 
   (testing "a global referenced only inside a branch is still recorded"
     (define-proc! "clodin.compiler" "branch-test-global-reader" ['flag] [:boolean]
-                  '[(if flag globals-test-counter 0)] :i64 false)
+      '[(if flag globals-test-counter 0)] :i64 false)
     (is (contains? (:globals (get @procedure-registry
                                   "clodin.compiler/branch-test-global-reader"))
                    "clodin.compiler.globals-test-counter"))))
@@ -3330,7 +3350,7 @@
          clojure.lang.ExceptionInfo
          #"arms must both produce a value of the same type"
          (define-proc! "clodin.compiler" "if-arm-mismatch" ['pointer] [:ptr]
-                       '[(if true 1 (store :i64 pointer 0))] :i64 false)))))
+           '[(if true 1 (store :i64 pointer 0))] :i64 false)))))
 
 (deftest test-when
   (testing "when runs its body only when the condition is true"
@@ -3351,7 +3371,7 @@
     (is (= 0 (when-runs-one-side-effect false)))
     (is (thrown? clojure.lang.ExceptionInfo
                  (define-proc! "clodin.compiler" "when-as-value" [] []
-                               '[(let [value :i64 (when true 1)] value)] :i64 false)))))
+                   '[(let [value :i64 (when true 1)] value)] :i64 false)))))
 
 (deftest test-to-f32
   (is (= 2.5 (halve-f32 5.0)))
@@ -3524,8 +3544,8 @@
     (is (= 9 (choose-by-flag false 7 9)))
     (is (= 1 (count-if-greater 5 3)))
     (is (= 0 (count-if-greater 3 5))))
-    (is (= 1 (flip-flag false)))
-    (is (= 0 (flip-flag true)))
+  (is (= 1 (flip-flag false)))
+  (is (= 0 (flip-flag true)))
 
   (testing "boolean literals are :boolean"
     (is (true? (always-true))))
@@ -3557,7 +3577,7 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo
                           #"do not match parameters"
                           (define-proc! "clodin.compiler" "not-on-integer" [] []
-                                        '[(not 1)] :boolean false)))))
+                            '[(not 1)] :boolean false)))))
 
 (deftest test-not-equal
   (testing "not= is composed from not and ="
@@ -3568,7 +3588,7 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo
                           #"Unknown clodin procedure: not="
                           (define-proc! "clodin.compiler" "not-equal-removed" [] []
-                                        '[(if (not= 1 2) 1 0)] :i64 false)))))
+                            '[(if (not= 1 2) 1 0)] :i64 false)))))
 
 (deftest test-boolean-buffer
   (let [arena (Arena/ofShared)
@@ -3588,6 +3608,25 @@
 (deftest test-extern-void-return
   (testing "a void external function produces no value"
     (is (nil? (seed-random 1)))))
+(deftest test-register-external-replaces-signature
+  (try
+    (register-external! 'clodin-test-extern [:i64] :i64 false)
+    (testing "a re-declaration with another signature replaces it"
+      (let [warning (with-out-str
+                      (binding [*err* *out*]
+                        (register-external! 'clodin-test-extern
+                                            [:ptr] :i32 true)))]
+        (is (= {:param-types [:ptr] :return-type :i32 :varargs? true}
+               (get @external-registry "clodin-test-extern")))
+        (is (re-find #"redeclared" warning))))
+    (testing "declaring the same signature again is silent"
+      (is (= "" (with-out-str
+                  (binding [*err* *out*]
+                    (register-external! 'clodin-test-extern
+                                        [:ptr] :i32 true))))))
+    (finally
+      (swap! external-registry dissoc "clodin-test-extern"))))
+
 
 (deftest test-optimization-level
   (testing "set-optimization-level! preserves results at every level"
@@ -3614,14 +3653,14 @@
     (set-build-mode! :reloadable)
     (define-proc! "clodin.compiler" "reload-test-value" [] [] [1] nil false)
     (define-proc! "clodin.compiler" "reload-test-caller" [] []
-                  '[(reload-test-value)] nil false)
+      '[(reload-test-value)] nil false)
     (is (= 1 (invoke-procedure "reload-test-caller" [])))
     (define-proc! "clodin.compiler" "reload-test-value" [] [] [2] nil false)
     (testing "an already compiled native caller sees the new body"
       (is (= 2 (invoke-procedure "reload-test-caller" []))))
     (testing "the body symbol is versioned but the stub keeps its name"
       (is (string/includes? (:body-symbol (get @procedure-registry
-                                            "clodin.compiler/reload-test-value"))
+                                               "clodin.compiler/reload-test-value"))
                             "$"))
       (is (= "clodin.compiler.reload-test-value"
              (:stub-symbol (get @procedure-registry
@@ -3635,17 +3674,17 @@
     (try
       (set-build-mode! :reloadable)
       (define-proc! "clodin.compiler" "reload-test-bump" ['pointer] [:ptr]
-                    '[(let [value :i64 (load :i64 pointer)]
-                        (store :i64 pointer (+ value 1))
-                        value)]
-                    :i64 false)
+        '[(let [value :i64 (load :i64 pointer)]
+            (store :i64 pointer (+ value 1))
+            value)]
+        :i64 false)
       (is (= 0 (invoke-procedure "reload-test-bump" [buffer])))
       (is (= 1 (invoke-procedure "reload-test-bump" [buffer])))
       (define-proc! "clodin.compiler" "reload-test-bump" ['pointer] [:ptr]
-                    '[(let [value :i64 (load :i64 pointer)]
-                        (store :i64 pointer (+ value 10))
-                        value)]
-                    :i64 false)
+        '[(let [value :i64 (load :i64 pointer)]
+            (store :i64 pointer (+ value 10))
+            value)]
+        :i64 false)
       (testing "the new body reads the memory the old body wrote"
         (is (= 2 (invoke-procedure "reload-test-bump" [buffer])))
         (is (= 12 (invoke-procedure "reload-test-bump" [buffer]))))
@@ -3658,14 +3697,14 @@
     (set-build-mode! :reloadable)
     (define-proc! "clodin.compiler" "reload-test-producer" [] [] [1] nil false)
     (define-proc! "clodin.compiler" "reload-test-consumer" [] []
-                  '[(reload-test-producer)] nil false)
+      '[(reload-test-producer)] nil false)
     (is (= 1 (invoke-procedure "reload-test-consumer" [])))
     (define-proc! "clodin.compiler" "reload-test-producer" [] [] [1.5] nil false)
     (testing "the callers are re-emitted and their inferred types follow"
       (is (= 1.5 (invoke-procedure "reload-test-producer" [])))
       (is (= 1.5 (invoke-procedure "reload-test-consumer" [])))
       (is (= :f64 (:return-type (get @procedure-registry
-                                  "clodin.compiler/reload-test-consumer")))))
+                                     "clodin.compiler/reload-test-consumer")))))
     (testing "the old stub is replaced by a signature stub"
       (is (not= "clodin.compiler.reload-test-producer"
                 (:stub-symbol (get @procedure-registry
@@ -3692,7 +3731,7 @@
     (set-build-mode! :reloadable)
     (define-proc! "clodin.compiler" "reload-test-ir-callee" [] [] [1] nil false)
     (define-proc! "clodin.compiler" "reload-test-ir-caller" [] []
-                  '[(reload-test-ir-callee)] nil false)
+      '[(reload-test-ir-callee)] nil false)
     (let [llvm-ir (requiring-resolve 'clodin.inspect/llvm-ir)
           ir (llvm-ir "reload-test-ir-caller")]
       (is (string/includes? ir "@clodin.compiler.reload-test-ir-callee"))
@@ -3711,12 +3750,12 @@
       (.set flag ValueLayout/JAVA_LONG 0 0)
       (define-proc! "clodin.compiler" "reload-test-loop-synth" [] [] [1] nil false)
       (define-proc! "clodin.compiler" "reload-test-loop-driver" ['flag 'out] [:ptr :ptr]
-                    '[(let [index :i64 0]
-                        (while (= (load :i64 flag) 0)
-                          (buffer-set out :i64 0 (reload-test-loop-synth))
-                          (set index (+ index 1)))
-                        index)]
-                    :i64 false)
+        '[(let [index :i64 0]
+            (while (= (load :i64 flag) 0)
+              (buffer-set out :i64 0 (reload-test-loop-synth))
+              (set index (+ index 1)))
+            index)]
+        :i64 false)
       (let [worker (future (invoke-procedure "reload-test-loop-driver" [flag out]))]
         (try
           (Thread/sleep 200)
@@ -3728,11 +3767,68 @@
           (finally
             (.set flag ValueLayout/JAVA_LONG 0 1)))
         (is (integer? (deref worker 10000 ::timeout))))
-    (finally
-      (.set flag ValueLayout/JAVA_LONG 0 1)
-      (set-build-mode! :monolithic)
-      (set-optimization-level! previous-level)
-      (.close arena)))))
+      (finally
+        (.set flag ValueLayout/JAVA_LONG 0 1)
+        (set-build-mode! :monolithic)
+        (set-optimization-level! previous-level)
+        (.close arena)))))
+
+;;; ---------------------------------------------------------------------------
+;;; Test isolation
+;;;
+;;; Tests below register procedures and globals at run time with
+;;; define-proc! and define-var!, and few of them remove every registration
+;;; they make. A leftover makes the suite pass once and fail when CIDER runs
+;;; the namespace a second time in the same JVM, because the second run
+;;; starts from the first run's definitions instead of from a clean state.
+;;;
+;;; The fixture below removes what a test added. It never restores removed
+;;; entries: a procedure the namespace defines at load time has a live JIT
+;;; body, and putting a stale copy back would hand out a body symbol the JIT
+;;; no longer has.
+;;; ---------------------------------------------------------------------------
+
+(defn- registry-keys
+  []
+  {:procedures (set (keys @procedure-registry))
+   :externs (set (keys @external-registry))
+   :globals (set (keys @globals/registry))})
+
+(defn- test-namespace?
+  "True for the namespaces the tests in this file create registrations in."
+  [qualified-name]
+  (or (string/starts-with? qualified-name "clodin.compiler/")
+      (string/starts-with? qualified-name "clodin.core/test-")
+      (string/starts-with? qualified-name "examples.naming/")
+      (string/starts-with? qualified-name "examples.other/")))
+
+(defn- drop-registrations!
+  "Removes every procedure, extern and global that a test registered in one
+  of the test namespaces, so the registries end up as they started.
+  Registrations a test makes in another namespace are kept, because they
+  come from requiring that namespace rather than from the test itself."
+  [{before-procedures :procedures before-externs :externs
+    before-globals :globals}
+   {now-procedures :procedures now-externs :externs now-globals :globals}]
+  (doseq [name (remove before-procedures now-procedures)
+          :when (test-namespace? name)]
+    (swap! procedure-registry dissoc name)
+    (swap! procedure-handles dissoc name))
+  (doseq [name (remove before-externs now-externs)
+          :when (test-namespace? name)]
+    (swap! external-registry dissoc name))
+  (doseq [name (remove before-globals now-globals)
+          :when (test-namespace? name)]
+    (swap! globals/registry dissoc name))
+  nil)
+
+(use-fixtures :each
+  (fn [test-function]
+    (let [before (registry-keys)]
+      (try
+        (test-function)
+        (finally
+          (drop-registrations! before (registry-keys)))))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Globals
@@ -3847,13 +3943,13 @@
     (reset! globals-test-counter 7)
     (reset! globals-test-boolean true)
     (define-proc! "clodin.compiler" "globals-test-read-counter" [] []
-                  '[(+ globals-test-counter 1)] nil false)
+      '[(+ globals-test-counter 1)] nil false)
     (define-proc! "clodin.compiler" "globals-test-write-counter" ['value] [:i64]
-                  '[(set globals-test-counter value)] nil false)
+      '[(set globals-test-counter value)] nil false)
     (define-proc! "clodin.compiler" "globals-test-read-boolean" [] []
-                  '[globals-test-boolean] nil false)
+      '[globals-test-boolean] nil false)
     (define-proc! "clodin.compiler" "globals-test-clear-boolean" [] []
-                  '[(set globals-test-boolean false)] nil false)
+      '[(set globals-test-boolean false)] nil false)
 
     (testing "native code reads a global written by Clojure"
       (is (= 8 (invoke-procedure "globals-test-read-counter" [])))
@@ -3897,11 +3993,11 @@
       (set-optimization-level! :O3)
       (reset! globals-test-boolean true)
       (define-proc! "clodin.compiler" "globals-test-spin" [] []
-                    '[(let [turns :i64 0]
-                        (while globals-test-boolean
-                          (set turns (+ turns 1)))
-                        turns)]
-                    :i64 false)
+        '[(let [turns :i64 0]
+            (while globals-test-boolean
+              (set turns (+ turns 1)))
+            turns)]
+        :i64 false)
       (let [worker (future (invoke-procedure "globals-test-spin" []))]
         (try
           (Thread/sleep 100)
@@ -3919,18 +4015,18 @@
     (set-build-mode! :reloadable)
     (reset! globals-test-counter 0)
     (define-proc! "clodin.compiler" "globals-test-bump" [] []
-                  '[(let [next-value :i64 (+ globals-test-counter 1)]
-                      (set globals-test-counter next-value)
-                      next-value)]
-                  :i64 false)
+      '[(let [next-value :i64 (+ globals-test-counter 1)]
+          (set globals-test-counter next-value)
+          next-value)]
+      :i64 false)
     (is (= 1 (invoke-procedure "globals-test-bump" [])))
     (is (= 2 (invoke-procedure "globals-test-bump" [])))
     (testing "a procedure redefinition keeps the live global value"
       (define-proc! "clodin.compiler" "globals-test-bump" [] []
-                    '[(let [next-value :i64 (+ globals-test-counter 10)]
-                        (set globals-test-counter next-value)
-                        next-value)]
-                    :i64 false)
+        '[(let [next-value :i64 (+ globals-test-counter 10)]
+            (set globals-test-counter next-value)
+            next-value)]
+        :i64 false)
       (is (= 12 (invoke-procedure "globals-test-bump" [])))
       (is (= 12 @globals-test-counter)))
     (finally
@@ -3940,7 +4036,7 @@
 (deftest test-globals-reset-reinitialises
   (try
     (define-proc! "clodin.compiler" "globals-test-reading" [] []
-                  '[globals-test-counter] nil false)
+      '[globals-test-counter] nil false)
     ;; A monolithic build replaces the whole JIT and links fresh storage, so a
     ;; global does not survive a rebuild in that mode. This is the documented
     ;; trade-off: stateful programs use :reloadable mode.
@@ -3957,12 +4053,43 @@
     (finally
       (reset! globals-test-counter 7))))
 
+(deftest test-globals-forget-unlinked-storage
+  ;; A monolithic rebuild links storage only for the globals its procedures
+  ;; use. A global left out of the new generation must lose its address: the
+  ;; address belongs to the JIT that is about to be disposed, and reading
+  ;; through it would dereference freed memory.
+  (try
+    (set-build-mode! :monolithic)
+    (define-var! "clodin.compiler" "globals-test-unlinked" :i64 3)
+    (define-proc! "clodin.compiler" "globals-test-unlinked-reader" [] []
+      '[globals-test-unlinked] nil false)
+    (is (= 3 (invoke-procedure "globals-test-unlinked-reader" [])))
+    (testing "a rebuild that links no user of the global forgets its address"
+      (swap! procedure-registry dissoc
+             "clodin.compiler/globals-test-unlinked-reader")
+      (swap! procedure-handles dissoc
+             "clodin.compiler/globals-test-unlinked-reader")
+      (reset! module-dirty true)
+      (compile-module!)
+      (is (nil? (:address (globals/entry
+                           "clodin.compiler/globals-test-unlinked")))))
+    (testing "the next access installs fresh storage at the source value"
+      (is (= 3 (globals/read-value
+                "clodin.compiler/globals-test-unlinked"))))
+    (finally
+      (swap! procedure-registry dissoc
+             "clodin.compiler/globals-test-unlinked-reader")
+      (swap! procedure-handles dissoc
+             "clodin.compiler/globals-test-unlinked-reader")
+      (swap! globals/registry dissoc
+             "clodin.compiler/globals-test-unlinked"))))
+
 (deftest test-globals-type-change
   (try
     (set-build-mode! :reloadable)
     (define-var! "clodin.compiler" "globals-test-retyped" :i64 5)
     (define-proc! "clodin.compiler" "globals-test-retyped-reader" [] []
-                  '[globals-test-retyped] nil false)
+      '[globals-test-retyped] nil false)
     (is (= 5 (invoke-procedure "globals-test-retyped-reader" [])))
     (testing "a type change mints a new native symbol"
       (let [[entry changed?] (globals/register! "clodin.compiler"
@@ -3972,12 +4099,17 @@
         (is (= :f64 (:type entry)))))
     (testing "the re-emitted body reads the new layout"
       (define-proc! "clodin.compiler" "globals-test-retyped-reader" [] []
-                    '[(+ globals-test-retyped 0.5)] nil false)
+        '[(+ globals-test-retyped 0.5)] nil false)
       (is (= 2.0 (invoke-procedure "globals-test-retyped-reader" []))))
     (finally
-      (swap! globals/registry dissoc "globals-test-retyped")
-      (swap! procedure-registry dissoc "globals-test-retyped-reader")
-      (swap! procedure-handles dissoc "globals-test-retyped-reader")
+      ;; The registries are keyed by qualified name, so the cleanup has to use
+      ;; the qualified names too; otherwise the next run of this test starts
+      ;; from the leftovers of the previous one.
+      (swap! globals/registry dissoc "clodin.compiler/globals-test-retyped")
+      (swap! procedure-registry dissoc
+             "clodin.compiler/globals-test-retyped-reader")
+      (swap! procedure-handles dissoc
+             "clodin.compiler/globals-test-retyped-reader")
       (set-build-mode! :monolithic))))
 
 (deftest test-globals-in-standalone-build
@@ -4057,8 +4189,8 @@
       (try
         (stack-scratch-record-address addresses)
         (is (zero? (mod (.address ^MemorySegment
-                                   (.getAtIndex addresses ValueLayout/ADDRESS 0))
-                          16)))
+                                  (.getAtIndex addresses ValueLayout/ADDRESS 0))
+                        16)))
         (finally
           (.close arena)))))
 
@@ -4085,29 +4217,29 @@
   (testing "both arguments are validated at compile time"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"at least one byte"
                           (define-proc! "clodin.compiler" "stack-allocate-empty" [] []
-                                        '[(stack-allocate 0 16)] nil false)))
+                            '[(stack-allocate 0 16)] nil false)))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"power of two"
                           (define-proc! "clodin.compiler" "stack-allocate-odd-alignment" [] []
-                                        '[(stack-allocate 16 3)] nil false)))
+                            '[(stack-allocate 16 3)] nil false)))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo
                           #"literal non-negative integer byte-count"
                           (define-proc! "clodin.compiler" "stack-allocate-runtime-size"
-                                        ['byte-count] [:i64]
-                                        '[(stack-allocate byte-count 16)] nil false)))
+                            ['byte-count] [:i64]
+                            '[(stack-allocate byte-count 16)] nil false)))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"at most 65536"
                           (define-proc! "clodin.compiler" "stack-allocate-huge-alignment"
-                                        [] []
-                                        '[(stack-allocate 16 131072)] nil false)))
+                            [] []
+                            '[(stack-allocate 16 131072)] nil false)))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"expects .stack-allocate byte-count"
                           (define-proc! "clodin.compiler" "stack-allocate-arity" [] []
-                                        '[(stack-allocate 16)] nil false))))
+                            '[(stack-allocate 16)] nil false))))
 
   (testing "a procedure may shadow a compiler form, but stays qualified only"
     (let [namespace "clodin.compiler.shadow"
           warnings (with-out-str
                      (binding [*err* *out*]
                        (defproc-form namespace 'stack-allocate []
-                                     '[(to-i32 0)])))]
+                         '[(to-i32 0)])))]
       (try
         (is (string/includes? warnings "shadows the compiler form"))
         (is (= :i32 (:return-type (get @procedure-registry
@@ -4115,12 +4247,12 @@
         ;; An unqualified name still means the form, so the body below compiles
         ;; a stack block rather than calling the shadowing procedure.
         (define-proc! "clodin.compiler.shadow" "unqualified-is-the-form" [] []
-                      '[(stack-allocate 8 8)] nil false)
+          '[(stack-allocate 8 8)] nil false)
         (is (= :ptr (:return-type (get @procedure-registry
                                        "clodin.compiler.shadow/unqualified-is-the-form"))))
         ;; The qualified name reaches the procedure.
         (define-proc! "clodin.compiler.shadow" "qualified-is-the-procedure" [] []
-                      '[(clodin.compiler.shadow/stack-allocate)] nil false)
+          '[(clodin.compiler.shadow/stack-allocate)] nil false)
         (is (= :i32 (:return-type (get @procedure-registry
                                        "clodin.compiler.shadow/qualified-is-the-procedure"))))
         (finally
@@ -4211,12 +4343,12 @@
   (testing "is-null rejects a type that cannot hold a null"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"do not match parameters"
                           (define-proc! "clodin.compiler" "is-null-non-pointer" [] []
-                                        '[(if (is-null 5) 1 0)] :i64 false))))
+                            '[(if (is-null 5) 1 0)] :i64 false))))
 
   (testing "is-null expects exactly one operand"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"expects 1 arguments"
                           (define-proc! "clodin.compiler" "is-null-arity" [] []
-                                        '[(if (is-null) 1 0)] :i64 false)))))
+                            '[(if (is-null) 1 0)] :i64 false)))))
 
 (deftest test-pointer-call
   (testing "a pointer-call reaches a libc function address"
@@ -4248,38 +4380,38 @@
   (testing "the written signature is checked as far as it can be"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"expects a :ptr function address"
                           (define-proc! "clodin.compiler" "pointer-call-non-pointer" [] []
-                                        '[(pointer-call 5 [] :void)] nil false)))
+                            '[(pointer-call 5 [] :void)] nil false)))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"takes 1 arguments, got 0"
                           (define-proc! "clodin.compiler" "pointer-call-arity" ['callback] [:ptr]
-                                        '[(pointer-call callback [:i64] :void)] nil false)))
+                            '[(pointer-call callback [:i64] :void)] nil false)))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"do not match pointer-call parameters"
                           (define-proc! "clodin.compiler" "pointer-call-argument-types"
-                                        ['callback] [:ptr]
-                                        '[(pointer-call callback [:i64] :void 1.5)]
-                                        nil false)))
+                            ['callback] [:ptr]
+                            '[(pointer-call callback [:i64] :void 1.5)]
+                            nil false)))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"literal vector of parameter types"
                           (define-proc! "clodin.compiler" "pointer-call-non-literal"
-                                        ['callback] [:ptr]
-                                        '[(pointer-call callback :i64 :void)]
-                                        nil false)))
+                            ['callback] [:ptr]
+                            '[(pointer-call callback :i64 :void)]
+                            nil false)))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"parameter types are"
                           (define-proc! "clodin.compiler" "pointer-call-void-parameter"
-                                        ['callback] [:ptr]
-                                        '[(pointer-call callback [:void] :void)]
-                                        nil false)))
+                            ['callback] [:ptr]
+                            '[(pointer-call callback [:void] :void)]
+                            nil false)))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"return type is"
                           (define-proc! "clodin.compiler" "pointer-call-silly-return"
-                                        ['callback] [:ptr]
-                                        '[(pointer-call callback [] :i8)]
-                                        nil false))))
+                            ['callback] [:ptr]
+                            '[(pointer-call callback [] :i8)]
+                            nil false))))
 
   (testing "a void call has no value to bind"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"its value is no value"
                           (define-proc! "clodin.compiler" "pointer-call-void-value"
-                                        ['callback] [:ptr]
-                                        '[(let [value :i64 (pointer-call callback [] :void)]
-                                            value)]
-                                        nil false)))))
+                            ['callback] [:ptr]
+                            '[(let [value :i64 (pointer-call callback [] :void)]
+                                value)]
+                            nil false)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Statement position and :void return types
@@ -4398,13 +4530,13 @@
          clojure.lang.ExceptionInfo
          #"arms must both produce a value of the same type"
          (define-proc! "clodin.compiler" "statement-if-value-position" ['pointer] [:ptr]
-                       '[(if true 1 (store :i64 pointer 0))] :i64 false)))
+           '[(if true 1 (store :i64 pointer 0))] :i64 false)))
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo
          #"arms must both produce a value of the same type"
          (define-proc! "clodin.compiler" "statement-if-let-value" ['pointer] [:ptr]
-                       '[(let [value :i64 (if true 1 (store :i64 pointer 0))] value)]
-                       nil false)))))
+           '[(let [value :i64 (if true 1 (store :i64 pointer 0))] value)]
+           nil false)))))
 
 (deftest test-void-return-type
   (testing ":void is a declarable return type and the call produces no value"
@@ -4419,19 +4551,19 @@
   (testing "a declared :void body is a statement, so it has no value to return"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"has no value to return"
                           (define-proc! "clodin.compiler" "void-declared-i64" ['pointer] [:ptr]
-                                        '[(if true (store :i64 pointer 1)
-                                           (store :i64 pointer 2))]
-                                        :i64 false))))
+                            '[(if true (store :i64 pointer 1)
+                                  (store :i64 pointer 2))]
+                            :i64 false))))
 
   (testing ":void is rejected as a parameter type"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"cannot take a :void parameter"
                           (define-proc! "clodin.compiler" "void-parameter" ['value] [:void]
-                                        '[1] nil false))))
+                            '[1] nil false))))
 
   (testing "an unsupported declared return type is a clear error"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unsupported return type"
                           (define-proc! "clodin.compiler" "unsupported-return" [] []
-                                        '[1] :i8 false)))))
+                            '[1] :i8 false)))))
 
 ;;; ---------------------------------------------------------------------------
 ;;; Qualified names
@@ -4449,13 +4581,13 @@
 
     (testing "its own namespace reaches it unqualified"
       (define-proc! "examples.naming" "own-caller" [] []
-                    '[(helper)] :i64 false)
+        '[(helper)] :i64 false)
       (is (= :i64 (:return-type (get @procedure-registry
                                      "examples.naming/own-caller")))))
 
     (testing "another namespace reaches it by qualified name"
       (define-proc! "examples.naming" "qualified-caller" [] []
-                    '[(examples.naming/helper)] :i64 false)
+        '[(examples.naming/helper)] :i64 false)
       (is (= :i64 (:return-type (get @procedure-registry
                                      "examples.naming/qualified-caller")))))
 
@@ -4463,7 +4595,7 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo
                             #"Unknown clodin procedure: helper"
                             (define-proc! "examples.other" "caller" [] []
-                                          '[(helper)] :i64 false))))
+                              '[(helper)] :i64 false))))
 
     (testing "two namespaces can define the same short name"
       (define-proc! "examples.other" "helper" [] [] '[42] :i64 false)
@@ -4475,7 +4607,7 @@
     (testing "a core procedure is visible unqualified everywhere"
       (define-proc! "clodin.core" "core-helper" [] [] '[7] :i64 false)
       (define-proc! "examples.other" "core-caller" [] []
-                    '[(core-helper)] :i64 false)
+        '[(core-helper)] :i64 false)
       (is (= :i64 (:return-type (get @procedure-registry
                                      "examples.other/core-caller")))))
 
@@ -4483,7 +4615,7 @@
       (define-proc! "clodin.core" "shadowed-helper" [] [] '[1] :i64 false)
       (define-proc! "examples.naming" "shadowed-helper" [] [] '[2] :i64 false)
       (define-proc! "examples.naming" "shadow-caller" [] []
-                    '[(shadowed-helper)] :i64 false)
+        '[(shadowed-helper)] :i64 false)
       (let [callees (:callees (get @procedure-registry
                                    "examples.naming/shadow-caller"))]
         (is (contains? callees "examples.naming/shadowed-helper"))
@@ -4494,9 +4626,9 @@
       (is (= "examples.naming.counter"
              (:symbol (globals/entry "examples.naming/counter"))))
       (define-proc! "examples.naming" "reads-own-global" [] []
-                    '[(+ counter 1)] :i64 false)
+        '[(+ counter 1)] :i64 false)
       (define-proc! "examples.naming" "reads-qualified-global" [] []
-                    '[(+ examples.naming/counter 1)] :i64 false)
+        '[(+ examples.naming/counter 1)] :i64 false)
       (is (= #{"examples.naming.counter"}
              (:globals (get @procedure-registry
                             "examples.naming/reads-own-global"))))
@@ -4505,7 +4637,7 @@
                             "examples.naming/reads-qualified-global"))))
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Unknown symbol: counter"
                             (define-proc! "examples.other" "reads-naming-global" [] []
-                                          '[(+ counter 1)] :i64 false))))
+                              '[(+ counter 1)] :i64 false))))
 
     (finally
       (doseq [name ["examples.naming/helper" "examples.naming/own-caller"
