@@ -109,7 +109,7 @@
 
 (comment
   ;; string literals compile to String structs
-  (:size "Hello") evaluates to 5
+  (:size "Hello") ;; evaluates to 5
 
   ;; this turns String struct into a null terminated c string by
   ;; copying the string and adding the terimnating null.
